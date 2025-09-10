@@ -105,6 +105,8 @@ fabric.properties
 
 build/
 
+.qt/
+
 # Binary files
 *.exe
 *.dll
