@@ -22,10 +22,16 @@ class DJAudioPlayer;
 class BpmAnalyzer;
 class PreferencesDialog;
 
-// Custom audio callback for proper stereo output
+// Custom audio callback for proper stereo mixing of both decks
 class StereoAudioCallback : public juce::AudioIODeviceCallback {
 public:
-    explicit StereoAudioCallback(DJAudioPlayer* player) : audioPlayer(player) {}
+    explicit StereoAudioCallback(DJAudioPlayer* playerA, DJAudioPlayer* playerB) 
+        : audioPlayerA(playerA), audioPlayerB(playerB),
+          volumeA(1.0f), volumeB(1.0f), crossfaderPos(0.0f), masterVolume(1.0f) {}
+    
+    void audioDeviceIOCallback(const float* const* inputChannelData, int numInputChannels,
+                              float* const* outputChannelData, int numOutputChannels, 
+                              int numSamples);
     
     void audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
                                          float* const* outputChannelData, int numOutputChannels, 
@@ -34,9 +40,23 @@ public:
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
     void audioDeviceStopped() override;
     
+    // Mixer controls
+    void setVolumeA(float vol) { volumeA.store(juce::jlimit(0.0f, 1.0f, vol)); }
+    void setVolumeB(float vol) { volumeB.store(juce::jlimit(0.0f, 1.0f, vol)); }
+    void setCrossfader(float pos) { crossfaderPos.store(juce::jlimit(-1.0f, 1.0f, pos)); }
+    void setMasterVolume(float vol) { masterVolume.store(juce::jlimit(0.0f, 1.0f, vol)); }
+    
 private:
-    DJAudioPlayer* audioPlayer{nullptr};
-    juce::AudioBuffer<float> tempBuffer;
+    DJAudioPlayer* audioPlayerA{nullptr};
+    DJAudioPlayer* audioPlayerB{nullptr};
+    juce::AudioBuffer<float> tempBufferA;
+    juce::AudioBuffer<float> tempBufferB;
+    
+    // Mixer parameters (atomic for thread safety)
+    std::atomic<float> volumeA{1.0f};
+    std::atomic<float> volumeB{1.0f};
+    std::atomic<float> crossfaderPos{0.0f};  // -1.0 = A only, 0.0 = center, +1.0 = B only
+    std::atomic<float> masterVolume{1.0f};
 };
 
 class QtMainWindow : public QWidget {
@@ -48,6 +68,10 @@ class QtMainWindow : public QWidget {
 public:
     explicit QtMainWindow(QWidget* parent = nullptr);
     ~QtMainWindow();
+
+protected:
+    // Event filter for double-click reset functionality
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
 private slots:
     void onCrossfader(int v);
@@ -125,6 +149,13 @@ private:
     
     // Master output level monitoring for the menubar display
     MasterLevelMonitor masterLevelMonitor;
+
+    // PREROLL SUPPORT: Timer for automatic position updates
+    QTimer* positionUpdateTimer;
+    
+    // Scratching state management to prevent timer conflicts
+    qint64 lastScratchEndA{0};
+    qint64 lastScratchEndB{0};
     
     // Performance optimization: Cached format manager to avoid repeated initialization
     static int formatManagerRefCount;
@@ -161,6 +192,9 @@ private:
     void updateOverviewLabel(bool isDeckA);
     void performCleanup(); // Safe cleanup method
     bool cleanupCompleted{false}; // Prevent double cleanup
+    
+    // PREROLL SUPPORT: Update playback positions automatically
+    void updatePlaybackPositions();
     
     // BetaPulseX Menu Setup
     // BetaPulseX: Deck Settings Management

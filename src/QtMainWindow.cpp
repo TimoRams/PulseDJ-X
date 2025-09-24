@@ -17,7 +17,18 @@
 #include <QJsonParseError>
 #include <QRegularExpression>
 
-// StereoAudioCallback implementation for proper stereo output
+// StereoAudioCallback - Main JUCE audio callback method
+void StereoAudioCallback::audioDeviceIOCallback(const float* const* inputChannelData, int numInputChannels,
+                                               float* const* outputChannelData, int numOutputChannels, 
+                                               int numSamples) {
+    // Create dummy context and call the full implementation
+    juce::AudioIODeviceCallbackContext context;
+    audioDeviceIOCallbackWithContext(inputChannelData, numInputChannels, 
+                                    outputChannelData, numOutputChannels, 
+                                    numSamples, context);
+}
+
+// StereoAudioCallback implementation for proper stereo mixing of both decks
 void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
                                                           float* const* outputChannelData, int numOutputChannels,
                                                           int numSamples, const juce::AudioIODeviceCallbackContext& context) {
@@ -26,17 +37,17 @@ void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* i
     
     // Log device info once, then reduce spam
     if (!infoLogged) {
-        std::cout << "Audio callback: outputChannels=" << numOutputChannels 
+        std::cout << "Stereo Mixer callback: outputChannels=" << numOutputChannels 
                   << ", samples=" << numSamples << std::endl;
         infoLogged = true;
     }
     
     if (++callCount % 5000 == 0) {  // Less frequent logging
-        std::cout << "Audio running (" << callCount << " callbacks)" << std::endl;
+        std::cout << "Mixer running (" << callCount << " callbacks)" << std::endl;
     }
     
-    if (!audioPlayer || numSamples <= 0) {
-        // Clear output if no audio
+    if (numSamples <= 0) {
+        // Clear output if no samples
         for (int ch = 0; ch < numOutputChannels; ++ch) {
             if (outputChannelData[ch]) {
                 juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
@@ -45,25 +56,40 @@ void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* i
         return;
     }
     
-    // SIMPLE APPROACH: Work with whatever the system gives us
-    // Don't force anything - just adapt to the available channels
-    
-    // Make sure temp buffer matches what we need
-    if (tempBuffer.getNumChannels() != std::max(2, numOutputChannels) || 
-        tempBuffer.getNumSamples() < numSamples) {
-        tempBuffer.setSize(std::max(2, numOutputChannels), numSamples, false, false, true);
+    // Ensure buffers are sized correctly for stereo
+    const int bufferChannels = std::max(2, numOutputChannels);
+    if (tempBufferA.getNumChannels() != bufferChannels || tempBufferA.getNumSamples() < numSamples) {
+        tempBufferA.setSize(bufferChannels, numSamples, false, false, true);
+    }
+    if (tempBufferB.getNumChannels() != bufferChannels || tempBufferB.getNumSamples() < numSamples) {
+        tempBufferB.setSize(bufferChannels, numSamples, false, false, true);
     }
     
-    // Get audio from DJ player
-    juce::AudioSourceChannelInfo bufferInfo;
-    bufferInfo.buffer = &tempBuffer;
-    bufferInfo.startSample = 0;
-    bufferInfo.numSamples = numSamples;
+    // Clear buffers
+    tempBufferA.clear();
+    tempBufferB.clear();
     
-    tempBuffer.clear();
-    audioPlayer->getNextAudioBlock(bufferInfo);
+    // Get audio from both players
+    juce::AudioSourceChannelInfo bufferInfoA;
+    bufferInfoA.buffer = &tempBufferA;
+    bufferInfoA.startSample = 0;
+    bufferInfoA.numSamples = numSamples;
     
-    // ADAPTIVE CHANNEL MAPPING: Work with whatever the system provides
+    juce::AudioSourceChannelInfo bufferInfoB;
+    bufferInfoB.buffer = &tempBufferB;
+    bufferInfoB.startSample = 0;
+    bufferInfoB.numSamples = numSamples;
+    
+    // Get audio from Player A
+    if (audioPlayerA) {
+        audioPlayerA->getNextAudioBlock(bufferInfoA);
+    }
+    
+    // Get audio from Player B
+    if (audioPlayerB) {
+        audioPlayerB->getNextAudioBlock(bufferInfoB);
+    }
+    
     // Clear all output channels first
     for (int ch = 0; ch < numOutputChannels; ++ch) {
         if (outputChannelData[ch]) {
@@ -71,27 +97,65 @@ void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* i
         }
     }
     
-    // Copy audio data intelligently based on available channels
-    const int inputChannels = tempBuffer.getNumChannels();
+    // Load mixer parameters (atomic reads)
+    const float volA = volumeA.load();
+    const float volB = volumeB.load();
+    const float crossfader = crossfaderPos.load();
+    const float master = masterVolume.load();
     
-    if (inputChannels >= 2 && numOutputChannels >= 2) {
-        // Best case: stereo to stereo
-        juce::FloatVectorOperations::copy(outputChannelData[0], tempBuffer.getReadPointer(0), numSamples);
-        juce::FloatVectorOperations::copy(outputChannelData[1], tempBuffer.getReadPointer(1), numSamples);
+    // Calculate crossfader gains (equal power law for smooth transitions)
+    float gainA, gainB;
+    if (crossfader <= 0.0f) {
+        // Left side: A stays full, B fades out
+        float fadePos = std::abs(crossfader); // 0.0 to 1.0
+        gainA = 1.0f;
+        gainB = std::cos(fadePos * M_PI * 0.5f); // Cosine fade
+    } else {
+        // Right side: A fades out, B stays full  
+        float fadePos = crossfader; // 0.0 to 1.0
+        gainA = std::cos(fadePos * M_PI * 0.5f); // Cosine fade
+        gainB = 1.0f;
     }
-    else if (inputChannels >= 2 && numOutputChannels == 1) {
-        // Stereo to mono: mix channels
-        juce::FloatVectorOperations::copy(outputChannelData[0], tempBuffer.getReadPointer(0), numSamples);
-        juce::FloatVectorOperations::addWithMultiply(outputChannelData[0], tempBuffer.getReadPointer(1), 0.5f, numSamples);
+    
+    // Apply volume controls
+    gainA *= volA;
+    gainB *= volB;
+    
+    // Mix both players to output with proper stereo channel mapping
+    for (int ch = 0; ch < std::min(numOutputChannels, 2); ++ch) {
+        if (outputChannelData[ch]) {
+            // Mix Player A
+            if (ch < tempBufferA.getNumChannels()) {
+                juce::FloatVectorOperations::addWithMultiply(
+                    outputChannelData[ch], 
+                    tempBufferA.getReadPointer(ch), 
+                    gainA, 
+                    numSamples
+                );
+            }
+            
+            // Mix Player B
+            if (ch < tempBufferB.getNumChannels()) {
+                juce::FloatVectorOperations::addWithMultiply(
+                    outputChannelData[ch], 
+                    tempBufferB.getReadPointer(ch), 
+                    gainB, 
+                    numSamples
+                );
+            }
+            
+            // Apply master volume
+            if (master != 1.0f) {
+                juce::FloatVectorOperations::multiply(outputChannelData[ch], master, numSamples);
+            }
+        }
     }
-    else if (inputChannels >= 1 && numOutputChannels >= 2) {
-        // Mono to stereo: duplicate
-        juce::FloatVectorOperations::copy(outputChannelData[0], tempBuffer.getReadPointer(0), numSamples);
-        juce::FloatVectorOperations::copy(outputChannelData[1], tempBuffer.getReadPointer(0), numSamples);
-    }
-    else if (inputChannels >= 1 && numOutputChannels >= 1) {
-        // Mono to mono: direct copy
-        juce::FloatVectorOperations::copy(outputChannelData[0], tempBuffer.getReadPointer(0), numSamples);
+    
+    // If more than 2 output channels, copy stereo to remaining channels
+    for (int ch = 2; ch < numOutputChannels; ++ch) {
+        if (outputChannelData[ch] && outputChannelData[ch % 2]) {
+            juce::FloatVectorOperations::copy(outputChannelData[ch], outputChannelData[ch % 2], numSamples);
+        }
     }
 }
 
@@ -472,7 +536,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 
     // BetaPulseX: Lade und wende gespeicherte Deck-Einstellungen an (verzögert)
     // Verwende QTimer::singleShot um sicherzustellen, dass alle Widgets initialisiert sind
+    std::cout << "*** SCHEDULING applyDeckSettings() with 100ms delay ***" << std::endl;
     QTimer::singleShot(100, this, [this]() {
+        std::cout << "*** QTimer callback FIRED - calling applyDeckSettings() ***" << std::endl;
         applyDeckSettings();
     });
 
@@ -526,11 +592,12 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
     connect(overviewTopA, &WaveformDisplay::scratchMove, this, [this](double absRel) {
         if (!playerA) return;
-        // Clamp position to valid range
-        absRel = std::max(0.0, std::min(1.0, absRel));
+        // PREROLL SUPPORT: Allow unlimited negative positions for DJ cueing
+        // Remove clamping to allow preroll positions
+        absRel = std::min(1.0, absRel); // Only clamp maximum, allow unlimited negative
+        // Only update audio player position - UI is already updated by the waveform itself
         playerA->setPositionRelative(absRel);
-        // Update UI immediately for responsive feel
-        overviewTopA->setPlayhead(absRel);
+        // Update deck waveform to stay in sync
         if (deckA && deckA->getWaveform()) {
             deckA->getWaveform()->setPlayhead(absRel);
         }
@@ -541,15 +608,25 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
     connect(overviewTopA, &WaveformDisplay::scratchEnd, this, [this]() {
         if (!playerA) return;
+        
+        // Mark exact scratch end time for timer system
+        lastScratchEndA = QDateTime::currentMSecsSinceEpoch();
+        
+        // IMPORTANT: Don't change position when ending scratch - stay where we are
         playerA->enableScratch(false);
         playerA->setScratchVelocity(0.0);
-        // Restore prior play state
+        // Restore prior play state WITHOUT changing position
         if (scratchWasPlayingA) {
             // keep playing if it was playing before
-            playerA->start();
+            if (!playerA->isPlaying()) {
+                playerA->start();
+            }
         } else {
-            // we started transport for scratching; stop again now
-            playerA->stop();
+            // Only stop if it wasn't playing before AND it's currently playing
+            if (playerA->isPlaying()) {
+                // Don't call stop() as it might reset position - use pause instead
+                // Actually, just leave it playing to avoid position jumps
+            }
         }
     });
 
@@ -564,11 +641,12 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
     connect(overviewTopB, &WaveformDisplay::scratchMove, this, [this](double absRel) {
         if (!playerB) return;
-        // Clamp position to valid range
-        absRel = std::max(0.0, std::min(1.0, absRel));
+        // PREROLL SUPPORT: Allow unlimited negative positions for DJ cueing
+        // Remove clamping to allow preroll positions
+        absRel = std::min(1.0, absRel); // Only clamp maximum, allow unlimited negative
+        // Only update audio player position - UI is already updated by the waveform itself
         playerB->setPositionRelative(absRel);
-        // Update UI immediately for responsive feel
-        overviewTopB->setPlayhead(absRel);
+        // Update deck waveform to stay in sync
         if (deckB && deckB->getWaveform()) {
             deckB->getWaveform()->setPlayhead(absRel);
         }
@@ -579,13 +657,25 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
     connect(overviewTopB, &WaveformDisplay::scratchEnd, this, [this]() {
         if (!playerB) return;
+        
+        // Mark exact scratch end time for timer system
+        lastScratchEndB = QDateTime::currentMSecsSinceEpoch();
+        
+        // IMPORTANT: Don't change position when ending scratch - stay where we are
         playerB->enableScratch(false);
         playerB->setScratchVelocity(0.0);
-        // Restore prior play state
+        // Restore prior play state WITHOUT changing position
         if (scratchWasPlayingB) {
-            playerB->start();
+            // keep playing if it was playing before
+            if (!playerB->isPlaying()) {
+                playerB->start();
+            }
         } else {
-            playerB->stop();
+            // Only stop if it wasn't playing before AND it's currently playing
+            if (playerB->isPlaying()) {
+                // Don't call stop() as it might reset position - use pause instead
+                // Actually, just leave it playing to avoid position jumps
+            }
         }
     });
 
@@ -1110,6 +1200,24 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     connect(rightLow, &QDial::valueChanged, this, &QtMainWindow::onRightLowChanged);
     connect(rightFilter, &QDial::valueChanged, this, &QtMainWindow::onRightFilterChanged);
     
+    // Add double-click reset functionality for all mixer controls
+    // EQ controls reset to 0 (neutral)
+    leftHigh->installEventFilter(this);
+    leftMid->installEventFilter(this);
+    leftLow->installEventFilter(this);
+    leftFilter->installEventFilter(this);
+    rightHigh->installEventFilter(this);
+    rightMid->installEventFilter(this);
+    rightLow->installEventFilter(this);
+    rightFilter->installEventFilter(this);
+    
+    // Volume sliders reset to 100 (full volume)
+    leftVolumeSlider->installEventFilter(this);
+    rightVolumeSlider->installEventFilter(this);
+    
+    // Crossfader resets to 50 (center)
+    crossfader->installEventFilter(this);
+    
     // Connect volume sliders
     connect(leftVolumeSlider, &QSlider::valueChanged, this, &QtMainWindow::onLeftVolumeChanged);
     connect(rightVolumeSlider, &QSlider::valueChanged, this, &QtMainWindow::onRightVolumeChanged);
@@ -1140,6 +1248,13 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     mainLayout->addLayout(decksLayout, 2);       // Deck controls + mixer (reduced from 4 to 2)
     mainLayout->addLayout(libLayout, 2);         // Library at bottom (increased from 1 to 2)
     setLayout(mainLayout);
+
+    // PREROLL SUPPORT: Timer for automatic position updates during playback
+    positionUpdateTimer = new QTimer(this);
+    positionUpdateTimer->setInterval(80); // Slower for even more stability (12.5 FPS)
+    connect(positionUpdateTimer, &QTimer::timeout, this, &QtMainWindow::updatePlaybackPositions);
+    positionUpdateTimer->start();
+    std::cout << "Position update timer started at 12.5 FPS for maximum stability" << std::endl;
 
     // BetaPulseX: Lade alle Deck-Einstellungen aus zentraler Config
     {
@@ -1215,7 +1330,7 @@ void QtMainWindow::initializeAudio()
         
         // Use simple audio callback - let JUCE handle the channel mapping
         std::cout << "Setting up audio callback for playerA" << std::endl;
-        stereoCallback = std::make_unique<StereoAudioCallback>(playerA);
+        stereoCallback = std::make_unique<StereoAudioCallback>(playerA, playerB);
         deviceManager.addAudioCallback(stereoCallback.get());
         
         // Add master level monitor
@@ -1365,45 +1480,71 @@ void QtMainWindow::closeEvent(QCloseEvent* event)
 }
 
 void QtMainWindow::onCrossfader(int v) {
-    // v: 0 => full A, 100 => full B
-    float cross = juce::jlimit(0.0f, 1.0f, (float)v / 100.0f);
-    // mixer.setCrossfader(cross); // Disabled - using simple AudioSourcePlayer
+    std::cout << "Crossfader changed to: " << v << std::endl;
+    // v: 0 => full A (left), 50 => center, 100 => full B (right)
+    // Convert to -1.0f (full A) to +1.0f (full B)
+    float crossPos = (float(v) - 50.0f) / 50.0f;  // -1.0 to +1.0
+    if (stereoCallback) {
+        stereoCallback->setCrossfader(crossPos);
+    }
 }
 
 // EQ/filter slot implementations
 void QtMainWindow::onLeftHighChanged(int v) {
+    std::cout << "onLeftHighChanged called with value: " << v << std::endl;
     // map -100..100 to -1.0..1.0
     double val = v / 100.0;
-    if (playerA) playerA->setHighGain(val);
+    if (playerA) {
+        std::cout << "  Calling playerA->setHighGain(" << val << ")" << std::endl;
+        playerA->setHighGain(val);
+    } else {
+        std::cout << "  ERROR: playerA is null!" << std::endl;
+    }
 }
 
 void QtMainWindow::onLeftMidChanged(int v) {
+    std::cout << "onLeftMidChanged called with value: " << v << std::endl;
     double val = v / 100.0;
-    if (playerA) playerA->setMidGain(val);
+    if (playerA) {
+        std::cout << "  Calling playerA->setMidGain(" << val << ")" << std::endl;
+        playerA->setMidGain(val);
+    } else {
+        std::cout << "  ERROR: playerA is null!" << std::endl;
+    }
 }
 
 void QtMainWindow::onLeftLowChanged(int v) {
+    std::cout << "onLeftLowChanged called with value: " << v << std::endl;
     double val = v / 100.0;
     if (playerA) playerA->setLowGain(val);
 }
 
 void QtMainWindow::onLeftFilterChanged(int v) {
+    std::cout << "onLeftFilterChanged called with value: " << v << std::endl;
     // map -100..100 to -1..1 (center 0 = bypass)
     double norm = v / 100.0;
-    if (playerA) playerA->setFilterCutoff(norm);
+    if (playerA) {
+        std::cout << "  Calling playerA->setFilterCutoff(" << norm << ")" << std::endl;
+        playerA->setFilterCutoff(norm);
+    } else {
+        std::cout << "  ERROR: playerA is null!" << std::endl;
+    }
 }
 
 void QtMainWindow::onRightHighChanged(int v) {
+    std::cout << "onRightHighChanged called with value: " << v << std::endl;
     double val = v / 100.0;
     if (playerB) playerB->setHighGain(val);
 }
 
 void QtMainWindow::onRightMidChanged(int v) {
+    std::cout << "onRightMidChanged called with value: " << v << std::endl;
     double val = v / 100.0;
     if (playerB) playerB->setMidGain(val);
 }
 
 void QtMainWindow::onRightLowChanged(int v) {
+    std::cout << "onRightLowChanged called with value: " << v << std::endl;
     double val = v / 100.0;
     if (playerB) playerB->setLowGain(val);
 }
@@ -1415,11 +1556,19 @@ void QtMainWindow::onRightFilterChanged(int v) {
 }
 
 void QtMainWindow::onLeftVolumeChanged(int v) {
-    // mixer.setGainA(juce::jlimit(0.0f, 1.0f, (float)v / 100.0f)); // Disabled - using simple AudioSourcePlayer
+    std::cout << "Left volume changed to: " << v << std::endl;
+    if (stereoCallback) {
+        float volume = juce::jlimit(0.0f, 1.0f, (float)v / 100.0f);
+        stereoCallback->setVolumeA(volume);
+    }
 }
 
 void QtMainWindow::onRightVolumeChanged(int v) {
-    // mixer.setGainB(juce::jlimit(0.0f, 1.0f, (float)v / 100.0f)); // Disabled - using simple AudioSourcePlayer
+    std::cout << "Right volume changed to: " << v << std::endl;
+    if (stereoCallback) {
+        float volume = juce::jlimit(0.0f, 1.0f, (float)v / 100.0f);
+        stereoCallback->setVolumeB(volume);
+    }
 }
 
 void QtMainWindow::keyPressEvent(QKeyEvent* event) {
@@ -1636,7 +1785,9 @@ void QtMainWindow::mouseReleaseEvent(QMouseEvent* event)
 
 // BetaPulseX: Wendet geladene Deck-Einstellungen auf die UI-Controls an
 void QtMainWindow::applyDeckSettings() {
+    std::cout << "*** applyDeckSettings() CALLED ***" << std::endl;
     if (!deckA || !deckB) {
+        std::cout << "*** ERROR: Cannot apply deck settings - deck widgets not created yet ***" << std::endl;
         qWarning() << "Cannot apply deck settings - deck widgets not created yet";
         return;
     }
@@ -1669,21 +1820,21 @@ void QtMainWindow::applyDeckSettings() {
         deckA->getSpeedSlider()->setValue(speedValue);
     }
     
-    // EQ für Deck A (falls verfügbar)
+    // EQ für Deck A - IMMER auf neutral (0) setzen, da nicht mehr gespeichert
     if (leftHigh && leftMid && leftLow) {
-        leftHigh->setValue((int)(configA.highGain * 50.0 + 50.0));   // -1..1 -> 0..100
-        leftMid->setValue((int)(configA.midGain * 50.0 + 50.0));
-        leftLow->setValue((int)(configA.lowGain * 50.0 + 50.0));
+        leftHigh->setValue(0);    // Neutral position
+        leftMid->setValue(0);     // Neutral position  
+        leftLow->setValue(0);     // Neutral position
     }
     
-    // Filter für Deck A
+    // Filter für Deck A - IMMER auf neutral (0) setzen
     if (leftFilter) {
-        leftFilter->setValue((int)(configA.filterPosition * 50.0 + 50.0));
+        leftFilter->setValue(0);  // Neutral position
     }
     
-    // Volume für Deck A
+    // Volume für Deck A - IMMER auf 100% setzen, da nicht mehr gespeichert
     if (leftVolumeSlider) {
-        leftVolumeSlider->setValue((int)(configA.gain * 100.0));
+        leftVolumeSlider->setValue(100);  // Full volume
     }
     
     // Deck B Settings anwenden
@@ -1711,21 +1862,21 @@ void QtMainWindow::applyDeckSettings() {
         deckB->getSpeedSlider()->setValue(speedValue);
     }
     
-    // EQ für Deck B
+    // EQ für Deck B - IMMER auf neutral (0) setzen, da nicht mehr gespeichert
     if (rightHigh && rightMid && rightLow) {
-        rightHigh->setValue((int)(configB.highGain * 50.0 + 50.0));
-        rightMid->setValue((int)(configB.midGain * 50.0 + 50.0));
-        rightLow->setValue((int)(configB.lowGain * 50.0 + 50.0));
+        rightHigh->setValue(0);   // Neutral position
+        rightMid->setValue(0);    // Neutral position
+        rightLow->setValue(0);    // Neutral position
     }
     
-    // Filter für Deck B
+    // Filter für Deck B - IMMER auf neutral (0) setzen
     if (rightFilter) {
-        rightFilter->setValue((int)(configB.filterPosition * 50.0 + 50.0));
+        rightFilter->setValue(0); // Neutral position
     }
     
-    // Volume für Deck B
+    // Volume für Deck B - IMMER auf 100% setzen, da nicht mehr gespeichert
     if (rightVolumeSlider) {
-        rightVolumeSlider->setValue((int)(configB.gain * 100.0));
+        rightVolumeSlider->setValue(100); // Full volume
     }
     
     qDebug() << "BetaPulseX: Deck settings applied successfully";
@@ -1738,7 +1889,178 @@ void QtMainWindow::applyDeckSettings() {
 
 // BetaPulseX: Verbindet UI-Controls mit dem Settings-System für automatisches Speichern
 void QtMainWindow::connectDeckSettings() {
+    std::cout << "*** connectDeckSettings() STARTED ***" << std::endl;
     qDebug() << "BetaPulseX: Connecting deck controls to settings system";
+    
+    // Find EQ controls for both decks first
+    QWidget* centralWidget = this;  // QtMainWindow selbst verwenden
+    std::cout << "*** Using QtMainWindow as search widget ***" << std::endl;
+    
+    // Find EQ controls for Deck A
+    QDial* leftHigh = centralWidget->findChild<QDial*>("leftHigh");
+    QDial* leftMid = centralWidget->findChild<QDial*>("leftMid");
+    QDial* leftLow = centralWidget->findChild<QDial*>("leftLow");
+    QDial* leftFilter = centralWidget->findChild<QDial*>("leftFilter");
+    
+    std::cout << "*** EQ Dials Deck A: leftHigh=" << (leftHigh ? "FOUND" : "NOT FOUND") 
+              << ", leftMid=" << (leftMid ? "FOUND" : "NOT FOUND")
+              << ", leftLow=" << (leftLow ? "FOUND" : "NOT FOUND")
+              << ", leftFilter=" << (leftFilter ? "FOUND" : "NOT FOUND") << std::endl;
+    
+    // Find EQ controls for Deck B  
+    QDial* rightHigh = centralWidget->findChild<QDial*>("rightHigh");
+    QDial* rightMid = centralWidget->findChild<QDial*>("rightMid");
+    QDial* rightLow = centralWidget->findChild<QDial*>("rightLow");
+    QDial* rightFilter = centralWidget->findChild<QDial*>("rightFilter");
+    
+    std::cout << "*** EQ Dials Deck B: rightHigh=" << (rightHigh ? "FOUND" : "NOT FOUND") 
+              << ", rightMid=" << (rightMid ? "FOUND" : "NOT FOUND")
+              << ", rightLow=" << (rightLow ? "FOUND" : "NOT FOUND")
+              << ", rightFilter=" << (rightFilter ? "FOUND" : "NOT FOUND") << std::endl;
+    
+    // EQ Controls für Deck A - DUPLICATE CONNECTIONS DISABLED TO AVOID CONFLICTS
+    /*
+    if (leftHigh && leftMid && leftLow) {
+        std::cout << "*** Setting up EQ connections for Deck A ***" << std::endl;
+        connect(leftHigh, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double gain = value / 100.0;  // -10-100..100 -> -1..1
+            std::cout << "*** LEFT HIGH EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setHighGain(gain);
+                std::cout << "*** Called playerA->setHighGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            auto& config = DeckSettings::instance().getDeckA();
+            DeckSettings::instance().setEQ(0, gain, config.midGain, config.lowGain);
+        });
+        
+        connect(leftMid, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double gain = value / 100.0;
+            std::cout << "*** LEFT MID EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setMidGain(gain);
+                std::cout << "*** Called playerA->setMidGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            auto& config = DeckSettings::instance().getDeckA();
+            DeckSettings::instance().setEQ(0, config.highGain, gain, config.lowGain);
+        });
+        
+        connect(leftLow, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double gain = value / 100.0;
+            std::cout << "*** LEFT LOW EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setLowGain(gain);
+                std::cout << "*** Called playerA->setLowGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            auto& config = DeckSettings::instance().getDeckA();
+            DeckSettings::instance().setEQ(0, config.highGain, config.midGain, gain);
+        });
+    } else {
+        std::cout << "*** ERROR: EQ dials not found for Deck A!" << std::endl;
+    }
+    
+    // Filter für Deck A
+    if (leftFilter) {
+        std::cout << "*** Setting up Filter connection for Deck A ***" << std::endl;
+        connect(leftFilter, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double pos = value / 100.0;  // -100..100 -> -1..1
+            std::cout << "*** LEFT FILTER CHANGED: " << value << " -> " << pos << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setFilterCutoff(pos);
+                std::cout << "*** Called playerA->setFilterCutoff(" << pos << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            DeckSettings::instance().setFilter(0, pos);
+        });
+    } else {
+        std::cout << "*** ERROR: Filter dial not found for Deck A!" << std::endl;
+    }
+    
+    // EQ Controls für Deck B
+    if (rightHigh && rightMid && rightLow) {
+        std::cout << "*** Setting up EQ connections for Deck B ***" << std::endl;
+        connect(rightHigh, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double gain = value / 100.0;
+            std::cout << "*** RIGHT HIGH EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setHighGain(gain);
+                std::cout << "*** Called playerB->setHighGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            auto& config = DeckSettings::instance().getDeckB();
+            DeckSettings::instance().setEQ(1, gain, config.midGain, config.lowGain);
+        });
+        
+        connect(rightMid, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double gain = value / 100.0;
+            std::cout << "*** RIGHT MID EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setMidGain(gain);
+                std::cout << "*** Called playerB->setMidGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            auto& config = DeckSettings::instance().getDeckB();
+            DeckSettings::instance().setEQ(1, config.highGain, gain, config.lowGain);
+        });
+        
+        connect(rightLow, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double gain = value / 100.0;
+            std::cout << "*** RIGHT LOW EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setLowGain(gain);
+                std::cout << "*** Called playerB->setLowGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            auto& config = DeckSettings::instance().getDeckB();
+            DeckSettings::instance().setEQ(1, config.highGain, config.midGain, gain);
+        });
+    } else {
+        std::cout << "*** ERROR: EQ dials not found for Deck B!" << std::endl;
+    }
+    
+    // Filter für Deck B
+    if (rightFilter) {
+        std::cout << "*** Setting up Filter connection for Deck B ***" << std::endl;
+        connect(rightFilter, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
+            double pos = value / 100.0;
+            std::cout << "*** RIGHT FILTER CHANGED: " << value << " -> " << pos << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setFilterCutoff(pos);
+                std::cout << "*** Called playerB->setFilterCutoff(" << pos << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
+            DeckSettings::instance().setFilter(1, pos);
+        });
+    } else {
+        std::cout << "*** ERROR: Filter dial not found for Deck B!" << std::endl;
+    }
+    */
     
     // Deck A Connections
     if (deckA) {
@@ -1767,33 +2089,74 @@ void QtMainWindow::connectDeckSettings() {
         }
     }
     
-    // EQ Controls für Deck A
+    // EQ Controls für Deck A - SECOND DUPLICATE SECTION DISABLED
+    /*
     if (leftHigh && leftMid && leftLow) {
         connect(leftHigh, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double gain = (value - 50.0) / 50.0;  // 0..100 -> -1..1
+            double gain = value / 100.0;  // -100..100 -> -1..1
+            std::cout << "*** LEFT HIGH EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setHighGain(gain);
+                std::cout << "*** Called playerA->setHighGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             auto& config = DeckSettings::instance().getDeckA();
             DeckSettings::instance().setEQ(0, gain, config.midGain, config.lowGain);
         });
         
         connect(leftMid, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double gain = (value - 50.0) / 50.0;
+            double gain = value / 100.0;
+            std::cout << "*** LEFT MID EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setMidGain(gain);
+                std::cout << "*** Called playerA->setMidGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             auto& config = DeckSettings::instance().getDeckA();
             DeckSettings::instance().setEQ(0, config.highGain, gain, config.lowGain);
         });
         
         connect(leftLow, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double gain = (value - 50.0) / 50.0;
+            double gain = value / 100.0;
+            std::cout << "*** LEFT LOW EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setLowGain(gain);
+                std::cout << "*** Called playerA->setLowGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             auto& config = DeckSettings::instance().getDeckA();
             DeckSettings::instance().setEQ(0, config.highGain, config.midGain, gain);
         });
+    } else {
+        std::cout << "*** ERROR: EQ dials not found for Deck A!" << std::endl;
     }
     
-    // Filter für Deck A
+    // Filter für Deck A - BEHEBT HAUPTPROBLEM: Ruft SOWOHL DeckSettings ALS AUCH Audio-Engine auf
     if (leftFilter) {
         connect(leftFilter, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double pos = (value - 50.0) / 50.0;  // 0..100 -> -1..1
+            double pos = value / 100.0;  // -100..100 -> -1..1
+            std::cout << "*** LEFT FILTER CHANGED: " << value << " -> " << pos << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerA) {
+                playerA->setFilterCutoff(pos);
+                std::cout << "*** Called playerA->setFilterCutoff(" << pos << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerA is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             DeckSettings::instance().setFilter(0, pos);
         });
+    } else {
+        std::cout << "*** ERROR: Filter dial not found for Deck A!" << std::endl;
     }
     
     // Volume für Deck A
@@ -1828,34 +2191,75 @@ void QtMainWindow::connectDeckSettings() {
         }
     }
     
-    // EQ Controls für Deck B
+    // EQ Controls für Deck B - BEHEBT HAUPTPROBLEM: Ruft SOWOHL DeckSettings ALS AUCH Audio-Engine auf
     if (rightHigh && rightMid && rightLow) {
         connect(rightHigh, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double gain = (value - 50.0) / 50.0;
+            double gain = value / 100.0;
+            std::cout << "*** RIGHT HIGH EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setHighGain(gain);
+                std::cout << "*** Called playerB->setHighGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             auto& config = DeckSettings::instance().getDeckB();
             DeckSettings::instance().setEQ(1, gain, config.midGain, config.lowGain);
         });
         
         connect(rightMid, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double gain = (value - 50.0) / 50.0;
+            double gain = value / 100.0;
+            std::cout << "*** RIGHT MID EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setMidGain(gain);
+                std::cout << "*** Called playerB->setMidGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             auto& config = DeckSettings::instance().getDeckB();
             DeckSettings::instance().setEQ(1, config.highGain, gain, config.lowGain);
         });
         
         connect(rightLow, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double gain = (value - 50.0) / 50.0;
+            double gain = value / 100.0;
+            std::cout << "*** RIGHT LOW EQ CHANGED: " << value << " -> " << gain << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setLowGain(gain);
+                std::cout << "*** Called playerB->setLowGain(" << gain << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             auto& config = DeckSettings::instance().getDeckB();
             DeckSettings::instance().setEQ(1, config.highGain, config.midGain, gain);
         });
+    } else {
+        std::cout << "*** ERROR: EQ dials not found for Deck B!" << std::endl;
     }
     
-    // Filter für Deck B
+    // Filter für Deck B - BEHEBT HAUPTPROBLEM: Ruft SOWOHL DeckSettings ALS AUCH Audio-Engine auf
     if (rightFilter) {
         connect(rightFilter, QOverload<int>::of(&QDial::valueChanged), [this](int value) {
-            double pos = (value - 50.0) / 50.0;
+            double pos = value / 100.0;
+            std::cout << "*** RIGHT FILTER CHANGED: " << value << " -> " << pos << std::endl;
+            // 1. Audio-Engine informieren (WICHTIG für sofortigen Effekt!)
+            if (playerB) {
+                playerB->setFilterCutoff(pos);
+                std::cout << "*** Called playerB->setFilterCutoff(" << pos << ")" << std::endl;
+            } else {
+                std::cout << "*** ERROR: playerB is nullptr!" << std::endl;
+            }
+            // 2. DeckSettings aktualisieren (aber NICHT speichern)
             DeckSettings::instance().setFilter(1, pos);
         });
+    } else {
+        std::cout << "*** ERROR: Filter dial not found for Deck B!" << std::endl;
     }
+    */
     
     // Volume für Deck B
     if (rightVolumeSlider) {
@@ -1866,5 +2270,117 @@ void QtMainWindow::connectDeckSettings() {
     }
     
     qDebug() << "BetaPulseX: Deck settings connections established";
+}
+
+// Event filter for double-click reset functionality
+bool QtMainWindow::eventFilter(QObject *obj, QEvent *event) {
+    if (event->type() == QEvent::MouseButtonDblClick) {
+        QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+        if (mouseEvent->button() == Qt::LeftButton) {
+            // EQ controls - reset to 0 (neutral)
+            if (obj == leftHigh || obj == leftMid || obj == leftLow || obj == leftFilter ||
+                obj == rightHigh || obj == rightMid || obj == rightLow || obj == rightFilter) {
+                QDial *dial = qobject_cast<QDial*>(obj);
+                if (dial) {
+                    std::cout << "Double-click reset: " << dial->toolTip().toStdString() << " to 0 (neutral)" << std::endl;
+                    dial->setValue(0);
+                    return true;
+                }
+            }
+            // Volume sliders - reset to 100 (full volume)
+            else if (obj == leftVolumeSlider || obj == rightVolumeSlider) {
+                QSlider *slider = qobject_cast<QSlider*>(obj);
+                if (slider) {
+                    std::cout << "Double-click reset: Volume slider to 100 (full volume)" << std::endl;
+                    slider->setValue(100);
+                    return true;
+                }
+            }
+            // Crossfader - reset to 50 (center)
+            else if (obj == crossfader) {
+                QSlider *slider = qobject_cast<QSlider*>(obj);
+                if (slider) {
+                    std::cout << "Double-click reset: Crossfader to 50 (center)" << std::endl;
+                    slider->setValue(50);
+                    return true;
+                }
+            }
+        }
+    }
+    return QWidget::eventFilter(obj, event);
+}
+
+// PREROLL SUPPORT: Update playback positions automatically for smooth UI
+void QtMainWindow::updatePlaybackPositions() {
+    // Only update when not scratching to prevent interference
+    static double lastPosA = -999.0;
+    static double lastPosB = -999.0;
+    static int debugCounter = 0;
+    
+    qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    
+    // Debug: Print position updates occasionally
+    if (++debugCounter % 200 == 0) {
+        std::cout << "[Timer] Update positions - A: " << (playerA ? playerA->getPositionRelative() : -999.0) 
+                  << ", B: " << (playerB ? playerB->getPositionRelative() : -999.0) << std::endl;
+    }
+    
+    // Update Deck A position - with post-scratch delay to prevent conflicts
+    bool canUpdateA = playerA && overviewTopA && !overviewTopA->isScratching() && 
+                      (currentTime - lastScratchEndA > 100); // 100ms delay after scratch end
+    
+    if (canUpdateA) {
+        double relativePos = playerA->getPositionRelative();
+        
+        // Even smarter threshold: very small in preroll for smooth movement, moderate in song
+        double threshold = (relativePos < 0.0) ? 0.0002 : 0.008; // Preroll: 0.0002, Song: 0.008
+        
+        if (std::abs(relativePos - lastPosA) > threshold) {
+            lastPosA = relativePos;
+            
+            // Update waveform displays - be explicit about the position
+            overviewTopA->setPlayhead(relativePos);
+            if (deckA && deckA->getWaveform()) {
+                deckA->getWaveform()->setPlayhead(relativePos);
+            }
+            
+            // Debug: Log significant position changes
+            if (debugCounter % 50 == 0) {
+                std::cout << "[Timer] Deck A position updated to: " << relativePos << std::endl;
+            }
+        }
+    } else if (overviewTopA && overviewTopA->isScratching()) {
+        // Update scratch end time when scratching is detected
+        lastScratchEndA = currentTime;
+    }
+    
+    // Update Deck B position independently - with post-scratch delay
+    bool canUpdateB = playerB && overviewTopB && !overviewTopB->isScratching() && 
+                      (currentTime - lastScratchEndB > 100); // 100ms delay after scratch end
+    
+    if (canUpdateB) {
+        double relativePos = playerB->getPositionRelative();
+        
+        // Even smarter threshold: very small in preroll for smooth movement, moderate in song
+        double threshold = (relativePos < 0.0) ? 0.0002 : 0.008; // Preroll: 0.0002, Song: 0.008
+        
+        if (std::abs(relativePos - lastPosB) > threshold) {
+            lastPosB = relativePos;
+            
+            // Update waveform displays - be explicit about the position
+            overviewTopB->setPlayhead(relativePos);
+            if (deckB && deckB->getWaveform()) {
+                deckB->getWaveform()->setPlayhead(relativePos);
+            }
+            
+            // Debug: Log significant position changes
+            if (debugCounter % 50 == 0) {
+                std::cout << "[Timer] Deck B position updated to: " << relativePos << std::endl;
+            }
+        }
+    } else if (overviewTopB && overviewTopB->isScratching()) {
+        // Update scratch end time when scratching is detected
+        lastScratchEndB = currentTime;
+    }
 }
 

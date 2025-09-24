@@ -1,4 +1,4 @@
-// Copied from project root
+    // Copied from project root
 #include "DJAudioPlayer.h"
 #include <QDebug>
 #include <cmath>
@@ -120,25 +120,22 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         if (enable) {
             resampleSource.setResamplingRatio(1.0);
 #if defined(RUBBERBAND_FOUND)
-            // Start RubberBand when keylock is enabled for 24/7 operation (no lag)
+            // Start RubberBand when keylock is enabled - it will run CONTINUOUSLY until disabled
             if (!rbReady) {
                 rbReady = true;
                 rbPaddedStartDone = false;
                 rbDiscardOutRemaining = 0;
-                if (debugKeylock) std::cout << "[KL] RB started for 24/7 mode" << std::endl;
+                keylockPrimeSamplesRemaining = (int) std::ceil((keylockPrimeMs / 1000.0) * currentSampleRate);
+                if (debugKeylock) std::cout << "[KL] RB started for CONTINUOUS mode" << std::endl;
             }
 #endif
-            // Start a brief prime period to accumulate input only if RB wasn't already running
-            if (!rbReady) {
-                keylockPrimeSamplesRemaining = (int) std::ceil((keylockPrimeMs / 1000.0) * currentSampleRate);
-            }
         } else {
             resampleSource.setResamplingRatio(currentSpeed);
 #if defined(RUBBERBAND_FOUND)
-            // Keep RB running when keylock is disabled for instant re-activation
-            // RB will run in pass-through mode at unity speed
-            if (rbReady && debugKeylock) {
-                std::cout << "[KL] RB staying active for instant re-enable" << std::endl;
+            // Stop RB completely when keylock is disabled
+            rbReady = false;
+            if (debugKeylock) {
+                std::cout << "[KL] RB stopped - keylock disabled" << std::endl;
             }
 #endif
         }
@@ -147,6 +144,47 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     // Immediate silence requested (e.g., right after stop) or soft-paused (keep transport running)
     if (forceSilent.load() || softPaused.load()) {
         bufferToFill.clearActiveBufferRegion();
+        return;
+    }
+
+    // PREROLL AUDIO HANDLING: If in preroll mode and playing, count toward track start
+    if (inPrerollMode && transportSource.isPlaying()) {
+        // Calculate how much time to advance based on sample rate and buffer size
+        double timeAdvance = double(bufferToFill.numSamples) / currentSampleRate;
+        double currentPrerollTime = prerollPosition * prerollTimeSec; // Convert to seconds
+        currentPrerollTime += timeAdvance; // Advance forward in time
+        
+        if (currentPrerollTime >= -0.01) { // Start transition slightly before 0.0 for smoother handoff
+            // Close to track start - prepare for smooth transition
+            std::cout << "Preroll count-in complete - smooth transition to track" << std::endl;
+            inPrerollMode = false;
+            prerollPosition = 0.0;
+            transportSource.setPosition(0.0);
+            
+            // KEYLOCK FIX: Reset RubberBand state for clean transition
+#if defined(RUBBERBAND_FOUND)
+            if (keylockEnabled && rbReady) {
+                // Flush RubberBand to clear any internal state
+                rb->reset();
+                rbPaddedStartDone = false;
+                rbDiscardOutRemaining = 0;
+                keylockPrimeSamplesRemaining = (int) std::ceil((keylockPrimeMs / 1000.0) * currentSampleRate);
+                if (debugKeylock) std::cout << "[KL] RubberBand reset for clean preroll transition" << std::endl;
+            }
+#endif
+            // Continue to normal audio processing below for immediate audio start
+        } else {
+            // Still in preroll - output silence and update position smoothly
+            prerollPosition = currentPrerollTime / prerollTimeSec; // Convert back to relative
+            bufferToFill.clearActiveBufferRegion();
+            return;
+        }
+    } else if (inPrerollMode) {
+        // Preroll mode but not playing - just output silence
+        bufferToFill.clearActiveBufferRegion();
+        if (transportSource.getCurrentPosition() > 0.1) {
+            transportSource.setPosition(0.0);
+        }
         return;
     }
 
@@ -406,6 +444,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             bufferToFill.clearActiveBufferRegion();
             return;
         }
+        
         // Priming stage: feed input and output silence until primed (only if keylock is active)
         if (keylockPrimeSamplesRemaining > 0 && isKeylockActive) {
             const int chsRB = rbNumChannels;
@@ -428,61 +467,17 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             return;
         }
         
-        // If keylock is off, run RB in pass-through mode (ready for instant keylock activation)
+        // If keylock is off, use normal resampling and don't run RubberBand
         if (!isKeylockActive) {
-            if (debugKeylock) std::cout << "[RB] Pass-through mode (keylock off, staying ready)" << std::endl;
-            // Set to unity ratio for pass-through
-            if (std::abs(rbLastTimeRatio - 1.0) > 1e-4) {
-                rb->setTimeRatio(1.0);
-                rbLastTimeRatio = 1.0;
-            }
-            rb->setPitchScale(1.0);
-            
-            // Process audio through RB but at unity speed (ready for instant keylock)
+            if (debugKeylock) std::cout << "[RB] Keylock OFF - using normal resampling" << std::endl;
             resampleSource.setResamplingRatio(currentSpeed); // Normal pitch+tempo changes
-            
-            // Simple pass-through with minimal processing
-            const int desiredOut = bufferToFill.numSamples;
-            const int chsOut = bufferToFill.buffer->getNumChannels();
-            const int chsRB = rbNumChannels;
-            
-            // Get input directly into output buffer
             resampleSource.getNextAudioBlock(bufferToFill);
-            
-            // Feed the same audio through RB to keep it primed (discard RB output)
-            if (rbInputBuffer.getNumChannels() < chsRB || rbInputBuffer.getNumSamples() < desiredOut)
-                rbInputBuffer.setSize(chsRB, desiredOut, false, true, true);
-            
-            // Copy from output buffer to RB input buffer
-            const int copyChs = std::min(chsOut, chsRB);
-            for (int c = 0; c < copyChs; ++c) {
-                rbInputBuffer.copyFrom(c, 0, *bufferToFill.buffer, c, bufferToFill.startSample, desiredOut);
-            }
-            
-            std::vector<const float*> inPtrs(chsRB);
-            for (int c = 0; c < chsRB; ++c) inPtrs[c] = rbInputBuffer.getReadPointer(c);
-            rb->process(inPtrs.data(), desiredOut, false);
-            
-            // Discard RB output to keep it fresh
-            while (rb->available() > 0) {
-                int avail = std::min(rb->available(), desiredOut);
-                if (rbOutScratch.getNumChannels() < chsRB || rbOutScratch.getNumSamples() < avail)
-                    rbOutScratch.setSize(chsRB, avail, false, true, true);
-                std::vector<float*> outPtrsRB(chsRB);
-                for (int c = 0; c < chsRB; ++c) outPtrsRB[c] = rbOutScratch.getWritePointer(c);
-                rb->retrieve(outPtrsRB.data(), avail);
-            }
             return;
         }
         
         try {
-        // Near-unity speeds: bypass stretching for transparency (keylock active mode)
-        if (std::abs(currentSpeed - 1.0) <= 0.01) {
-            if (debugKeylock) std::cout << "[RB] Near unity speed=" << currentSpeed << ", bypass" << std::endl;
-            resampleSource.setResamplingRatio(currentSpeed); // very small change, accept slight pitch shift for quality
-            resampleSource.getNextAudioBlock(bufferToFill);
-            return;
-        }
+        // When keylock is active, ALWAYS use RubberBand processing (even at 1.0x speed)
+        // This ensures consistent behavior and no audio dropout at unity speed
         // Set desired time ratio (tempo change) and keep pitch 1.0
         const double speed = std::clamp(currentSpeed, 0.05, 8.0);
         double timeRatio = 1.0 / speed; // speed up -> smaller ratio
@@ -501,7 +496,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         // Ensure we provide enough input using getSamplesRequired when possible
         resampleSource.setResamplingRatio(1.0);
 
-    // Handle preferred start padding once after (re)initialisation
+        // Handle preferred start padding once after (re)initialisation
         if (!rbPaddedStartDone) {
             size_t pad = rb->getPreferredStartPad();
             if (debugKeylock) std::cout << "[KL][RB] preferredStartPad=" << pad << std::endl;
@@ -663,88 +658,63 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     if (!dspPrepared || bufferToFill.buffer->getNumChannels() == 0) {
         return; // Early exit if no DSP needed
     }
-    
-    // Check if any processing is actually needed
-    const bool needsEQ = (std::abs(highGain) > 0.01f) || (std::abs(midGain) > 0.01f) || (std::abs(lowGain) > 0.01f);
-    const bool needsFilter = std::abs(filterKnob) > 0.15;
-    
-    if (!needsEQ && !needsFilter) {
-        return; // Skip all DSP if no effects are active
+
+    // DEBUG: Check if DSP is running and what the EQ values are
+    static int dspDebugCounter = 0;
+    if (++dspDebugCounter % 100 == 0) {
+        std::cout << "DSP RUNNING: low=" << lowGain << ", mid=" << midGain 
+                  << ", high=" << highGain << ", filter=" << filterKnob << std::endl;
     }
 
     AudioBuffer<float>& buffer = *bufferToFill.buffer;
     const int numSamples = bufferToFill.numSamples;
     const int startSample = bufferToFill.startSample;
-    
-    // Use JUCE's optimized audio block system
+
     juce::dsp::AudioBlock<float> block(buffer);
     auto subBlock = block.getSubBlock(startSample, numSamples);
-    
-    // Limit to stereo for performance
     auto limitedBlock = subBlock.getSubsetChannelBlock(0, std::min(buffer.getNumChannels(), 2));
     juce::dsp::ProcessContextReplacing<float> ctx(limitedBlock);
 
-    // PERFORMANCE: Reduced tolerance and update frequency  
-    const float tolerance = 0.05f; // Larger tolerance = fewer updates
-    static int updateCounter = 0;
-    const bool shouldUpdate = (++updateCounter & 7) == 0; // Update every 8th buffer
-    
-    if (needsEQ && shouldUpdate) {
-        // Update EQ coefficients only when significantly changed AND on update cycle
-        if (std::abs(highGain - lastHighGain) > tolerance) {
-            float gainDb = juce::jlimit(-12.0f, 12.0f, (float)(highGain * 12.0)); 
-            float gainLinear = juce::Decibels::decibelsToGain(gainDb);
-            highShelf.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf(
-                currentSampleRate, 8000.0f, 0.707f, gainLinear);
-            lastHighGain = highGain;
-        }
-        
-        if (std::abs(midGain - lastMidGain) > tolerance) {
-            float gainDb = juce::jlimit(-12.0f, 12.0f, (float)(midGain * 12.0));
-            float gainLinear = juce::Decibels::decibelsToGain(gainDb);
-            midPeak.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter(
-                currentSampleRate, 2500.0f, 1.0f, gainLinear);
-            lastMidGain = midGain;
-        }
-        
-        if (std::abs(lowGain - lastLowGain) > tolerance) {
-            float gainDb = juce::jlimit(-12.0f, 12.0f, (float)(lowGain * 12.0));
-            float gainLinear = juce::Decibels::decibelsToGain(gainDb);
-            lowShelf.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf(
-                currentSampleRate, 300.0f, 0.707f, gainLinear);
-            lastLowGain = lowGain;
-        }
-    }
+    // EQ-Parameter immer aktualisieren
+    float gainDbHigh = juce::jlimit(-12.0f, 12.0f, (float)(highGain * 12.0)); 
+    float gainLinearHigh = juce::Decibels::decibelsToGain(gainDbHigh);
+    highShelf.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf(
+        currentSampleRate, 8000.0f, 0.707f, gainLinearHigh);
 
-    // Apply EQ only if needed
-    if (needsEQ) {
-        if (std::abs(lowGain) > 0.01f) lowShelf.process(ctx);
-        if (std::abs(midGain) > 0.01f) midPeak.process(ctx);  
-        if (std::abs(highGain) > 0.01f) highShelf.process(ctx);
-    }
+    float gainDbMid = juce::jlimit(-12.0f, 12.0f, (float)(midGain * 12.0));
+    float gainLinearMid = juce::Decibels::decibelsToGain(gainDbMid);
+    midPeak.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter(
+        currentSampleRate, 2500.0f, 1.0f, gainLinearMid);
 
-    // Optimized filter processing with reduced updates
-    if (needsFilter && shouldUpdate && std::abs(filterKnob - lastFilterKnob) > tolerance) {
-        const double bypassZone = 0.15; 
-        double absNorm = (std::abs(filterKnob) - bypassZone) / (1.0 - bypassZone);
-        
-        if (filterKnob < 0.0) {
-            // Smooth lowpass curve: 20kHz down to 200Hz
-            double cutoffHz = 20000.0 * std::pow(0.01, absNorm);
-            svf.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
-            svf.setCutoffFrequency(juce::jlimit(200.0f, 20000.0f, (float)cutoffHz));
-        } else {
-            // Smooth highpass curve: 20Hz up to 5kHz  
-            double cutoffHz = 20.0 * std::pow(250.0, absNorm);
-            svf.setType(juce::dsp::StateVariableTPTFilterType::highpass);
-            svf.setCutoffFrequency(juce::jlimit(20.0f, 5000.0f, (float)cutoffHz));
-        }
-        lastFilterKnob = filterKnob;
+    float gainDbLow = juce::jlimit(-12.0f, 12.0f, (float)(lowGain * 12.0));
+    float gainLinearLow = juce::Decibels::decibelsToGain(gainDbLow);
+    lowShelf.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf(
+        currentSampleRate, 300.0f, 0.707f, gainLinearLow);
+
+    // EQ immer anwenden
+    lowShelf.process(ctx);
+    midPeak.process(ctx);
+    highShelf.process(ctx);
+
+    // Filter-Parameter immer aktualisieren
+    if (filterKnob < 0.0) {
+        double absNorm = std::abs(filterKnob);
+        double cutoffHz = 20000.0 * std::pow(0.01, absNorm);
+        svf.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+        svf.setCutoffFrequency(juce::jlimit(200.0f, 20000.0f, (float)cutoffHz));
+    } else {
+        double absNorm = filterKnob;
+        double cutoffHz = 20.0 * std::pow(250.0, absNorm);
+        svf.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+        svf.setCutoffFrequency(juce::jlimit(20.0f, 5000.0f, (float)cutoffHz));
     }
+    svf.process(ctx);
     
-    // Apply filter only when needed
-    if (needsFilter) {
-        svf.process(ctx);
+    // DEBUG: Print EQ and filter values every 500th buffer for monitoring
+    static int eqDebugCounter = 0;
+    if (++eqDebugCounter % 500 == 0) {
+        std::cout << "EQ/Filter values: low=" << lowGain << ", mid=" << midGain 
+                  << ", high=" << highGain << ", filter=" << filterKnob << std::endl;
     }
     
     // Audio level monitoring for Master Out display
@@ -944,21 +914,42 @@ void DJAudioPlayer::setPosition(double posInSecs) {
 }
 
 void DJAudioPlayer::setPositionRelative(double pos) {
-    if (pos < 0.0 || pos > 1.0) {
-        std::cout << "DJAudioPlayer::setPositionRelative should be between 0.0 and 1.0\n";
+    // PREROLL SUPPORT: Allow UNLIMITED negative positions for DJ-style cueing
+    // No minimum limit - DJs should be able to cue as far back as they want
+    const double minRelativePos = -999.0; // Effectively unlimited preroll
+    
+    if (pos < minRelativePos || pos > 1.0) {
+        std::cout << "DJAudioPlayer::setPositionRelative should be between " << minRelativePos << " and 1.0 (unlimited preroll)\n";
     } else {
-        const double relativePos = transportSource.getLengthInSeconds() * pos;
-        // Apply quantization if enabled
-        double finalPos = quantizePosition(relativePos);
-        setPosition(finalPos);
-        // Ensure paused resume picks up here
-        if (!transportSource.isPlaying() || softPaused.load()) {
-            pausedPosSec = finalPos;
+        if (pos < 0.0) {
+            // In preroll area - set transport to position 0 but remember the preroll offset
+            transportSource.setPosition(0.0);
+            prerollPosition = pos;  // Store the negative position
+            inPrerollMode = true;
+            pausedPosSec = 0.0;
+            std::cout << "Preroll position: " << pos << " (cued to start)" << std::endl;
+        } else {
+            // Normal position within track
+            inPrerollMode = false;
+            prerollPosition = 0.0;
+            const double relativePos = trackLengthSec * pos;
+            // Apply quantization if enabled
+            double finalPos = quantizePosition(relativePos);
+            setPosition(finalPos);
+            // Ensure paused resume picks up here
+            if (!transportSource.isPlaying() || softPaused.load()) {
+                pausedPosSec = finalPos;
+            }
         }
     }
 }
 
 double DJAudioPlayer::getPositionRelative() {
+    // PREROLL SUPPORT: Return preroll position when in preroll mode
+    if (inPrerollMode) {
+        return prerollPosition;  // Return the negative position
+    }
+    
     double currentPosInSecs = transportSource.getCurrentPosition();
     double lengthInSecs = transportSource.getLengthInSeconds();
 
@@ -979,6 +970,15 @@ void DJAudioPlayer::start() {
         std::cout << "  dspPrepared: " << dspPrepared << std::endl;
         
         if (readerSource.get() != nullptr) {
+            // PREROLL SUPPORT: Handle play from preroll position
+            if (inPrerollMode) {
+                std::cout << "  Starting from preroll - will count in and transition to track start" << std::endl;
+                // Stay in preroll mode but enable count-in behavior
+                // The audio will play silence until reaching position 0.0, then start the track
+                transportSource.setPosition(0.0);
+                // Don't exit preroll mode yet - let it transition naturally during playback
+            }
+            
             // Check current position and length to debug auto-stop
             double currentPos = transportSource.getCurrentPosition();
             double totalLength = transportSource.getLengthInSeconds();
@@ -1105,13 +1105,13 @@ void DJAudioPlayer::reinitRubberBand() {
         rbInputBuffer.setSize(rbNumChannels, std::max(256, lastBlockSizeHint));
         rbInputBuffer.clear();
         rbReady = true;
-        rbPaddedStartDone = false;
+        rbPaddedStartDone = false; // Normal padding will be done
         rbLatencySamples = (int)rb->getStartDelay();
         rbLatencySeconds = rbLatencySamples / currentSampleRate;
         rbDiscardOutRemaining = 0;
         rbOutScratch.setSize(rbNumChannels, std::max(256, lastBlockSizeHint));
         rbOutScratch.clear();
-        std::cout << "Rubber Band init: quality=" << (int)rbQuality << ", engine=" << rb->getEngineVersion() << ", SR=" << currentSampleRate << std::endl;
+        std::cout << "Rubber Band init: CONTINUOUS when keylock ON, quality=" << (int)rbQuality << ", engine=" << rb->getEngineVersion() << ", SR=" << currentSampleRate << std::endl;
     } catch (const std::exception& e) {
         std::cout << "RubberBand init failed: " << e.what() << std::endl;
         rb.reset();
@@ -1149,21 +1149,25 @@ bool DJAudioPlayer::isPlaying() {
 
 // Simple EQ/filter stubs (store values, no DSP applied yet) - optimized for real-time performance
 void DJAudioPlayer::setHighGain(double v) {
+    std::cout << "DJAudioPlayer::setHighGain called with: " << v << std::endl;
     highGain = std::clamp(v, -1.0, 1.0);
     // Coefficient update will happen in getNextAudioBlock for thread safety
 }
 
 void DJAudioPlayer::setMidGain(double v) {
+    std::cout << "DJAudioPlayer::setMidGain called with: " << v << std::endl;
     midGain = std::clamp(v, -1.0, 1.0);
     // Coefficient update will happen in getNextAudioBlock for thread safety
 }
 
 void DJAudioPlayer::setLowGain(double v) {
+    std::cout << "DJAudioPlayer::setLowGain called with: " << v << std::endl;
     lowGain = std::clamp(v, -1.0, 1.0);
     // Coefficient update will happen in getNextAudioBlock for thread safety
 }
 
 void DJAudioPlayer::setFilterCutoff(double v) {
+    std::cout << "DJAudioPlayer::setFilterCutoff called with: " << v << std::endl;
     filterKnob = std::clamp(v, -1.0, 1.0);
     // Filter update will happen in getNextAudioBlock for thread safety
 }

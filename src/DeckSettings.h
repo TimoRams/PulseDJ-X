@@ -20,36 +20,39 @@
  */
 class DeckSettings {
 public:
-    // Einzelne Deck-Konfiguration
+    // Einzelne Deck-Konfiguration - VEREINFACHT: Nur wichtige Einstellungen speichern
     struct DeckConfig {
-        // Transport & Tempo
+        // Transport & Tempo - NUR DIESE WERDEN GESPEICHERT
         bool keylockEnabled = false;
         bool quantizeEnabled = false;
-        double speedFactor = 1.0;       // 1.0 = original speed
-        double gain = 0.75;             // 0.0 - 1.0
         
-        // EQ Einstellungen
-        double highGain = 0.0;          // -1.0 bis +1.0
-        double midGain = 0.0;           // -1.0 bis +1.0
-        double lowGain = 0.0;           // -1.0 bis +1.0
+        // ALLE ANDEREN WERTE SIND NICHT PERSISTENT (springen auf Standard zurück)
+        // Diese werden nur zur Laufzeit verwendet aber NICHT gespeichert:
+        double speedFactor = 1.0;       // Reset bei jedem Start
+        double gain = 0.75;             // Reset bei jedem Start
         
-        // Filter
-        double filterPosition = 0.0;    // -1.0 bis +1.0 (negativ=lowpass, positiv=highpass)
+        // EQ Einstellungen - NICHT GESPEICHERT (immer Standard)
+        double highGain = 0.0;          // Immer 0.0 beim Start
+        double midGain = 0.0;           // Immer 0.0 beim Start  
+        double lowGain = 0.0;           // Immer 0.0 beim Start
         
-        // Visual & Display
-        double visualTrim = 0.0;        // Visual offset in seconds
+        // Filter - NICHT GESPEICHERT (immer Standard)
+        double filterPosition = 0.0;    // Immer 0.0 beim Start
         
-        // Loop Einstellungen
-        bool loopEnabled = false;
-        double loopStartSec = 0.0;
-        double loopLengthSec = 4.0;     // Standard 4-Beat Loop
+        // Visual & Display - NICHT GESPEICHERT
+        double visualTrim = 0.0;        // Immer 0.0 beim Start
         
-        // Scratch & Performance
-        bool scratchMode = false;
+        // Loop Einstellungen - NICHT GESPEICHERT  
+        bool loopEnabled = false;       // Immer false beim Start
+        double loopStartSec = 0.0;      // Immer 0.0 beim Start
+        double loopLengthSec = 4.0;     // Immer 4.0 beim Start
         
-        // Zuletzt geladener Track (für Session-Wiederherstellung)
-        QString lastTrackPath;
-        double lastPosition = 0.0;      // Position in Sekunden
+        // Scratch & Performance - NICHT GESPEICHERT
+        bool scratchMode = false;       // Immer false beim Start
+        
+        // Session Restore - NICHT GESPEICHERT
+        QString lastTrackPath;          // Leer beim Start
+        double lastPosition = 0.0;      // Immer 0.0 beim Start
         
         // Cue Points (bis zu 8 Cue Points pro Deck)
         struct CuePoint {
@@ -65,23 +68,31 @@ public:
         return instance;
     }
     
-    // Lade alle Deck-Settings
+    // Lade alle Deck-Settings - NUR KEYLOCK UND QUANTIZE
     void loadSettings() {
         QString settingsPath = AppConfig::instance().getConfigDirectory() + "/deck_settings.ini";
         QSettings settings(settingsPath, QSettings::IniFormat);
         
-        // Deck A laden
-        deckA = loadDeckConfig(settings, "DeckA");
+        // Deck A laden - NUR keylock und quantize
+        settings.beginGroup("DeckA");
+        deckA.keylockEnabled = settings.value("keylock", false).toBool();
+        deckA.quantizeEnabled = settings.value("quantize", false).toBool();
+        // ALLE ANDEREN WERTE BLEIBEN AUF STANDARD (werden nicht geladen)
+        settings.endGroup();
         
-        // Deck B laden  
-        deckB = loadDeckConfig(settings, "DeckB");
+        // Deck B laden - NUR keylock und quantize
+        settings.beginGroup("DeckB");
+        deckB.keylockEnabled = settings.value("keylock", false).toBool();
+        deckB.quantizeEnabled = settings.value("quantize", false).toBool();
+        // ALLE ANDEREN WERTE BLEIBEN AUF STANDARD (werden nicht geladen)
+        settings.endGroup();
         
-        qDebug() << "BetaPulseX: Deck settings loaded from" << settingsPath;
+        qDebug() << "BetaPulseX: Nur Keylock/Quantize geladen:";
         qDebug() << "  Deck A: Keylock=" << deckA.keylockEnabled << "Quantize=" << deckA.quantizeEnabled;
         qDebug() << "  Deck B: Keylock=" << deckB.keylockEnabled << "Quantize=" << deckB.quantizeEnabled;
     }
     
-    // Speichere alle Deck-Settings
+    // Speichere alle Deck-Settings - NUR KEYLOCK UND QUANTIZE
     void saveSettings() {
         // Stelle sicher, dass Config-Verzeichnis existiert
         AppConfig::instance().createDirectories();
@@ -89,16 +100,25 @@ public:
         QString settingsPath = AppConfig::instance().getConfigDirectory() + "/deck_settings.ini";
         QSettings settings(settingsPath, QSettings::IniFormat);
         
-        // Deck A speichern
-        saveDeckConfig(settings, "DeckA", deckA);
+        // Lösche alte Settings komplett für saubere Neuanlage
+        settings.clear();
         
-        // Deck B speichern
-        saveDeckConfig(settings, "DeckB", deckB);
+        // Deck A speichern - NUR keylock und quantize
+        settings.beginGroup("DeckA");
+        settings.setValue("keylock", deckA.keylockEnabled);
+        settings.setValue("quantize", deckA.quantizeEnabled);
+        settings.endGroup();
+        
+        // Deck B speichern - NUR keylock und quantize  
+        settings.beginGroup("DeckB");
+        settings.setValue("keylock", deckB.keylockEnabled);
+        settings.setValue("quantize", deckB.quantizeEnabled);
+        settings.endGroup();
         
         // Explizit synchronisieren
         settings.sync();
         
-        qDebug() << "BetaPulseX: Deck settings saved to" << settingsPath;
+        qDebug() << "BetaPulseX: Nur Keylock/Quantize gespeichert nach" << settingsPath;
     }
     
     // Getter für Deck-Konfigurationen
@@ -116,20 +136,21 @@ public:
         return (deckIndex == 0) ? deckA : deckB;
     }
     
-    // Quick-Access für häufige Einstellungen
+    // Quick-Access für wichtige Einstellungen - NUR KEYLOCK UND QUANTIZE GESPEICHERT
     void setKeylock(int deckIndex, bool enabled) {
         getDeck(deckIndex).keylockEnabled = enabled;
-        autoSave();
+        autoSave(); // Wird gespeichert
     }
     
     void setQuantize(int deckIndex, bool enabled) {
         getDeck(deckIndex).quantizeEnabled = enabled;
-        autoSave();
+        autoSave(); // Wird gespeichert
     }
     
+    // FOLGENDE FUNKTIONEN AKTUALISIEREN NUR LAUFZEIT-WERTE (NICHT GESPEICHERT)
     void setSpeedFactor(int deckIndex, double factor) {
         getDeck(deckIndex).speedFactor = factor;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     void setEQ(int deckIndex, double high, double mid, double low) {
@@ -137,22 +158,22 @@ public:
         deck.highGain = high;
         deck.midGain = mid;
         deck.lowGain = low;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     void setFilter(int deckIndex, double position) {
         getDeck(deckIndex).filterPosition = position;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     void setGain(int deckIndex, double gain) {
         getDeck(deckIndex).gain = gain;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     void setVisualTrim(int deckIndex, double trimSec) {
         getDeck(deckIndex).visualTrim = trimSec;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     void setLoop(int deckIndex, bool enabled, double startSec = 0.0, double lengthSec = 4.0) {
@@ -160,7 +181,7 @@ public:
         deck.loopEnabled = enabled;
         deck.loopStartSec = startSec;
         deck.loopLengthSec = lengthSec;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     void setCuePoint(int deckIndex, int cueIndex, bool active, double position, const QString& label = "") {
@@ -169,7 +190,7 @@ public:
             cue.active = active;
             cue.position = position;
             cue.label = label;
-            autoSave();
+            // NICHT gespeichert - autoSave() NICHT aufgerufen
         }
     }
     
@@ -177,24 +198,25 @@ public:
         auto& deck = getDeck(deckIndex);
         deck.lastTrackPath = trackPath;
         deck.lastPosition = position;
-        autoSave();
+        // NICHT gespeichert - autoSave() NICHT aufgerufen
     }
     
     // Reset alle Settings auf Default-Werte
     void resetToDefaults() {
-        deckA = DeckConfig(); // Default constructor
-        deckB = DeckConfig(); // Default constructor
+        deckA = DeckConfig(); // Default constructor - alle Werte auf Standard
+        deckB = DeckConfig(); // Default constructor - alle Werte auf Standard
         
         // Lösche alle gespeicherten Settings
-        QSettings settings(AppConfig::instance().getSettingsPath(), QSettings::IniFormat);
+        QString settingsPath = AppConfig::instance().getConfigDirectory() + "/deck_settings.ini";
+        QSettings settings(settingsPath, QSettings::IniFormat);
         settings.clear();
         
-        // Speichere Default-Werte
+        // Speichere Standard-Werte (nur Keylock/Quantize = false)
         if (autoSaveEnabled) {
             saveSettings();
         }
         
-        qDebug() << "BetaPulseX: All deck settings reset to defaults";
+        qDebug() << "BetaPulseX: Alle Deck-Settings auf Standard zurückgesetzt";
     }
     
     // Auto-Save aktivieren/deaktivieren
@@ -213,103 +235,6 @@ private:
         if (autoSaveEnabled) {
             saveSettings();
         }
-    }
-    
-    DeckConfig loadDeckConfig(QSettings& settings, const QString& deckSection) {
-        settings.beginGroup(deckSection);
-        
-        DeckConfig config;
-        
-        // Transport & Tempo
-        config.keylockEnabled = settings.value("keylock", false).toBool();
-        config.quantizeEnabled = settings.value("quantize", false).toBool();
-        config.speedFactor = settings.value("speedFactor", 1.0).toDouble();
-        config.gain = settings.value("gain", 0.75).toDouble();
-        
-        // EQ
-        config.highGain = settings.value("eq/high", 0.0).toDouble();
-        config.midGain = settings.value("eq/mid", 0.0).toDouble();
-        config.lowGain = settings.value("eq/low", 0.0).toDouble();
-        
-        // Filter
-        config.filterPosition = settings.value("filter", 0.0).toDouble();
-        
-        // Visual
-        config.visualTrim = settings.value("visualTrim", 0.0).toDouble();
-        
-        // Loop
-        config.loopEnabled = settings.value("loop/enabled", false).toBool();
-        config.loopStartSec = settings.value("loop/start", 0.0).toDouble();
-        config.loopLengthSec = settings.value("loop/length", 4.0).toDouble();
-        
-        // Performance
-        config.scratchMode = settings.value("scratchMode", false).toBool();
-        
-        // Session
-        config.lastTrackPath = settings.value("session/lastTrack", "").toString();
-        config.lastPosition = settings.value("session/lastPosition", 0.0).toDouble();
-        
-        // Cue Points
-        for (int i = 0; i < 8; ++i) {
-            QString cueGroup = QString("cue%1").arg(i);
-            settings.beginGroup(cueGroup);
-            
-            config.cuePoints[i].active = settings.value("active", false).toBool();
-            config.cuePoints[i].position = settings.value("position", 0.0).toDouble();
-            config.cuePoints[i].label = settings.value("label", "").toString();
-            
-            settings.endGroup();
-        }
-        
-        settings.endGroup();
-        return config;
-    }
-    
-    void saveDeckConfig(QSettings& settings, const QString& deckSection, const DeckConfig& config) {
-        settings.beginGroup(deckSection);
-        
-        // Transport & Tempo
-        settings.setValue("keylock", config.keylockEnabled);
-        settings.setValue("quantize", config.quantizeEnabled);
-        settings.setValue("speedFactor", config.speedFactor);
-        settings.setValue("gain", config.gain);
-        
-        // EQ
-        settings.setValue("eq/high", config.highGain);
-        settings.setValue("eq/mid", config.midGain);
-        settings.setValue("eq/low", config.lowGain);
-        
-        // Filter
-        settings.setValue("filter", config.filterPosition);
-        
-        // Visual
-        settings.setValue("visualTrim", config.visualTrim);
-        
-        // Loop
-        settings.setValue("loop/enabled", config.loopEnabled);
-        settings.setValue("loop/start", config.loopStartSec);
-        settings.setValue("loop/length", config.loopLengthSec);
-        
-        // Performance
-        settings.setValue("scratchMode", config.scratchMode);
-        
-        // Session
-        settings.setValue("session/lastTrack", config.lastTrackPath);
-        settings.setValue("session/lastPosition", config.lastPosition);
-        
-        // Cue Points
-        for (int i = 0; i < 8; ++i) {
-            QString cueGroup = QString("cue%1").arg(i);
-            settings.beginGroup(cueGroup);
-            
-            settings.setValue("active", config.cuePoints[i].active);
-            settings.setValue("position", config.cuePoints[i].position);
-            settings.setValue("label", config.cuePoints[i].label);
-            
-            settings.endGroup();
-        }
-        
-        settings.endGroup();
     }
 };
 

@@ -213,6 +213,11 @@ private:
     double trackFirstBeatOffset{0.0};
     double trackLengthSec{0.0};
     
+    // Preroll state for DJ-style cueing
+    double prerollPosition{0.0};        // Current preroll position (negative when in preroll)
+    bool inPrerollMode{false};          // Whether we're currently in preroll area
+    double prerollTimeSec{8.0};         // Preroll time in seconds (matches WaveformDisplay)
+    
     // Audio level monitoring (thread-safe for real-time display)
     std::atomic<float> leftChannelLevel{0.0f};
     std::atomic<float> rightChannelLevel{0.0f};

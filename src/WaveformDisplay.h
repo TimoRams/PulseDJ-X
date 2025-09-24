@@ -75,6 +75,10 @@ public:
     // Set track length for default beat grid
     void setTrackLength(double lengthSeconds) { trackLengthSec = lengthSeconds; generateDefaultGrid(); }
 
+    // NEW: Enable preroll functionality for DJ-style cueing
+    void setPrerollEnabled(bool enabled) { prerollEnabled = enabled; update(); }
+    void setPrerollTime(double seconds) { prerollTimeSec = seconds; update(); }
+
     // Set tempo factor to adjust beat grid timing (deck-specific)
     void setTempoFactor(double factor) { 
     // Update tempo factor immediately for visual sync (no threshold to reflect tiny slider steps)
@@ -113,6 +117,9 @@ public:
     void setBeatGridZoomLevel(int level); // Set zoom level directly (for synchronization)
     int getBeatGridZoomLevel() const { return beatGridZoomLevel; }
     double getBeatGridZoomFactor() const { return beatGridZoomFactors[beatGridZoomLevel]; }
+    
+    // PREROLL SUPPORT: Check if currently scratching to prevent timer interference
+    bool isScratching() const { return scratching; }
     
     // NEW: Fixed pixels-per-second system for consistent beat grid display
     void setUseFixedPixelsPerSecond(bool use) { useFixedPixelsPerSecond = use; update(); }
@@ -230,9 +237,8 @@ private:
     bool useAnalyzedBeats{false}; // Flag to switch between default grid and analyzed beats
     double firstBeatOffset{0.0}; // Offset of first beat from start of track (seconds)
     
-    // Beat grid zoom system (independent of tempo)
-    static int globalBeatGridZoomLevel; // Shared zoom level between all instances
-    int beatGridZoomLevel{4}; // 0-9, where 4 is standard (1x)
+    // Beat grid zoom system (independent of tempo) - each deck has its own zoom
+    int beatGridZoomLevel{4}; // 0-9, where 4 is standard (1x) - now per-instance
     static constexpr double beatGridZoomFactors[10] = {0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0}; // Extended zoom levels
     
     // NEW: Fixed pixels-per-second system
@@ -271,6 +277,10 @@ private:
     double scratchInitialDisplayPos{0.0}; // Initial display position when scratch started
     double scratchInitialAbsPos{0.0};   // Initial absolute position when scratch started
     
+    // Preroll functionality for DJ-style cueing before track start
+    bool prerollEnabled{true};           // Enable preroll by default
+    double prerollTimeSec{8.0};         // 8 seconds of preroll before track start
+    
     // Viewport caching for scroll mode
     mutable bool viewportDirty{true};
     mutable bool cachedValidViewport{false};
@@ -295,6 +305,9 @@ private:
     
     // NEW: Loop region rendering
     void drawLoopRegion(QPainter& p, double leftSecond, double rightSecond, double timeRange);
+    
+    // NEW: Preroll region rendering for DJ-style cueing
+    void drawPrerollRegion(QPainter& p, double leftSecond, double rightSecond, double timeRange);
     
     // NEW: Ghost loop region rendering
     void drawGhostLoopRegion(QPainter& p, double leftSecond, double rightSecond, double timeRange);
