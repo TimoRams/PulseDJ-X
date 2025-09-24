@@ -49,61 +49,64 @@ void BeatIndicator::setFirstBeatOffsetDeckB(double seconds) { firstBeatOffsetB =
 
 // NEW: Calculate beat position from track time using global beat grid
 void BeatIndicator::setTrackPositionDeckA(double positionSeconds) {
-    // Use original BPM for beat calculation (tempo scaling is already in positionSeconds)
+    // Base BPM from analysis; fall back to global grid if unknown
     double baseBpm = (bpmA > 0.0) ? bpmA : GlobalBeatGrid::getInstance().getCurrentBpm();
     if (baseBpm <= 0.0) {
         setBeatPositionDeckA(0.0);
         return;
     }
-    
-    // Calculate beat position using original BPM since position already reflects tempo
-    double beatPeriod = 60.0 / baseBpm;
+
+    // Apply tempo factor ONLY in preroll to make animation speed reflect tempo,
+    // but keep continuity at t=0 by adding a correction term.
+    const double tf = (tempoFactorA > 0.0) ? tempoFactorA : 1.0;
+    const bool inPreroll = (positionSeconds < 0.0);
+    const double effectiveBpm = inPreroll ? (baseBpm * tf) : baseBpm;
+
+    const double basePeriod = 60.0 / baseBpm;
+    const double effPeriod = 60.0 / effectiveBpm;
+
     double beatPosition = 0.0;
-    if (beatPeriod > 0.0) {
-        beatPosition = (positionSeconds - firstBeatOffsetA) / beatPeriod;
+    if (effPeriod > 0.0) {
+        // Continuity correction so beat phase matches at exactly t=0
+        double correction = 0.0;
+        if (inPreroll) {
+            correction = (-firstBeatOffsetA) * (1.0 / basePeriod - 1.0 / effPeriod);
+        }
+        beatPosition = (positionSeconds - firstBeatOffsetA) / effPeriod + correction;
     }
-    
-    // Calculate which beat we're on (0-based index matching waveform)
-    int beatIndex = (int)std::floor(beatPosition);
-    if (beatIndex < 0) beatIndex = 0;
-    
-    // Calculate position within the current 4-beat cycle
-    // Orange lines in waveform appear when beatIndex % 4 == 0
-    // Map this to BeatIndicator display: beat 0->1, beat 1->2, beat 2->3, beat 3->4
-    int beatInCycle = beatIndex % 4;
-    double fractionalBeat = beatPosition - std::floor(beatPosition);
-    
-    // Set beat position: 0.0-0.99 = beat "1", 1.0-1.99 = beat "2", etc.
-    setBeatPositionDeckA(beatInCycle + fractionalBeat);
+
+    // Position within current 4-beat cycle, allowing continuous wrap for negative values
+    double beatInCycle = std::fmod(beatPosition, 4.0);
+    if (beatInCycle < 0.0) beatInCycle += 4.0;
+    setBeatPositionDeckA(beatInCycle);
 }
 
 void BeatIndicator::setTrackPositionDeckB(double positionSeconds) {
-    // Use original BPM for beat calculation (tempo scaling is already in positionSeconds)
     double baseBpm = (bpmB > 0.0) ? bpmB : GlobalBeatGrid::getInstance().getCurrentBpm();
     if (baseBpm <= 0.0) {
         setBeatPositionDeckB(0.0);
         return;
     }
-    
-    // Calculate beat position using original BPM since position already reflects tempo
-    double beatPeriod = 60.0 / baseBpm;
+
+    const double tf = (tempoFactorB > 0.0) ? tempoFactorB : 1.0;
+    const bool inPreroll = (positionSeconds < 0.0);
+    const double effectiveBpm = inPreroll ? (baseBpm * tf) : baseBpm;
+
+    const double basePeriod = 60.0 / baseBpm;
+    const double effPeriod = 60.0 / effectiveBpm;
+
     double beatPosition = 0.0;
-    if (beatPeriod > 0.0) {
-        beatPosition = (positionSeconds - firstBeatOffsetB) / beatPeriod;
+    if (effPeriod > 0.0) {
+        double correction = 0.0;
+        if (inPreroll) {
+            correction = (-firstBeatOffsetB) * (1.0 / basePeriod - 1.0 / effPeriod);
+        }
+        beatPosition = (positionSeconds - firstBeatOffsetB) / effPeriod + correction;
     }
-    
-    // Calculate which beat we're on (0-based index matching waveform)
-    int beatIndex = (int)std::floor(beatPosition);
-    if (beatIndex < 0) beatIndex = 0;
-    
-    // Calculate position within the current 4-beat cycle
-    // Orange lines in waveform appear when beatIndex % 4 == 0
-    // Map this to BeatIndicator display: beat 0->1, beat 1->2, beat 2->3, beat 3->4
-    int beatInCycle = beatIndex % 4;
-    double fractionalBeat = beatPosition - std::floor(beatPosition);
-    
-    // Set beat position: 0.0-0.99 = beat "1", 1.0-1.99 = beat "2", etc.
-    setBeatPositionDeckB(beatInCycle + fractionalBeat);
+
+    double beatInCycle = std::fmod(beatPosition, 4.0);
+    if (beatInCycle < 0.0) beatInCycle += 4.0;
+    setBeatPositionDeckB(beatInCycle);
 }
 
 void BeatIndicator::paintEvent(QPaintEvent* event) {

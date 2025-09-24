@@ -12,6 +12,7 @@ public:
     void setSpeed(double ratio); // 1.0 = normal
     void setBpm(double bpm);
     void setPlayheadPosition(double position); // 0.0 to 1.0 through track
+    void setPositionSeconds(double seconds); // absolute time in seconds (can be negative for preroll)
     void setTrackLength(double lengthInSeconds);
 
 protected:
@@ -25,6 +26,7 @@ private:
     double bpm{120.0};
     double playheadPosition{0.0}; // Current position in track (0.0 to 1.0)
     double trackLengthSeconds{0.0};
+    double currentTimeSeconds{0.0}; // absolute time in seconds (supports preroll)
     bool syncToBeats{true};
     
     // Performance optimization: Cache rendered elements

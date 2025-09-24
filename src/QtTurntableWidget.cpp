@@ -28,7 +28,11 @@ void QtTurntableWidget::setBpm(double newBpm) {
 
 void QtTurntableWidget::setPlayheadPosition(double position) {
     playheadPosition = std::clamp(position, 0.0, 1.0);
-    updateRotationFromPosition();
+    if (trackLengthSeconds > 0.0) {
+        setPositionSeconds(playheadPosition * trackLengthSeconds);
+    } else {
+        updateRotationFromPosition();
+    }
 }
 
 void QtTurntableWidget::setTrackLength(double lengthInSeconds) {
@@ -36,17 +40,16 @@ void QtTurntableWidget::setTrackLength(double lengthInSeconds) {
 }
 
 void QtTurntableWidget::updateRotationFromPosition() {
-    if (!syncToBeats || bpm <= 0.0 || trackLengthSeconds <= 0.0) {
+    if (!syncToBeats || bpm <= 0.0) {
         return;
     }
-    
-    // Calculate current time in track
-    double currentTimeSeconds = playheadPosition * trackLengthSeconds;
+
+    // Use absolute seconds if provided (supports preroll)
     
     // Calculate beats per second
     double beatsPerSecond = bpm / 60.0;
     
-    // Calculate current beat position
+    // Calculate current beat position (can be negative in preroll)
     double currentBeat = currentTimeSeconds * beatsPerSecond;
     
     // Each bar = 4 beats, and we want 25% rotation (90°) per bar
@@ -60,6 +63,11 @@ void QtTurntableWidget::updateRotationFromPosition() {
     // Normalize angle to [0, 2π)
     while (angle >= 2.0 * M_PI) angle -= 2.0 * M_PI;
     while (angle < 0.0) angle += 2.0 * M_PI;
+}
+
+void QtTurntableWidget::setPositionSeconds(double seconds) {
+    currentTimeSeconds = seconds;
+    updateRotationFromPosition();
 }
 
 void QtTurntableWidget::resizeEvent(QResizeEvent* event) {

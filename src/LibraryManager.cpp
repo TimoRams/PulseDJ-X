@@ -18,10 +18,12 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QPushButton>
+#include <QPushButton> // (legacy, can be removed if no longer used)
 #include <QComboBox>
 #include <QLineEdit>
 #include <QProgressBar>
+#include <QToolButton>
+#include <QMenu>
 #include <iostream>
 
 // JUCE includes for audio format reading and ID3 tag extraction
@@ -187,6 +189,17 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
         }
     } else if (role == Qt::ToolTipRole) {
         return track->filePath;
+    } else if (role == Qt::TextAlignmentRole) {
+        // Right-align numeric-ish columns for readability
+        switch (index.column()) {
+            case DurationColumn:
+            case BpmColumn:
+            case YearColumn:
+            case FileSizeColumn:
+                return int(Qt::AlignRight | Qt::AlignVCenter);
+            default:
+                return int(Qt::AlignVCenter); // default vertical centering
+        }
     } else if (role == Qt::UserRole) {
         // Return the file path for drag operations
         return track->filePath;
@@ -219,6 +232,24 @@ Qt::ItemFlags LibraryTableModel::flags(const QModelIndex& index) const
         return Qt::NoItemFlags;
     }
     return Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled;
+}
+
+void LibraryTableModel::sort(int column, Qt::SortOrder order)
+{
+    // Map view column to our SortMode
+    SortMode mode = SortByTitle;
+    switch (column) {
+        case TitleColumn:   mode = SortByTitle; break;
+        case ArtistColumn:  mode = SortByArtist; break;
+        case AlbumColumn:   mode = SortByAlbum; break;
+        case DurationColumn:mode = SortByDuration; break;
+        case BpmColumn:     mode = SortByBpm; break;
+        case GenreColumn:   mode = SortByGenre; break;
+        case YearColumn:    mode = SortByYear; break;
+        case FileSizeColumn:mode = SortByFileSize; break;
+        default:            mode = SortByTitle; break;
+    }
+    setSortMode(mode, order);
 }
 
 QStringList LibraryTableModel::mimeTypes() const
@@ -275,9 +306,13 @@ const TrackInfo* LibraryTableModel::getTrack(int row) const
 
 void LibraryTableModel::setSortMode(SortMode mode, Qt::SortOrder order)
 {
+    if (currentSortMode == mode && currentSortOrder == order)
+        return;
+    emit layoutAboutToBeChanged();
     currentSortMode = mode;
     currentSortOrder = order;
     sortFilteredTracks();
+    emit layoutChanged();
 }
 
 void LibraryTableModel::setFilterText(const QString& filter)
@@ -354,21 +389,41 @@ LibraryTableView::LibraryTableView(QWidget* parent)
     setSelectionBehavior(QAbstractItemView::SelectRows);
     setSelectionMode(QAbstractItemView::ExtendedSelection);
     setAlternatingRowColors(true);
-    
+    setShowGrid(false);
+    setWordWrap(false);
+    setTextElideMode(Qt::ElideRight);
+    setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+
     // Configure headers
-    horizontalHeader()->setStretchLastSection(true);
-    horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+    auto* hh = horizontalHeader();
+    hh->setSortIndicatorShown(true);
+    hh->setSectionsClickable(true);
+    hh->setHighlightSections(false);
+    hh->setSectionResizeMode(QHeaderView::Interactive);
+    // Prefer the title column to get more space when window grows
+    hh->setStretchLastSection(false);
+    hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
+    hh->resizeSection(LibraryTableModel::TitleColumn, 560); // make title wider by default
+    // Other columns keep their initial width but remain resizable by user
+    for (int col = LibraryTableModel::ArtistColumn; col < LibraryTableModel::ColumnCount; ++col) {
+        hh->setSectionResizeMode(col, QHeaderView::Interactive);
+    }
     verticalHeader()->setVisible(false);
+    verticalHeader()->setDefaultSectionSize(22); // row height
     
     // Set column widths
-    setColumnWidth(LibraryTableModel::TitleColumn, 250);
-    setColumnWidth(LibraryTableModel::ArtistColumn, 200);
-    setColumnWidth(LibraryTableModel::AlbumColumn, 200);
-    setColumnWidth(LibraryTableModel::DurationColumn, 80);
-    setColumnWidth(LibraryTableModel::BpmColumn, 60);
-    setColumnWidth(LibraryTableModel::GenreColumn, 100);
-    setColumnWidth(LibraryTableModel::YearColumn, 60);
-    setColumnWidth(LibraryTableModel::FileSizeColumn, 80);
+    setColumnWidth(LibraryTableModel::TitleColumn, 560);
+    setColumnWidth(LibraryTableModel::ArtistColumn, 140);
+    setColumnWidth(LibraryTableModel::AlbumColumn, 120);
+    setColumnWidth(LibraryTableModel::DurationColumn, 60);
+    setColumnWidth(LibraryTableModel::BpmColumn, 50);
+    setColumnWidth(LibraryTableModel::GenreColumn, 80);
+    setColumnWidth(LibraryTableModel::YearColumn, 50);
+    setColumnWidth(LibraryTableModel::FileSizeColumn, 60);
+    setSortingEnabled(true);
+    sortByColumn(LibraryTableModel::TitleColumn, Qt::AscendingOrder);
+    setStyleSheet("QTableView { font-family: 'Lato', 'Arial', sans-serif; font-size: 13px; background: #181a1b; alternate-background-color: #222426; selection-background-color: #2d5aa0; border: none; gridline-color: #2a2d2e; } QHeaderView::section { font-weight: bold; font-size: 13px; background: #23272a; color: #e0e0e0; border: none; padding: 6px 4px; } QTableView::item { padding-left: 6px; padding-right: 6px; } QTableView::item:selected { color: #ffffff; } QTableView::item:hover { background: rgba(255,255,255,0.035); } ");
 }
 
 void LibraryTableView::startDrag(Qt::DropActions supportedActions)
@@ -433,6 +488,8 @@ LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget*
 
 LibraryManager::~LibraryManager()
 {
+    // Persist column sizes/order for next launch
+    saveColumnState();
     if (loaderThread && loaderThread->isRunning()) {
         loaderThread->stop();
         loaderThread->wait(3000);
@@ -444,30 +501,19 @@ void LibraryManager::setupUI()
 {
     setStyleSheet(
         "QWidget { background-color: #1a1a1a; color: #e0e0e0; }"
-        "QTableView { gridline-color: #333; background-color: #0f0f0f; }"
-        "QTableView::item:selected { background-color: #2d5aa0; }"
-        "QTableView::item:alternate { background-color: #141414; }"
-        "QHeaderView::section { background-color: #2a2a2a; border: 1px solid #555; padding: 4px; }"
-        "QPushButton { background-color: #2a2a2a; border: 1px solid #555; padding: 5px; border-radius: 3px; }"
+        "QTableView { font-family: 'Lato', 'Arial', sans-serif; font-size: 13px; background: #181a1b; alternate-background-color: #222426; selection-background-color: #2d5aa0; border: none; }"
+        "QHeaderView::section { font-weight: bold; font-size: 13px; background: #23272a; color: #e0e0e0; border: none; padding: 6px 4px; }"
+        "QTableView::item { padding-left: 6px; padding-right: 6px; }"
+        "QPushButton { background-color: #23272a; border: 1px solid #444; padding: 4px 10px; border-radius: 3px; font-size: 12px; color: #e0e0e0; }"
         "QPushButton:hover { background-color: #3a3a3a; }"
         "QPushButton:pressed { background-color: #1a1a1a; }"
-        "QComboBox { background-color: #2a2a2a; border: 1px solid #555; padding: 3px; }"
-        "QLineEdit { background-color: #2a2a2a; border: 1px solid #555; padding: 3px; }"
-        "QProgressBar { background-color: #2a2a2a; border: 1px solid #555; }"
-        "QProgressBar::chunk { background-color: #4a9eff; }"
+        "QComboBox { background-color: #23272a; border: 1px solid #444; padding: 2px 6px; font-size: 12px; color: #e0e0e0; min-width: 90px; }"
+        "QLineEdit { background-color: #23272a; border: 1px solid #444; padding: 2px 6px; font-size: 12px; color: #e0e0e0; min-width: 180px; }"
+        "QProgressBar { height: 12px; background: #23272a; border: 1px solid #444; border-radius: 3px; }"
+        "QProgressBar::chunk { background: #4a9eff; }"
         "QTreeView { background-color: #1a1a1a; border: 1px solid #555; }"
         "QTreeView::item:selected { background-color: #2d5aa0; }"
         "QTreeView::item:hover { background-color: #2a2a2a; }"
-        "QTreeView::branch:has-children:!has-siblings:closed,"
-        "QTreeView::branch:closed:has-children:has-siblings {"
-        "    border-image: none;"
-        "    image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAJCAYAAADgkQYQAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAFHSURBVBiVY/j//z8DJQAggBhwgQACiAHbgCCAGLANCAKIAdeBIIAYsA0IAogB24AggBiwDQgCiAHXgSCAGLANCAKIAdeBIIAYsA0IAogB24AggBhwHQgCiAHbgCCAGHAdCAKIAduAIIAYcB0IAogB24AggBiwDQgCiAHXgSCAGLANCAKIAdeBIIAYsA0IAogB14EggBiwDQgCiAHbgCCAGHAdCAKIAduAIIAYcB0IAogB24AggBhwHQgCiAHbgCCAGHAdCAKIAduAIIAYsA0IAogB14EggBiwDQgCiAHbgCCAGHAdCAKIAduAIIAYcB0IAogB24AggBhwHQgCiAHbgCCAGLANCAKIAdeBIIAYsA0IAogB24AggBhwHQgCiAHbgCCAGHAdCAKIAduAIIAYsA0IAogB14EggBiwDf//AwQQAwMVAAgAAP//sEhb+gAAAABJRU5ErkJggg==);"
-        "}"
-        "QTreeView::branch:open:has-children:!has-siblings,"
-        "QTreeView::branch:open:has-children:has-siblings {"
-        "    border-image: none;"
-        "    image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAJCAYAAADgkQYQAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAdgAAAHYBTnsmCAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAFHSURBVBiVY/j//z8DJQAggBhwgQACiAHbgCCAGLANCAKIAdeBIIAYsA0IAogB24AggBiwDQgCiAHXgSCAGLANCAKIAdeBIIAYsA0IAogB24AggBhwHQgCiAHbgCCAGHAdCAKIAduAIIAYcB0IAogB24AggBiwDQgCiAHXgSCAGLANCAKIAdeBIIAYsA0IAogB14EggBiwDQgCiAHbgCCAGHAdCAKIAduAIIAYcB0IAogB24AggBhwHQgCiAHbgCCAGHAdCAKIAduAIIAYsA0IAogB14EggBiwDQgCiAHbgCCAGHAdCAKIAduAIIAYcB0IAogB24AggBhwHQgCiAHbgCCAGLANCAKIAdeBIIAYsA0IAogB24AggBhwHQgCiAHbgCCAGHAdCAKIAduAIIAYsA0IAogB14EggBiwDf//AwQQAwMVAAgAAP//sEhb+gAAAABJRU5ErkJggg==);"
-        "}"
         "QSplitter::handle { background-color: #555; }"
         "QSplitter::handle:horizontal { width: 2px; }"
     );
@@ -481,15 +527,14 @@ void LibraryManager::setupUI()
     
     // === LEFT PANEL: File System Browser ===
     auto* leftPanel = new QWidget();
-    leftPanel->setMinimumWidth(250);
-    leftPanel->setMaximumWidth(400);
+    leftPanel->setMinimumWidth(160);
+    leftPanel->setMaximumWidth(260);
     
     auto* leftLayout = new QVBoxLayout(leftPanel);
     leftLayout->setContentsMargins(0, 0, 0, 0);
-    
     // File browser header
     auto* browserHeader = new QLabel("Music Folders", leftPanel);
-    browserHeader->setStyleSheet("font-weight: bold; padding: 5px; background-color: #2a2a2a; border-bottom: 1px solid #555;");
+    browserHeader->setStyleSheet("font-weight: bold; font-size: 13px; padding: 6px 8px; background: #23272a; color: #e0e0e0; border-bottom: 1px solid #444;");
     
     // File system tree view
     fileSystemTree = new QTreeView(leftPanel);
@@ -506,11 +551,12 @@ void LibraryManager::setupUI()
     auto* rightLayout = new QVBoxLayout(rightPanel);
     rightLayout->setContentsMargins(0, 0, 0, 0);
     
-    // Top controls for right panel
-    auto* controlsLayout = new QHBoxLayout();
-    
-    // Sort controls
-    auto* sortLabel = new QLabel("Sort by:", rightPanel);
+    // Compact top bar: icons + search (no big buttons)
+    auto* topBarLayout = new QHBoxLayout();
+    topBarLayout->setSpacing(6);
+    topBarLayout->setContentsMargins(0,0,0,0);
+
+    // Hidden sort combo (logic only) - we still use header click sorting; hide it.
     sortComboBox = new QComboBox(rightPanel);
     sortComboBox->addItem("Title", LibraryTableModel::SortByTitle);
     sortComboBox->addItem("Artist", LibraryTableModel::SortByArtist);
@@ -520,45 +566,63 @@ void LibraryManager::setupUI()
     sortComboBox->addItem("Genre", LibraryTableModel::SortByGenre);
     sortComboBox->addItem("Year", LibraryTableModel::SortByYear);
     sortComboBox->addItem("File Size", LibraryTableModel::SortByFileSize);
+    sortComboBox->setVisible(false);
     connect(sortComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &LibraryManager::onSortModeChanged);
-    
-    // Filter controls
-    auto* filterLabel = new QLabel("Filter:", rightPanel);
+
+    // Actions
+    actionAddFiles = new QAction(QIcon::fromTheme("list-add"), "Add Files", this);
+    actionAddFolder = new QAction(QIcon::fromTheme("folder-open"), "Add Folder", this);
+    actionRefresh = new QAction(QIcon::fromTheme("view-refresh"), "Refresh", this);
+    actionClearLibrary = new QAction(QIcon::fromTheme("edit-delete"), "Clear Library", this);
+    connect(actionAddFiles, &QAction::triggered, this, &LibraryManager::onAddFilesClicked);
+    connect(actionAddFolder, &QAction::triggered, this, &LibraryManager::onAddFolderClicked);
+    connect(actionRefresh, &QAction::triggered, this, &LibraryManager::onRefreshClicked);
+    connect(actionClearLibrary, &QAction::triggered, this, &LibraryManager::onClearLibraryClicked);
+
+    auto addFilesBtn = new QToolButton(rightPanel); addFilesBtn->setDefaultAction(actionAddFiles); addFilesBtn->setToolTip("Add audio files");
+    auto addFolderBtn = new QToolButton(rightPanel); addFolderBtn->setDefaultAction(actionAddFolder); addFolderBtn->setToolTip("Add folder");
+    auto refreshBtn = new QToolButton(rightPanel); refreshBtn->setDefaultAction(actionRefresh); refreshBtn->setToolTip("Refresh view");
+    auto clearBtn = new QToolButton(rightPanel); clearBtn->setDefaultAction(actionClearLibrary); clearBtn->setToolTip("Clear library");
+    for (auto tb : {addFilesBtn, addFolderBtn, refreshBtn, clearBtn}) {
+        tb->setAutoRaise(true);
+        tb->setIconSize(QSize(16,16));
+        tb->setCursor(Qt::PointingHandCursor);
+    }
+
     filterLineEdit = new QLineEdit(rightPanel);
-    filterLineEdit->setPlaceholderText("Search title, artist, album, genre...");
-    connect(filterLineEdit, &QLineEdit::textChanged, [this]() {
-        filterUpdateTimer->start(); // Restart timer on each keystroke
-    });
-    
-    controlsLayout->addWidget(sortLabel);
-    controlsLayout->addWidget(sortComboBox);
-    controlsLayout->addStretch();
-    controlsLayout->addWidget(filterLabel);
-    controlsLayout->addWidget(filterLineEdit, 1);
-    
-    // Action buttons
-    auto* buttonsLayout = new QHBoxLayout();
-    
-    addFilesButton = new QPushButton("Add Files...", rightPanel);
-    addFolderButton = new QPushButton("Add Folder...", rightPanel);
-    refreshButton = new QPushButton("Refresh", rightPanel);
-    clearLibraryButton = new QPushButton("Clear Library", rightPanel);
-    
-    connect(addFilesButton, &QPushButton::clicked, this, &LibraryManager::onAddFilesClicked);
-    connect(addFolderButton, &QPushButton::clicked, this, &LibraryManager::onAddFolderClicked);
-    connect(refreshButton, &QPushButton::clicked, this, &LibraryManager::onRefreshClicked);
-    connect(clearLibraryButton, &QPushButton::clicked, this, &LibraryManager::onClearLibraryClicked);
-    
-    buttonsLayout->addWidget(addFilesButton);
-    buttonsLayout->addWidget(addFolderButton);
-    buttonsLayout->addWidget(refreshButton);
-    buttonsLayout->addStretch();
-    buttonsLayout->addWidget(clearLibraryButton);
+    filterLineEdit->setPlaceholderText("Search...");
+    filterLineEdit->setClearButtonEnabled(true);
+    filterLineEdit->setFixedHeight(24);
+    filterLineEdit->setStyleSheet("QLineEdit { padding-left: 22px; background:#23272a; border:1px solid #444; border-radius:4px; font-size:12px; } QLineEdit:focus { border:1px solid #4a9eff; }");
+    connect(filterLineEdit, &QLineEdit::textChanged, [this]() { filterUpdateTimer->start(); });
+
+    // Magnifier icon overlay
+    auto searchWrapper = new QHBoxLayout();
+    searchWrapper->setContentsMargins(0,0,0,0);
+    auto* searchContainer = new QWidget(rightPanel);
+    searchContainer->setLayout(searchWrapper);
+    auto* searchIcon = new QLabel(searchContainer);
+    searchIcon->setPixmap(QIcon::fromTheme("edit-find").pixmap(14,14));
+    searchIcon->setStyleSheet("QLabel { padding-left:4px; color:#aaa; }");
+    searchWrapper->addWidget(searchIcon);
+    searchWrapper->addWidget(filterLineEdit,1);
+
+    topBarLayout->addWidget(addFilesBtn);
+    topBarLayout->addWidget(addFolderBtn);
+    topBarLayout->addWidget(refreshBtn);
+    topBarLayout->addWidget(clearBtn);
+    topBarLayout->addSpacing(4);
+    topBarLayout->addWidget(searchContainer,1);
+    topBarLayout->addWidget(sortComboBox); // hidden
     
     // Table view
     model = new LibraryTableModel(rightPanel);
     tableView = new LibraryTableView(rightPanel);
     tableView->setModel(model);
+    tableView->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tableView, &QWidget::customContextMenuRequested, this, &LibraryManager::onContextMenuRequested);
+    // Restore previously saved column sizes/order if available
+    restoreColumnState();
     
     connect(tableView, &QTableView::doubleClicked, this, &LibraryManager::onTableDoubleClicked);
     connect(tableView->selectionModel(), &QItemSelectionModel::selectionChanged, this, &LibraryManager::onSelectionChanged);
@@ -573,8 +637,7 @@ void LibraryManager::setupUI()
     statusLayout->addWidget(progressBar);
     
     // Assemble right panel
-    rightLayout->addLayout(controlsLayout);
-    rightLayout->addLayout(buttonsLayout);
+    rightLayout->addLayout(topBarLayout);
     rightLayout->addWidget(tableView, 1);
     rightLayout->addLayout(statusLayout);
     
@@ -745,6 +808,8 @@ void LibraryManager::onLoadingFinished()
     isLoading = false;
     progressBar->setVisible(false);
     updateStatusLabel();
+    // After first full load, auto-size the non-title columns to contents once
+    autoSizeColumnsInitial();
     
     if (loaderThread) {
         loaderThread->deleteLater();
@@ -757,6 +822,20 @@ void LibraryManager::onSortModeChanged()
     LibraryTableModel::SortMode mode = static_cast<LibraryTableModel::SortMode>(
         sortComboBox->currentData().toInt());
     model->setSortMode(mode);
+    // Map SortMode to column index for header sorting and indicator
+    int column = 0;
+    switch (mode) {
+        case LibraryTableModel::SortByTitle:    column = LibraryTableModel::TitleColumn; break;
+        case LibraryTableModel::SortByArtist:   column = LibraryTableModel::ArtistColumn; break;
+        case LibraryTableModel::SortByAlbum:    column = LibraryTableModel::AlbumColumn; break;
+        case LibraryTableModel::SortByDuration: column = LibraryTableModel::DurationColumn; break;
+        case LibraryTableModel::SortByBpm:      column = LibraryTableModel::BpmColumn; break;
+        case LibraryTableModel::SortByGenre:    column = LibraryTableModel::GenreColumn; break;
+        case LibraryTableModel::SortByYear:     column = LibraryTableModel::YearColumn; break;
+        case LibraryTableModel::SortByFileSize: column = LibraryTableModel::FileSizeColumn; break;
+    }
+    tableView->horizontalHeader()->setSortIndicatorShown(true);
+    tableView->sortByColumn(column, Qt::AscendingOrder);
 }
 
 void LibraryManager::onFilterTextChanged()
@@ -874,4 +953,68 @@ void LibraryManager::updateStatusLabel()
     } else {
         statusLabel->setText(QString("%1 of %2 tracks").arg(filtered).arg(total));
     }
+}
+
+void LibraryManager::onContextMenuRequested(const QPoint& pos)
+{
+    QMenu menu(this);
+    menu.addAction(actionAddFiles);
+    menu.addAction(actionAddFolder);
+    menu.addSeparator();
+    menu.addAction(actionRefresh);
+    menu.addSeparator();
+    menu.addAction(actionClearLibrary);
+    menu.exec(tableView->viewport()->mapToGlobal(pos));
+}
+
+void LibraryManager::autoSizeColumnsInitial()
+{
+    if (columnsSizedOnce || !tableView || !model) return;
+    if (model->rowCount() == 0) return;
+    columnsSizedOnce = true;
+    auto* hh = tableView->horizontalHeader();
+    if (!hh) return;
+
+    // Temporarily set other columns to ResizeToContents to measure
+    for (int col = LibraryTableModel::ArtistColumn; col < LibraryTableModel::ColumnCount; ++col) {
+        hh->setSectionResizeMode(col, QHeaderView::ResizeToContents);
+    }
+    tableView->resizeColumnsToContents();
+
+    // Clamp overly wide columns to keep Title dominant
+    auto clamp = [&](int col, int maxWidth) {
+        int w = hh->sectionSize(col);
+        if (w > maxWidth) hh->resizeSection(col, maxWidth);
+    };
+    clamp(LibraryTableModel::ArtistColumn,   200);
+    clamp(LibraryTableModel::AlbumColumn,    200);
+    clamp(LibraryTableModel::DurationColumn, 70);
+    clamp(LibraryTableModel::BpmColumn,      60);
+    clamp(LibraryTableModel::GenreColumn,    140);
+    clamp(LibraryTableModel::YearColumn,     70);
+    clamp(LibraryTableModel::FileSizeColumn, 90);
+
+    // Restore resize modes: Title stretches, others interactive
+    hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
+    for (int col = LibraryTableModel::ArtistColumn; col < LibraryTableModel::ColumnCount; ++col) {
+        hh->setSectionResizeMode(col, QHeaderView::Interactive);
+    }
+    // Ensure Title starts notably wide
+    hh->resizeSection(LibraryTableModel::TitleColumn, qMax(hh->sectionSize(LibraryTableModel::TitleColumn), 560));
+}
+
+void LibraryManager::restoreColumnState()
+{
+    QSettings s("PulseDJ-X", "Library");
+    QByteArray headerState = s.value("library/headerState").toByteArray();
+    if (!headerState.isEmpty()) {
+        tableView->horizontalHeader()->restoreState(headerState);
+    }
+}
+
+void LibraryManager::saveColumnState()
+{
+    if (!tableView) return;
+    QSettings s("PulseDJ-X", "Library");
+    s.setValue("library/headerState", tableView->horizontalHeader()->saveState());
 }

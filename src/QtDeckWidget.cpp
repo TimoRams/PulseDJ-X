@@ -280,17 +280,18 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
         // Always reflect current position, even when paused, to keep displays in sync
         static double lastPos = -1.0;
         double len = std::max(1e-9, player->getLengthInSeconds());
-        double pos = std::clamp(player->getCurrentPositionSeconds() / len, 0.0, 1.0);
+        double curSec = player->getCurrentPositionSeconds();
+        double pos = std::clamp(curSec / len, 0.0, 1.0);
         waveform->setPlayhead(pos);
 
-        // Update turntable with current position and BPM for beat synchronization
-        turntable->setPlayheadPosition(pos);
+        // Update turntable with absolute seconds and BPM for beat synchronization
+        double trackLengthSec = player->getLengthInSeconds();
+        if (trackLengthSec > 0.0) {
+            turntable->setTrackLength(trackLengthSec);
+        }
+        turntable->setPositionSeconds(curSec); // supports preroll negative seconds
         if (detectedBpm > 0.0) {
             turntable->setBpm(detectedBpm);
-            double trackLengthSec = player->getLengthInSeconds();
-            if (trackLengthSec > 0.0) {
-                turntable->setTrackLength(trackLengthSec);
-            }
         }
 
         // Emit only when the position changed to minimize redundant updates

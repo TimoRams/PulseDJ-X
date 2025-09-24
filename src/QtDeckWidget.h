@@ -39,6 +39,8 @@ public:
     double getTempoFactor() const;                 // Current speed factor (1.0 = original)
     double getDetectedBpm() const { return detectedBpm; }
     void setTempoFactor(double factor);            // Programmatically set tempo
+    // Turntable control
+    void setPlatterSeconds(double seconds) { if (turntable) turntable->setPositionSeconds(seconds); }
     
     // Getter for Rekordbox-style layout (waveform now integrated into controls)
     QWidget* getControlsWidget() const { return controlsWidget; }

@@ -696,7 +696,8 @@ void WaveformDisplay::drawBeatGrid(QPainter& p, double playheadSec, double leftS
     
     // PREROLL BEAT GRID: Handle negative time region ONLY - completely independent
     if (leftSecond < 0.0 && prerollEnabled && localBpm > 0.0) {
-        double beatInterval = 60.0 / (localBpm * deckTempoFactor); // Use local BPM with tempo
+        // Use base BPM for preroll intervals; BeatLocked mapping applies tempo visually.
+        double beatInterval = 60.0 / localBpm;
         
         // Only draw in negative time region - start from -beatInterval and go backwards
         for (double beatTime = -beatInterval; beatTime >= leftSecond; beatTime -= beatInterval) {

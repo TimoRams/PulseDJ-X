@@ -601,6 +601,14 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         if (deckA && deckA->getWaveform()) {
             deckA->getWaveform()->setPlayhead(absRel);
         }
+        // Update beat indicator and platter rotation using absolute seconds (preroll-aware)
+        if (beatIndicator && playerA && deckA) {
+            double lenSec = std::max(1e-9, playerA->getLengthInSeconds());
+            constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
+            double seconds = (absRel < 0.0) ? (absRel * prerollSec) : (absRel * lenSec);
+            beatIndicator->setTrackPositionDeckA(seconds);
+            deckA->setPlatterSeconds(seconds);
+        }
     });
     connect(overviewTopA, &WaveformDisplay::scratchVelocityChanged, this, [this](double velocity) {
         if (!playerA) return;
@@ -649,6 +657,14 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         // Update deck waveform to stay in sync
         if (deckB && deckB->getWaveform()) {
             deckB->getWaveform()->setPlayhead(absRel);
+        }
+        // Update beat indicator and platter rotation using absolute seconds (preroll-aware)
+        if (beatIndicator && playerB && deckB) {
+            double lenSec = std::max(1e-9, playerB->getLengthInSeconds());
+            constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
+            double seconds = (absRel < 0.0) ? (absRel * prerollSec) : (absRel * lenSec);
+            beatIndicator->setTrackPositionDeckB(seconds);
+            deckB->setPlatterSeconds(seconds);
         }
     });
     connect(overviewTopB, &WaveformDisplay::scratchVelocityChanged, this, [this](double velocity) {
@@ -749,12 +765,10 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             overviewTopA->setPlayhead(relative);
             if (deckA && deckA->getWaveform()) deckA->getWaveform()->setPlayhead(relative);
         }
-        // Update beat indicator with current track time for deck A
+        // Update beat indicator with audible time in seconds (support preroll)
         if (playerA) {
-            double lenSec = std::max(1e-9, playerA->getLengthInSeconds());
-            double audibleRel = std::clamp(relative - (totalDelay / lenSec), 0.0, 1.0);
-            double audibleTimeSec = audibleRel * lenSec;
-            // Pass audible absolute track time; BeatIndicator subtracts per-deck firstBeatOffset
+            double curSec = playerA->getCurrentPositionSeconds();
+            double audibleTimeSec = curSec - totalDelay; // do not clamp; may be negative in preroll
             beatIndicator->setTrackPositionDeckA(audibleTimeSec);
         }
     });
@@ -781,12 +795,10 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             overviewTopB->setPlayhead(relative);
             if (deckB && deckB->getWaveform()) deckB->getWaveform()->setPlayhead(relative);
         }
-        // Update beat indicator with current track time for deck B
+        // Update beat indicator with audible time in seconds (support preroll)
         if (playerB) {
-            double lenSec = std::max(1e-9, playerB->getLengthInSeconds());
-            double audibleRel = std::clamp(relative - (totalDelay / lenSec), 0.0, 1.0);
-            double audibleTimeSec = audibleRel * lenSec;
-            // Pass audible absolute track time; BeatIndicator subtracts per-deck firstBeatOffset
+            double curSec = playerB->getCurrentPositionSeconds();
+            double audibleTimeSec = curSec - totalDelay; // do not clamp; may be negative in preroll
             beatIndicator->setTrackPositionDeckB(audibleTimeSec);
         }
     });

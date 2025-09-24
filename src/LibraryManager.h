@@ -8,7 +8,8 @@
 #include <QHeaderView>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QPushButton>
+#include <QToolButton>
+#include <QMenu>
 #include <QComboBox>
 #include <QLineEdit>
 #include <QLabel>
@@ -152,6 +153,7 @@ public:
     QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override;
     QVariant headerData(int section, Qt::Orientation orientation, int role = Qt::DisplayRole) const override;
     Qt::ItemFlags flags(const QModelIndex& index) const override;
+    void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override; // Enable header-click sorting
     
     // Drag and drop support
     QStringList mimeTypes() const override;
@@ -229,10 +231,11 @@ private slots:
     void onLoadingFinished();
     void onSortModeChanged();
     void onFilterTextChanged();
-    void onAddFilesClicked();
-    void onAddFolderClicked();
-    void onRefreshClicked();
-    void onClearLibraryClicked();
+         void onAddFilesClicked(); // Replaced QPushButton with QAction
+         void onAddFolderClicked(); // Replaced QPushButton with QAction
+         void onRefreshClicked(); // Replaced QPushButton with QAction
+         void onClearLibraryClicked(); // Replaced QPushButton with QAction
+         void onContextMenuRequested(const QPoint& pos); // New slot for context menu
     void onTableDoubleClicked(const QModelIndex& index);
     void onSelectionChanged();
     void onFileSystemSelectionChanged();
@@ -246,10 +249,10 @@ private:
     LibraryTableModel* model;
     QComboBox* sortComboBox;
     QLineEdit* filterLineEdit;
-    QPushButton* addFilesButton;
-    QPushButton* addFolderButton;
-    QPushButton* refreshButton;
-    QPushButton* clearLibraryButton;
+        QAction* actionAddFiles; // Replaced QPushButton with QAction
+        QAction* actionAddFolder; // Replaced QPushButton with QAction
+        QAction* actionRefresh; // Replaced QPushButton with QAction
+        QAction* actionClearLibrary; // Replaced QPushButton with QAction
     QLabel* statusLabel;
     QProgressBar* progressBar;
     
@@ -260,9 +263,13 @@ private:
     // State
     bool isLoading = false;
     QTimer* filterUpdateTimer;
+    bool columnsSizedOnce = false; // run auto-size only after first load
     
     void setupUI();
     void setupFileSystemModel();
     void updateStatusLabel();
     QStringList getSupportedAudioFiles(const QString& directory, bool recursive = true);
+    void autoSizeColumnsInitial();
+    void restoreColumnState();
+    void saveColumnState();
 };
