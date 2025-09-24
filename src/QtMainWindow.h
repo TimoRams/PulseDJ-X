@@ -76,6 +76,7 @@ protected:
 private slots:
     void onCrossfader(int v);
     void initializeAudio();
+    void onLibraryLoadToDeck(int deckIndex, const QString& filePath); // new slot
     // EQ/filter slots
     void onLeftHighChanged(int v);
     void onLeftMidChanged(int v);

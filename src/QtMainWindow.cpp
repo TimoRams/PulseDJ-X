@@ -29,6 +29,16 @@ void StereoAudioCallback::audioDeviceIOCallback(const float* const* inputChannel
 }
 
 // StereoAudioCallback implementation for proper stereo mixing of both decks
+// Library explicit deck load handler
+void QtMainWindow::onLibraryLoadToDeck(int deckIndex, const QString& filePath)
+{
+    QtDeckWidget* targetDeck = nullptr;
+    if (deckIndex == 1) targetDeck = deckA; else if (deckIndex == 2) targetDeck = deckB;
+    if (!targetDeck) return;
+    targetDeck->loadFile(filePath);
+    // Optionally set focus to the deck so keyboard controls work immediately
+    targetDeck->setFocus();
+}
 void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
                                                           float* const* outputChannelData, int numOutputChannels,
                                                           int numSamples, const juce::AudioIODeviceCallbackContext& context) {
@@ -1024,6 +1034,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             if (deckA) deckA->loadFile(filePath);
         }
     });
+
+    // Explicit context-menu deck loading
+    connect(libraryManager, &LibraryManager::loadToDeck, this, &QtMainWindow::onLibraryLoadToDeck);
     
     // Auto-populate with user's Music folder on startup
     QTimer::singleShot(500, this, [this]() {

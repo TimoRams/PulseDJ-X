@@ -224,6 +224,7 @@ public:
 signals:
     void fileSelected(const QString& filePath);
     void filesDropped(const QStringList& files);
+    void loadToDeck(int deckIndex, const QString& filePath); // New signal for explicit deck loading
     
 private slots:
     void onTrackLoaded(const TrackInfo& track);
@@ -253,6 +254,8 @@ private:
         QAction* actionAddFolder; // Replaced QPushButton with QAction
         QAction* actionRefresh; // Replaced QPushButton with QAction
         QAction* actionClearLibrary; // Replaced QPushButton with QAction
+        QAction* actionLoadDeck1 = nullptr; // Context-menu created; keep pointers if we later need enable/disable
+        QAction* actionLoadDeck2 = nullptr;
     QLabel* statusLabel;
     QProgressBar* progressBar;
     

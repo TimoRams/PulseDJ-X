@@ -958,9 +958,36 @@ void LibraryManager::updateStatusLabel()
 void LibraryManager::onContextMenuRequested(const QPoint& pos)
 {
     QMenu menu(this);
+    // Basic actions
     menu.addAction(actionAddFiles);
     menu.addAction(actionAddFolder);
     menu.addSeparator();
+
+    // Track-specific section only if a valid row under cursor
+    QModelIndex index = tableView->indexAt(pos);
+    const TrackInfo* track = nullptr;
+    if (index.isValid()) {
+        track = model->getTrack(index.row());
+    }
+
+    if (track) {
+        QMenu* loadToMenu = menu.addMenu("Load To");
+        actionLoadDeck1 = new QAction("Deck 1", loadToMenu);
+        actionLoadDeck2 = new QAction("Deck 2", loadToMenu);
+        loadToMenu->addAction(actionLoadDeck1);
+        loadToMenu->addAction(actionLoadDeck2);
+
+        QString filePath = track->filePath;
+        connect(actionLoadDeck1, &QAction::triggered, this, [this, filePath]() {
+            emit loadToDeck(1, filePath);
+        });
+        connect(actionLoadDeck2, &QAction::triggered, this, [this, filePath]() {
+            emit loadToDeck(2, filePath);
+        });
+
+        menu.addSeparator();
+    }
+
     menu.addAction(actionRefresh);
     menu.addSeparator();
     menu.addAction(actionClearLibrary);
