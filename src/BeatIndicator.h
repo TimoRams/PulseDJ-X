@@ -24,6 +24,11 @@ public:
     // NEW: Use global beat grid for accurate beat calculation
     void setTrackPositionDeckA(double positionSeconds); // Use track position in seconds
     void setTrackPositionDeckB(double positionSeconds); // Use track position in seconds
+
+    // Mark whether a valid beat grid/BPM+offset exists for each deck. When false,
+    // the indicator stays at beat 1 and is rendered greyed-out.
+    void setBeatGridAvailableDeckA(bool available) { gridAvailableA = available; if (!available) { currentBeatA = 0.0; } update(); }
+    void setBeatGridAvailableDeckB(bool available) { gridAvailableB = available; if (!available) { currentBeatB = 0.0; } update(); }
     
     // NEW: Getter methods for performance pads
     double getBpmDeckA() const { return bpmA; }
@@ -48,6 +53,10 @@ private:
     // First beat offsets per deck (seconds)
     double firstBeatOffsetA = 0.0;
     double firstBeatOffsetB = 0.0;
+
+    // Whether a beat grid is available for each deck
+    bool gridAvailableA = false;
+    bool gridAvailableB = false;
     
     // Box and layout sizes (rectangular, compact)
     static constexpr int BOX_W = 18;       // width of each beat box

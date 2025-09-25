@@ -106,6 +106,9 @@ public:
     // NEW: Ghost loop visualization support
     void setGhostLoopRegion(bool enabled, double startSec = 0.0, double endSec = 0.0);
 
+    // NEW: Clear the display to a pristine "NO TRACK LOADED" state
+    void clearDisplay();
+
     // Public access to track length and original BPM for external updates
     double trackLengthSec{0.0};
     double originalBpm{120.0}; // Public access for label updates

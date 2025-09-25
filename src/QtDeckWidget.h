@@ -5,6 +5,7 @@
 #include <QSlider>
 #include <QLabel>
 #include <QDoubleSpinBox>
+#include <QMenu>
 #include <memory>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -28,6 +29,7 @@ signals:
     void syncRequested(QtDeckWidget* requester); // One-shot sync
     void syncToggled(QtDeckWidget* requester, bool enabled); // Toggle follow-sync
     void loopChanged(bool enabled, double startSec, double endSec); // NEW: Loop status signal
+    void fileUnloaded(); // NEW: Emitted when the deck unloads the track
 
 public:
     void loadFile(const QString& path);
@@ -59,6 +61,8 @@ public slots:
     // BetaPulseX: Public slots für Settings-Integration
     void onKeylockToggle();
     void onQuantizeToggle();
+    void onUnload();
+    void onTempoRangeSelected();
 
 private slots:
     void onPlayPause();
@@ -73,6 +77,11 @@ private slots:
     void onSyncToggled(bool enabled);
     void onTempoSpinChanged(double v);
     void applyTempo(double factor);
+    void setTempoRangePm6();
+    void setTempoRangePm8();
+    void setTempoRangePm16();
+    void setTempoRangeWide();
+    void updateTempoControlsForRange();
 
 private:
     DJAudioPlayer* player;
@@ -83,16 +92,19 @@ private:
     QLabel* songNameLabel;
     QPushButton* playPauseBtn;
     QPushButton* loadBtn;
+    QPushButton* unloadBtn;
     QPushButton* cueBtn;
     QPushButton* keylockBtn;
     QPushButton* quantizeBtn;
     QPushButton* syncBtn;
+    QPushButton* tempoRangeBtn;
     QSlider* speedSlider;
     QLabel* speedLabel;
     QLabel* tempoValueLabel;
     QDoubleSpinBox* tempoSpin;
     QLabel* bpmDefaultLabel; // Shows detected/default BPM
     QLabel* bpmCurrentLabel; // Shows speed-adjusted BPM
+    QMenu* tempoRangeMenu{nullptr};
     PerformancePads* pads{nullptr};
     bool playing{false};
     QString currentFilePath;
@@ -103,6 +115,10 @@ private:
     QTimer* cueClickTimer; // Timer for detecting double-clicks on cue
     bool cueClickPending{false}; // True when waiting for potential second click
     qint64 lastPlayPressTime{0}; // Timestamp of last play button press
+    // Dynamic tempo range
+    double minTempoFactor{0.8400};
+    double maxTempoFactor{1.1600};
+    int tempoRangeIndex{2}; // 0: ±6, 1: ±8, 2: ±16, 3: WIDE
     
     // Loop state tracking for change detection
     bool lastLoopEnabled{false};

@@ -645,6 +645,31 @@ void WaveformDisplay::clearLoop() {
     throttledUpdate();
 }
 
+void WaveformDisplay::clearDisplay() {
+    // Reset source buffers and metadata
+    sourceMaxBins.clear();
+    sourceMinBins.clear();
+    sourceWidth = 0;
+    audioLength = 0.0;
+    trackLengthSec = 0.0;
+    originalBpm = 0.0;
+    firstBeatOffset = 0.0;
+    beatPositions.clear();
+    useAnalyzedBeats = false;
+    // Reset overlays
+    clearCuePoints();
+    clearLoop();
+    setGhostLoopRegion(false, 0.0, 0.0);
+    // Reset playhead so paint shows NO TRACK LOADED
+    playheadPos = -1.0;
+    // Clear cached images
+    waveformImage = QImage();
+    cachedScaled = QPixmap();
+    renderCache = RenderCache{}; // reset cache struct
+    // Trigger repaint
+    update();
+}
+
 // NEW: Ghost loop region support
 void WaveformDisplay::setGhostLoopRegion(bool enabled, double startSec, double endSec) {
     ghostLoopEnabled = enabled;

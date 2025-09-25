@@ -32,6 +32,8 @@ public:
     double getPositionRelative();
     void start();
     void stop();
+    // Fully unload the current track and detach sources
+    void unload();
     // Pause is an alias to stop playback without unloading the track
     void pause() { stop(); }
     bool isPlaying();

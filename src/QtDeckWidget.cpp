@@ -13,6 +13,8 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
+#include <QAction>
+#include <QPoint>
 
 QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QString& deckTitle, bool isLeftDeck)
     : QWidget(parent), player(player_)
@@ -52,10 +54,12 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     turntable = new QtTurntableWidget(controlsWidget);
     playPauseBtn = new QPushButton("Play", controlsWidget);
     loadBtn = new QPushButton("Load", controlsWidget);
+    unloadBtn = new QPushButton("Unload", controlsWidget);
     cueBtn = new QPushButton("Cue", controlsWidget);
     keylockBtn = new QPushButton("Key", controlsWidget);
     quantizeBtn = new QPushButton("Q", controlsWidget);
     syncBtn = new QPushButton("Sync", controlsWidget);
+    tempoRangeBtn = new QPushButton("±16%", controlsWidget);
     speedSlider = new QSlider(Qt::Vertical, controlsWidget);
     tempoValueLabel = new QLabel("1.000x", controlsWidget);
     tempoSpin = new QDoubleSpinBox(controlsWidget);
@@ -69,6 +73,9 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     cueBtn->setStyleSheet("QPushButton { background-color: #ff6600; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #e55a00; }");
     keylockBtn->setStyleSheet("QPushButton { background-color: #333; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #444; } QPushButton:checked { background-color: #00cc66; }");
     quantizeBtn->setStyleSheet("QPushButton { background-color: #333; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #444; } QPushButton:checked { background-color: #cc6600; }");
+    unloadBtn->setStyleSheet("QPushButton { background-color: #555; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #666; }");
+    tempoRangeBtn->setStyleSheet("QPushButton { background-color: #333; color: #ddd; border: none; padding: 2px 6px; border-radius: 0px; font-size: 9px; } QPushButton:hover { background-color: #444; }");
+    tempoRangeBtn->setFixedSize(42, 18); // keep size constant regardless of label
     syncBtn->setStyleSheet("QPushButton { background-color: #008844; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #00733a; } QPushButton:checked { background-color: #00aa55; }");
     
     // Make keylock and quantize buttons checkable
@@ -80,11 +87,13 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     quantizeBtn->setToolTip("Quantize - snaps cues and loops to nearest beat");
     syncBtn->setToolTip("Sync tempo & phase to the other deck");
     
-    // Tempo fader: ±16% with 0.001 precision via slider
+    // Tempo fader: ±16% with 0.001 precision via slider (defaults; dynamic range supported)
     speedSlider->setRange(840, 1160);     // store factor*1000
     speedSlider->setSingleStep(1);        // 0.001 per step
     speedSlider->setPageStep(5);          // 0.005 per page
     speedSlider->setTracking(true);       // continuous updates
+    speedSlider->setInvertedAppearance(true); // Down = faster, Up = slower
+    speedSlider->setInvertedControls(true);   // Arrow/Page keys match inverted appearance
     speedSlider->setValue(1000);          // 1.000x default
     // High precision spin (4 decimals)
     tempoSpin->setDecimals(4);
@@ -105,6 +114,7 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     connect(cueBtn, &QPushButton::released, this, &QtDeckWidget::onCueReleased);
     connect(keylockBtn, &QPushButton::clicked, this, &QtDeckWidget::onKeylockToggle);
     connect(quantizeBtn, &QPushButton::clicked, this, &QtDeckWidget::onQuantizeToggle);
+    connect(unloadBtn, &QPushButton::clicked, this, &QtDeckWidget::onUnload);
     syncBtn->setCheckable(true);
     connect(syncBtn, &QPushButton::clicked, this, &QtDeckWidget::onSync);          // immediate one-shot sync
     connect(syncBtn, &QPushButton::toggled, this, &QtDeckWidget::onSyncToggled);   // follow mode on/off
@@ -113,6 +123,16 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     connect(tempoSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &QtDeckWidget::onTempoSpinChanged);
     // Double-click reset on slider
     speedSlider->installEventFilter(this);
+    // Tempo range: cycle on click (no dropdown)
+    connect(tempoRangeBtn, &QPushButton::clicked, this, [this]() {
+        tempoRangeIndex = (tempoRangeIndex + 1) % 4;
+        switch (tempoRangeIndex) {
+            case 0: setTempoRangePm6(); break;
+            case 1: setTempoRangePm8(); break;
+            case 2: setTempoRangePm16(); break;
+            case 3: setTempoRangeWide(); break;
+        }
+    });
     
     // Connect overview click/drag to seek position and broadcast immediately
     connect(waveform, &DeckWaveformOverview::positionClicked, this, [this](double relative) {
@@ -179,20 +199,24 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     transportLayout->setSpacing(2);  // Reduced spacing for smaller buttons
     playPauseBtn->setFixedHeight(20);  // Smaller height
     loadBtn->setFixedHeight(20);       // Smaller height
+    unloadBtn->setFixedHeight(20);     // Smaller height
     cueBtn->setFixedHeight(20);        // Smaller height
     keylockBtn->setFixedHeight(20);    // Smaller height
     quantizeBtn->setFixedHeight(20);   // Smaller height
     playPauseBtn->setFixedWidth(40);   // Smaller width
     loadBtn->setFixedWidth(40);        // Smaller width
+    unloadBtn->setFixedWidth(50);      // Slightly wider
     cueBtn->setFixedWidth(30);         // Smaller width for Cue
     keylockBtn->setFixedWidth(30);     // Smaller width for Key
     quantizeBtn->setFixedWidth(25);    // Smaller width for Q
     transportLayout->addWidget(playPauseBtn);
     transportLayout->addWidget(loadBtn);
+    transportLayout->addWidget(unloadBtn);
     transportLayout->addWidget(cueBtn);
     transportLayout->addWidget(keylockBtn);
     transportLayout->addWidget(quantizeBtn);
     transportLayout->addWidget(syncBtn);
+    transportLayout->addWidget(tempoRangeBtn);
     turntableSection->addLayout(transportLayout);
     
     // Turntable (smaller to save space)
@@ -270,6 +294,10 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     setLayout(mainLayout);
 
     setAcceptDrops(true);
+
+    // Initialize tempo range defaults (±16%) and disable Unload until a track is loaded
+    setTempoRangePm16(); // also sets tempoRangeIndex to 2 implicitly
+    if (unloadBtn) unloadBtn->setEnabled(false);
 
     // Poll player position and update waveform playhead at ~60 FPS for smooth visuals
     QTimer* t = new QTimer(this);
@@ -366,8 +394,9 @@ void QtDeckWidget::onFileLoadingComplete(const QString& filePath) {
         // Re-enable controls after loading is complete
         playPauseBtn->setText("Play");
         playPauseBtn->setEnabled(true);
-        loadBtn->setText("Unload");
+        loadBtn->setText("Load");
         loadBtn->setEnabled(true);
+        if (unloadBtn) unloadBtn->setEnabled(true);
         
         // Emit the file loaded signal for other components (BPM analysis, etc.)
         emit fileLoaded();
@@ -484,20 +513,30 @@ void QtDeckWidget::onLoad() {
         QString fn = QFileDialog::getOpenFileName(this, "Open audio file");
         if (!fn.isEmpty()) loadFile(fn);
     } else {
-        // Unload current file
-        currentFilePath.clear();
-        songNameLabel->setText("No Track Loaded");
-        loadBtn->setText("Load");
-        playPauseBtn->setText("Play");
-        if (player) {
-            player->stop();
-            // Clear the loaded file
-        }
-        playing = false;
-        turntable->stop();
-        waveform->setPlayhead(0.0);
-        waveform->update();
+        onUnload();
     }
+}
+
+void QtDeckWidget::onUnload() {
+    // Unload current file
+    currentFilePath.clear();
+    songNameLabel->setText("No Track Loaded");
+    loadBtn->setText("Load");
+    if (unloadBtn) unloadBtn->setEnabled(false);
+    playPauseBtn->setText("Play");
+    if (player) {
+        player->stop();
+        player->unload();
+    }
+    playing = false;
+    turntable->stop();
+    // Clear displays (waveform, cue/loop, labels, tempo)
+    if (waveform) waveform->clearDisplay();
+    detectedBpm = 0.0;
+    if (bpmDefaultLabel) bpmDefaultLabel->setText("BPM: --");
+    if (bpmCurrentLabel) bpmCurrentLabel->setText("Curr: --");
+    setTempoFactor(1.0);
+    emit fileUnloaded();
 }
 
 void QtDeckWidget::onCue() {
@@ -607,8 +646,8 @@ void QtDeckWidget::onTempoSpinChanged(double v) {
 
 void QtDeckWidget::applyTempo(double factor) {
     if (!player) return;
-    // clamp to UI limits
-    double clamped = std::clamp(factor, 0.8400, 1.1600);
+    // clamp to UI limits (dynamic range)
+    double clamped = std::clamp(factor, minTempoFactor, maxTempoFactor);
     // Update player/turntable
     player->setSpeed(clamped);
     turntable->setSpeed(clamped);
@@ -637,6 +676,56 @@ void QtDeckWidget::applyTempo(double factor) {
     }
     emit displayedBpmChanged(displayed);
     emit tempoFactorChanged(clamped);
+}
+
+void QtDeckWidget::onTempoRangeSelected() {}
+
+void QtDeckWidget::setTempoRangePm6() {
+    minTempoFactor = 1.0 - 0.06;
+    maxTempoFactor = 1.0 + 0.06;
+    if (tempoRangeBtn) tempoRangeBtn->setText("±6%");
+    updateTempoControlsForRange();
+    tempoRangeIndex = 0;
+}
+
+void QtDeckWidget::setTempoRangePm8() {
+    minTempoFactor = 1.0 - 0.08;
+    maxTempoFactor = 1.0 + 0.08;
+    if (tempoRangeBtn) tempoRangeBtn->setText("±8%");
+    updateTempoControlsForRange();
+    tempoRangeIndex = 1;
+}
+
+void QtDeckWidget::setTempoRangePm16() {
+    minTempoFactor = 1.0 - 0.16;
+    maxTempoFactor = 1.0 + 0.16;
+    if (tempoRangeBtn) tempoRangeBtn->setText("±16%");
+    updateTempoControlsForRange();
+    tempoRangeIndex = 2;
+}
+
+void QtDeckWidget::setTempoRangeWide() {
+    // Choose a sensible wide range
+    minTempoFactor = 0.5;
+    maxTempoFactor = 1.5;
+    if (tempoRangeBtn) tempoRangeBtn->setText("WIDE");
+    updateTempoControlsForRange();
+    tempoRangeIndex = 3;
+}
+
+void QtDeckWidget::updateTempoControlsForRange() {
+    if (!speedSlider || !tempoSpin) return;
+    int minS = (int)std::round(minTempoFactor * 1000.0);
+    int maxS = (int)std::round(maxTempoFactor * 1000.0);
+    speedSlider->blockSignals(true);
+    speedSlider->setRange(minS, maxS);
+    speedSlider->blockSignals(false);
+    tempoSpin->blockSignals(true);
+    tempoSpin->setRange(minTempoFactor, maxTempoFactor);
+    tempoSpin->blockSignals(false);
+    // Ensure current factor is clamped and UI synced
+    double current = std::clamp(getTempoFactor(), minTempoFactor, maxTempoFactor);
+    applyTempo(current);
 }
 
 void QtDeckWidget::setDetectedBpm(double bpm) {

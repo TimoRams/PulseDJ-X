@@ -405,8 +405,12 @@ public:
             const double lengthSec = res.lengthSeconds;
 
             const bool onDeckA = isDeckA;
-            QMetaObject::invokeMethod(window, [w = window, maxBins, minBins, audioStart, lengthSec, onDeckA]() {
+            QMetaObject::invokeMethod(window, [w = window, maxBins, minBins, audioStart, lengthSec, onDeckA, filePath = this->filePath]() {
                 if (!w) return;
+                // Ensure deck still has the same file loaded to avoid race after unload/reload
+                QtDeckWidget* deck = onDeckA ? w->deckA : w->deckB;
+                if (!deck) return;
+                if (deck->getCurrentFilePath() != filePath) return;
                 WaveformDisplay* wf = onDeckA ? w->overviewTopA : w->overviewTopB;
                 if (wf) wf->setSourceBins(*maxBins, *minBins, audioStart, lengthSec);
             }, Qt::QueuedConnection);
@@ -457,6 +461,8 @@ public:
             QMetaObject::invokeMethod(window, [=]() {
                 if (window) {
                     // Get the appropriate waveform display
+                    QtDeckWidget* deck = isDeckA ? window->deckA : window->deckB;
+                    if (!deck || deck->getCurrentFilePath() != filePath) return;
                     WaveformDisplay* waveform = isDeckA ? window->overviewTopA : window->overviewTopB;
                     if (waveform) {
                         // Load waveform and set up defaults
@@ -745,6 +751,28 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             juce::File f(filePath.toStdString());
             bpmThreadPool->start(new BpmAnalysisTask(this, f, false));
         }
+    });
+
+    // Clear visuals and indicator when a deck unloads
+    connect(deckA, &QtDeckWidget::fileUnloaded, this, [this]() {
+        if (overviewTopA) {
+            overviewTopA->clearDisplay();
+        }
+        if (beatIndicator) {
+            beatIndicator->setBeatGridAvailableDeckA(false);
+        }
+        analysisActiveA = false; analysisFailedA = false; analysisProgressA = 0.0; algorithmA.clear();
+        updateOverviewLabel(true);
+    });
+    connect(deckB, &QtDeckWidget::fileUnloaded, this, [this]() {
+        if (overviewTopB) {
+            overviewTopB->clearDisplay();
+        }
+        if (beatIndicator) {
+            beatIndicator->setBeatGridAvailableDeckB(false);
+        }
+        analysisActiveB = false; analysisFailedB = false; analysisProgressB = 0.0; algorithmB.clear();
+        updateOverviewLabel(false);
     });
     // When playhead updates on deck, update overview playhead and beat indicator
     connect(deckA, &QtDeckWidget::playheadUpdated, this, [this](double relative) {
@@ -1690,6 +1718,11 @@ void QtMainWindow::keyPressEvent(QKeyEvent* event) {
 void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>& beatsSec, double totalSec, 
                                          const std::string& algorithm, double firstBeatOffset, bool isDeckA) {
     if (isDeckA) {
+        // Skip applying if deck has no file anymore
+        if (!deckA || deckA->getCurrentFilePath().isEmpty()) {
+            if (beatIndicator) beatIndicator->setBeatGridAvailableDeckA(false);
+            return;
+        }
         // Handle Deck A results
         if (deckA) deckA->setDetectedBpm(bpm);
         if (deckA && deckA->getWaveform()) {
@@ -1712,11 +1745,16 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
                 overviewTopA->setBeats(rel);
             }
         }
+        if (beatIndicator) { beatIndicator->setBeatGridAvailableDeckA(bpm > 0.0); }
         if (deckALabel) {
             algorithmA = QString::fromStdString(algorithm);
             updateOverviewLabel(true);
         }
     } else {
+        if (!deckB || deckB->getCurrentFilePath().isEmpty()) {
+            if (beatIndicator) beatIndicator->setBeatGridAvailableDeckB(false);
+            return;
+        }
         // Handle Deck B results
         if (deckB) deckB->setDetectedBpm(bpm);
         if (deckB && deckB->getWaveform()) {
@@ -1739,6 +1777,7 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
                 overviewTopB->setBeats(rel);
             }
         }
+        if (beatIndicator) { beatIndicator->setBeatGridAvailableDeckB(bpm > 0.0); }
         if (deckBLabel) {
             algorithmB = QString::fromStdString(algorithm);
             updateOverviewLabel(false);

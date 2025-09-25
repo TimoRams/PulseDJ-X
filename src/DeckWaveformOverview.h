@@ -48,6 +48,19 @@ public:
         meshDirty = true;
         update();
     }
+    // NEW: Clear waveform and overlays for unloaded state
+    void clearDisplay() {
+        waveform.clear();
+        meshDirty = true;
+        vertexCount = 0;
+        playheadPos = -1.0;
+        displayedPlayheadPos = -1.0;
+        clearCuePoints();
+        clearLoop();
+        totalLength = 0.0;
+        audioStartOffset = 0.0;
+        update();
+    }
 
 signals:
     void fileDropped(const QString& path);

@@ -1049,6 +1049,48 @@ void DJAudioPlayer::stop() {
     }
 }
 
+#include <atomic>
+
+void DJAudioPlayer::unload() {
+    // Hard stop and detach any loaded source; ensure subsequent callbacks output silence
+    try {
+        std::cout << "=== DJAudioPlayer::unload() BEGIN ===" << std::endl;
+        // Stop playback immediately
+        transportSource.stop();
+        softPaused.store(false);
+        forceSilent.store(true);
+        inPrerollMode = false;
+        prerollPosition = 0.0;
+        pausedPosSec = 0.0;
+        loopEnabled = false;
+        loopStartSec = 0.0;
+        loopEndSec = 0.0;
+
+        // Detach source so length/position report empty
+        transportSource.setSource(nullptr);
+        readerSource.reset();
+
+        // Release processing resources (they will be re-prepared by device callbacks)
+        try { resampleSource.releaseResources(); } catch (...) {}
+        try { transportSource.releaseResources(); } catch (...) {}
+
+#if defined(RUBBERBAND_FOUND)
+        // Reset Rubber Band state
+        rb.reset();
+        rbReady = false;
+        rbPaddedStartDone = false;
+        rbDiscardOutRemaining = 0;
+        rbLatencySamples = 0;
+        rbLatencySeconds = 0.0;
+#endif
+        std::cout << "=== DJAudioPlayer::unload() END ===" << std::endl;
+    } catch (const std::exception& e) {
+        std::cout << "Exception in DJAudioPlayer::unload(): " << e.what() << std::endl;
+    } catch (...) {
+        std::cout << "Unknown exception in DJAudioPlayer::unload()" << std::endl;
+    }
+}
+
 #if defined(RUBBERBAND_FOUND)
 void DJAudioPlayer::reinitRubberBand() {
     // Validate environment before creating RB stretcher

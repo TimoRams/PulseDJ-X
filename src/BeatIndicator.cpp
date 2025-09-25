@@ -25,12 +25,16 @@ void BeatIndicator::setBeatPositionDeckB(double beat) {
 void BeatIndicator::setBpmDeckA(double newBpm) {
     if (newBpm > 0.0) {
         bpmA = newBpm;
+        gridAvailableA = true;
+        update();
     }
 }
 
 void BeatIndicator::setBpmDeckB(double newBpm) {
     if (newBpm > 0.0) {
         bpmB = newBpm;
+        gridAvailableB = true;
+        update();
     }
 }
 
@@ -49,6 +53,8 @@ void BeatIndicator::setFirstBeatOffsetDeckB(double seconds) { firstBeatOffsetB =
 
 // NEW: Calculate beat position from track time using global beat grid
 void BeatIndicator::setTrackPositionDeckA(double positionSeconds) {
+    // If no beat grid is available yet, keep it at beat 1 (index 0) and greyed out
+    if (!gridAvailableA) { setBeatPositionDeckA(0.0); return; }
     // Base BPM from analysis; fall back to global grid if unknown
     double baseBpm = (bpmA > 0.0) ? bpmA : GlobalBeatGrid::getInstance().getCurrentBpm();
     if (baseBpm <= 0.0) {
@@ -82,6 +88,7 @@ void BeatIndicator::setTrackPositionDeckA(double positionSeconds) {
 }
 
 void BeatIndicator::setTrackPositionDeckB(double positionSeconds) {
+    if (!gridAvailableB) { setBeatPositionDeckB(0.0); return; }
     double baseBpm = (bpmB > 0.0) ? bpmB : GlobalBeatGrid::getInstance().getCurrentBpm();
     if (baseBpm <= 0.0) {
         setBeatPositionDeckB(0.0);
@@ -143,26 +150,36 @@ void BeatIndicator::paintEvent(QPaintEvent* event) {
     for (int i = 0; i < 4; ++i) {
         int x = startX + i * BOX_SPACING;
         
-    // Top row (blue boxes for Deck A) - flat rectangles
-    QColor topColor = (i == currentBeatIndexA) ? QColor(100, 150, 255) : QColor(40, 60, 80);
+        // Top row (Deck A)
+        const bool aDisabled = !gridAvailableA;
+        QColor topActive = aDisabled ? QColor(85, 85, 95) : QColor(100, 150, 255);
+        QColor topInactive = aDisabled ? QColor(55, 55, 65) : QColor(40, 60, 80);
+        QColor topBorder = aDisabled ? QColor(120, 120, 130) : QColor(200, 200, 255);
+        QColor topText = aDisabled ? QColor(180, 180, 190) : QColor(255, 255, 255);
+        QColor topColor = (i == currentBeatIndexA) ? topActive : topInactive;
         p.setBrush(QBrush(topColor));
-    p.setPen(QPen(QColor(200, 200, 255), 1));
-    p.drawRect(x, topY, BOX_W, BOX_H);
+        p.setPen(QPen(topBorder, 1));
+        p.drawRect(x, topY, BOX_W, BOX_H);
         
         // Beat number in top box - always show 1,2,3,4
-    p.setPen(QPen(QColor(255, 255, 255), 1));
-    p.setFont(QFont("Arial", 8, QFont::Bold));
-    p.drawText(x, topY, BOX_W, BOX_H, Qt::AlignCenter, QString::number(i + 1));
+        p.setPen(QPen(topText, 1));
+        p.setFont(QFont("Arial", 8, QFont::Bold));
+        p.drawText(x, topY, BOX_W, BOX_H, Qt::AlignCenter, QString::number(i + 1));
         
-        // Bottom row (orange boxes for Deck B)
-        QColor bottomColor = (i == currentBeatIndexB) ? QColor(255, 150, 50) : QColor(80, 50, 20);
+        // Bottom row (Deck B)
+        const bool bDisabled = !gridAvailableB;
+        QColor bottomActive = bDisabled ? QColor(95, 85, 75) : QColor(255, 150, 50);
+        QColor bottomInactive = bDisabled ? QColor(65, 60, 55) : QColor(80, 50, 20);
+        QColor bottomBorder = bDisabled ? QColor(130, 120, 110) : QColor(255, 200, 100);
+        QColor bottomText = bDisabled ? QColor(190, 180, 170) : QColor(255, 255, 255);
+        QColor bottomColor = (i == currentBeatIndexB) ? bottomActive : bottomInactive;
         p.setBrush(QBrush(bottomColor));
-        p.setPen(QPen(QColor(255, 200, 100), 1));
-    p.drawRect(x, bottomY, BOX_W, BOX_H);
+        p.setPen(QPen(bottomBorder, 1));
+        p.drawRect(x, bottomY, BOX_W, BOX_H);
         
         // Beat number in bottom box - always show 1,2,3,4
-    p.setPen(QPen(QColor(255, 255, 255), 1));
-    p.drawText(x, bottomY, BOX_W, BOX_H, Qt::AlignCenter, QString::number(i + 1));
+        p.setPen(QPen(bottomText, 1));
+        p.drawText(x, bottomY, BOX_W, BOX_H, Qt::AlignCenter, QString::number(i + 1));
     }
     
     // Draw progress bar showing position within current beat for Deck A
@@ -171,11 +188,11 @@ void BeatIndicator::paintEvent(QPaintEvent* event) {
     int progressWidthA = (int)(BOX_W * beatProgressA);
     
     // Progress overlay on current beat for Deck A (top row)
-    if (progressWidthA > 0) {
+    if (gridAvailableA && progressWidthA > 0) {
         QColor progressColorA(255, 255, 255, 120);
         p.setBrush(QBrush(progressColorA));
         p.setPen(Qt::NoPen);
-    p.drawRect(progressXA, topY, progressWidthA, BOX_H);
+        p.drawRect(progressXA, topY, progressWidthA, BOX_H);
     }
     
     // Draw progress bar showing position within current beat for Deck B
@@ -184,11 +201,11 @@ void BeatIndicator::paintEvent(QPaintEvent* event) {
     int progressWidthB = (int)(BOX_W * beatProgressB);
     
     // Progress overlay on current beat for Deck B (bottom row)
-    if (progressWidthB > 0) {
+    if (gridAvailableB && progressWidthB > 0) {
         QColor progressColorB(255, 255, 255, 120);
         p.setBrush(QBrush(progressColorB));
         p.setPen(Qt::NoPen);
-    p.drawRect(progressXB, bottomY, progressWidthB, BOX_H);
+        p.drawRect(progressXB, bottomY, progressWidthB, BOX_H);
     }
     
     // No A/B labels: nur die Zahlen 1..4 in den Kästchen
