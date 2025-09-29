@@ -1,5 +1,7 @@
 #include "PreferencesDialog.h"
 #include <QApplication>
+#include <QTimer>
+#include <QTime>
 #include <QScreen>
 #include <QHeaderView>
 #include <QStandardPaths>
@@ -7,9 +9,11 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSettings>
+#include <iostream>
 
 PreferencesDialog::PreferencesDialog(QWidget* parent)
-    : QDialog(parent) {
+    : QDialog(parent)
+    , midiEngine(new MidiEngine(this)) {
     setWindowTitle("BetaPulseX - Preferences");
     setWindowIcon(QIcon(":/icons/settings.png"));
     setModal(true);
@@ -25,9 +29,41 @@ PreferencesDialog::PreferencesDialog(QWidget* parent)
         move(screen->geometry().center() - rect().center());
     }
     
+    // Connect MIDI Engine signals
+    connect(midiEngine, &MidiEngine::deviceOpened, this, &PreferencesDialog::onMidiDeviceOpened);
+    connect(midiEngine, &MidiEngine::deviceClosed, this, &PreferencesDialog::onMidiDeviceClosed);
+    connect(midiEngine, &MidiEngine::deviceError, this, &PreferencesDialog::onMidiDeviceError);
+    connect(midiEngine, &MidiEngine::midiMessageReceived, this, &PreferencesDialog::onMidiMessageReceived);
+    
     setupUI();
     loadSettings();
     originalSettings = settings; // Backup für Cancel
+}
+
+void PreferencesDialog::setPlayerReferences(DJAudioPlayer* playerA, DJAudioPlayer* playerB, QtMainWindow* mainWindow)
+{
+    // Store main window reference for deck access
+    mainWindowRef = mainWindow;
+    
+    if (midiEngine) {
+        midiEngine->setPlayers(playerA, playerB);
+        midiEngine->setMainWindow(mainWindow);
+        qDebug() << "PreferencesDialog: Player references set for MIDI integration";
+        
+        // Add a default test mapping for quick testing
+        // Map any CC control #1 to PlayPause for Deck A (Omni channel handling in MidiEngine)
+        MidiControlMapping testMapping;
+        testMapping.midiChannel = 0;  // Omni Channel (handled automatically by MidiEngine)
+        testMapping.controlNumber = 1;  // CC1
+        testMapping.controlType = MidiControlType::PlayPause;
+        testMapping.deckId = "A";
+        testMapping.isNote = false;
+        testMapping.minValue = 0;
+        testMapping.maxValue = 127;
+        
+        midiEngine->addControlMapping(testMapping);
+        qDebug() << "PreferencesDialog: Added test mapping - CC1 on Omni Channel -> PlayPause Deck A";
+    }
 }
 
 void PreferencesDialog::setupUI() {
@@ -43,6 +79,7 @@ void PreferencesDialog::setupUI() {
     createInterfaceTab();
     createLibraryTab();
     createPerformanceTab();
+    createMidiTab();
     createAdvancedTab();
     
     // Button layout
@@ -490,6 +527,320 @@ void PreferencesDialog::createPerformanceTab() {
     layout->addStretch();
 }
 
+void PreferencesDialog::createMidiTab() {
+    midiTab = new QWidget();
+    tabWidget->addTab(midiTab, QIcon(":/icons/midi.png"), "MIDI");
+    
+    QVBoxLayout* layout = new QVBoxLayout(midiTab);
+    
+    // MIDI Device Group
+    QGroupBox* deviceGroup = new QGroupBox("MIDI Controller");
+    QFormLayout* deviceLayout = new QFormLayout(deviceGroup);
+    
+    // Enable MIDI
+    midiEnabled = new QCheckBox("Enable MIDI control");
+    deviceLayout->addRow(midiEnabled);
+    
+    // Device Selection
+    QHBoxLayout* deviceSelectionLayout = new QHBoxLayout();
+    midiDeviceCombo = new QComboBox();
+    midiDeviceCombo->setMinimumWidth(200);
+    midiRefreshButton = new QPushButton("Refresh");
+    midiRefreshButton->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    midiRefreshButton->setFixedWidth(80);
+    deviceSelectionLayout->addWidget(midiDeviceCombo);
+    deviceSelectionLayout->addWidget(midiRefreshButton);
+    deviceLayout->addRow("MIDI Device:", deviceSelectionLayout);
+    
+    // Status indicator
+    midiStatusLabel = new QLabel("No device connected");
+    midiStatusLabel->setStyleSheet("color: #888; font-style: italic;");
+    deviceLayout->addRow("Status:", midiStatusLabel);
+    
+    // Device activation button
+    midiActivateButton = new QPushButton("Connect Device");
+    midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+    midiActivateButton->setEnabled(false);  // Disabled until device is selected
+    midiActivateButton->setToolTip("Click to connect and activate the selected MIDI device");
+    deviceLayout->addRow("", midiActivateButton);
+    
+    layout->addWidget(deviceGroup);
+    
+    // MIDI Learning Group
+    QGroupBox* learningGroup = new QGroupBox("MIDI Learning");
+    QFormLayout* learningLayout = new QFormLayout(learningGroup);
+    
+    midiLearnMode = new QCheckBox("Enable MIDI Learn mode");
+    midiLearnMode->setToolTip("When enabled, click on any control and then move a knob/fader on your MIDI controller to assign it.");
+    learningLayout->addRow(midiLearnMode);
+    
+    layout->addWidget(learningGroup);
+    
+    // MIDI Control Mapping Group
+    QGroupBox* mappingGroup = new QGroupBox("Control Mapping");
+    QVBoxLayout* mappingLayout = new QVBoxLayout(mappingGroup);
+    
+    // Instructions
+    QLabel* mappingInstructions = new QLabel(
+        "Map your MIDI controller buttons to deck controls:\n"
+        "1. Click 'Learn' next to a control\n" 
+        "2. Press the button/knob on your controller\n"
+        "3. The mapping is saved automatically"
+    );
+    mappingInstructions->setStyleSheet("color: #aaa; font-size: 10px; margin-bottom: 10px;");
+    mappingLayout->addWidget(mappingInstructions);
+    
+    // Mapping table
+    midiMappingTable = new QTableWidget(0, 4);
+    midiMappingTable->setHorizontalHeaderLabels({"Control", "MIDI Input", "Status", "Action"});
+    midiMappingTable->horizontalHeader()->setStretchLastSection(true);
+    midiMappingTable->setAlternatingRowColors(true);
+    midiMappingTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    midiMappingTable->setMinimumHeight(300);
+    midiMappingTable->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    
+    // Set column widths
+    midiMappingTable->setColumnWidth(0, 150); // Control name
+    midiMappingTable->setColumnWidth(1, 120); // MIDI input
+    midiMappingTable->setColumnWidth(2, 100); // Status
+    
+    mappingLayout->addWidget(midiMappingTable);
+    
+    // Add essential deck controls
+    addMidiMappingRow("Play/Pause Deck A", "", "Not Mapped");
+    addMidiMappingRow("Play/Pause Deck B", "", "Not Mapped");
+    addMidiMappingRow("Cue Deck A", "", "Not Mapped");
+    addMidiMappingRow("Cue Deck B", "", "Not Mapped");
+    addMidiMappingRow("Tempo Deck A", "", "Not Mapped");
+    addMidiMappingRow("Tempo Deck B", "", "Not Mapped");
+    addMidiMappingRow("Volume Deck A", "", "Not Mapped");
+    addMidiMappingRow("Volume Deck B", "", "Not Mapped");
+    addMidiMappingRow("Crossfader", "", "Not Mapped");
+    
+    // Mapping buttons
+    QHBoxLayout* mappingButtonLayout = new QHBoxLayout();
+    
+    QPushButton* addMappingButton = new QPushButton("Add Control");
+    addMappingButton->setIcon(style()->standardIcon(QStyle::SP_FileIcon));
+    
+    QPushButton* clearMappingsButton = new QPushButton("Clear All");
+    clearMappingsButton->setIcon(style()->standardIcon(QStyle::SP_DialogResetButton));
+    
+    QPushButton* saveMappingsButton = new QPushButton("Save Preset");
+    saveMappingsButton->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
+    
+    QPushButton* loadMappingsButton = new QPushButton("Load Preset");
+    loadMappingsButton->setIcon(style()->standardIcon(QStyle::SP_DialogOpenButton));
+    
+    mappingButtonLayout->addWidget(addMappingButton);
+    mappingButtonLayout->addWidget(clearMappingsButton);
+    mappingButtonLayout->addStretch();
+    mappingButtonLayout->addWidget(saveMappingsButton);
+    mappingButtonLayout->addWidget(loadMappingsButton);
+    
+    mappingLayout->addLayout(mappingButtonLayout);
+    
+    // Connect mapping button signals
+    connect(clearMappingsButton, &QPushButton::clicked, [this]() {
+        int ret = QMessageBox::question(this, "Clear All Mappings", 
+            "Are you sure you want to clear all MIDI mappings?",
+            QMessageBox::Yes | QMessageBox::No);
+        
+        if (ret == QMessageBox::Yes) {
+            for (int row = 0; row < midiMappingTable->rowCount(); ++row) {
+                midiMappingTable->item(row, 1)->setText("");
+                midiMappingTable->item(row, 2)->setText("Not Mapped");
+                midiMappingTable->item(row, 2)->setForeground(QBrush(QColor(255, 87, 34))); // Orange
+            }
+            QMessageBox::information(this, "Mappings Cleared", "All MIDI mappings have been cleared.");
+        }
+    });
+    
+    connect(saveMappingsButton, &QPushButton::clicked, [this]() {
+        QString fileName = QFileDialog::getSaveFileName(this, 
+            "Save MIDI Mapping Preset", 
+            QApplication::applicationDirPath() + "/midi_presets/", 
+            "MIDI Preset Files (*.midip)");
+        
+        if (!fileName.isEmpty()) {
+            saveMidiMappings(fileName);
+        }
+    });
+    
+    connect(loadMappingsButton, &QPushButton::clicked, [this]() {
+        QString fileName = QFileDialog::getOpenFileName(this, 
+            "Load MIDI Mapping Preset", 
+            QApplication::applicationDirPath() + "/midi_presets/", 
+            "MIDI Preset Files (*.midip)");
+        
+        if (!fileName.isEmpty()) {
+            loadMidiMappings(fileName);
+        }
+    });
+    
+    layout->addWidget(mappingGroup, 3); // Give more space to mapping section
+    
+    // Test section with live input display
+    QVBoxLayout* testSectionLayout = new QVBoxLayout();
+    
+    // Test button row
+    QHBoxLayout* testButtonLayout = new QHBoxLayout();
+    midiTestButton = new QPushButton("Start MIDI Test");
+    midiTestButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+    midiTestButton->setCheckable(true);
+    midiTestButton->setToolTip("Click to start/stop live MIDI input monitoring");
+    
+    QPushButton* clearTestButton = new QPushButton("Clear");
+    clearTestButton->setIcon(style()->standardIcon(QStyle::SP_DialogResetButton));
+    clearTestButton->setFixedWidth(60);
+    
+    testButtonLayout->addWidget(midiTestButton);
+    testButtonLayout->addWidget(clearTestButton);
+    testSectionLayout->addLayout(testButtonLayout);
+    
+    // Live input display
+    midiInputLabel = new QLabel("Click 'Start MIDI Test' and move controls on your MIDI device");
+    midiInputLabel->setStyleSheet("color: #666; font-size: 9px; padding: 3px; border: 1px solid #444; border-radius: 3px; background-color: #2a2a2a;");
+    midiInputLabel->setWordWrap(true);
+    midiInputLabel->setMaximumHeight(40);
+    midiInputLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    testSectionLayout->addWidget(midiInputLabel);
+    
+    // MIDI activity indicator
+    midiActivityLabel = new QLabel("● No Activity");
+    midiActivityLabel->setStyleSheet("color: #666; font-size: 9px;");
+    testSectionLayout->addWidget(midiActivityLabel);
+    
+    learningLayout->addRow("MIDI Test:", testSectionLayout);
+    
+    // Connect test button signals
+    connect(midiTestButton, &QPushButton::toggled, [this, clearTestButton](bool checked) {
+        qDebug() << "PreferencesDialog: MIDI Test button toggled to:" << checked;
+        
+        if (checked) {
+            // Check if device is selected
+            QString selectedDevice = midiDeviceCombo->currentText();
+            qDebug() << "PreferencesDialog: Selected MIDI device:" << selectedDevice;
+            
+            if (selectedDevice.isEmpty() || selectedDevice == "None") {
+                QMessageBox::warning(this, "MIDI Test", 
+                    "Please select a MIDI device first from the dropdown above.");
+                midiTestButton->setChecked(false);
+                return;
+            }
+            
+            // Enable MIDI and open device if not already open
+            qDebug() << "PreferencesDialog: Current device open status:" << (midiEngine ? midiEngine->isDeviceOpen() : false);
+            qDebug() << "PreferencesDialog: Current device name:" << (midiEngine ? midiEngine->getCurrentDevice() : "none");
+            
+            if (!midiEngine->isDeviceOpen() || midiEngine->getCurrentDevice() != selectedDevice) {
+                qDebug() << "PreferencesDialog: Device not connected. Please use 'Connect Device' button first.";
+                
+                QMessageBox::information(this, "MIDI Test", 
+                    "Please connect to the MIDI device first using the 'Connect Device' button, then try the test again.");
+                midiTestButton->setChecked(false);
+                return;
+                
+                if (!midiEngine->openMidiDevice(selectedDevice)) {
+                    QMessageBox::warning(this, "MIDI Test Error", 
+                        "Failed to open MIDI device: " + selectedDevice + 
+                        "\n\nPossible causes:\n"
+                        "• Device is already in use by another application\n"
+                        "• Device is disconnected\n"
+                        "• Driver issues\n\n"
+                        "Please check your MIDI device connection and try again.");
+                    midiTestButton->setChecked(false);
+                    return;
+                }
+            }
+            
+            // Activate test mode
+            midiTestActive = true;
+            midiTestButton->setText("Stop MIDI Test");
+            midiTestButton->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+            midiInputLabel->setText("Listening for MIDI input from: " + selectedDevice + 
+                                  "\n\nMove any control on your device to test the connection...");
+            midiInputLabel->setStyleSheet("color: #4CAF50; font-size: 10px; padding: 5px; border: 1px solid #4CAF50; border-radius: 3px; background-color: #1a2a1a;");
+            midiActivityLabel->setText("● Listening");
+            midiActivityLabel->setStyleSheet("color: #4CAF50; font-size: 9px;");
+            
+            qDebug() << "PreferencesDialog: MIDI Test mode activated successfully";
+        } else {
+            // Deactivate test mode
+            midiTestActive = false;
+            midiTestButton->setText("Start MIDI Test");
+            midiTestButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+            midiInputLabel->setText("MIDI test stopped. Click 'Start MIDI Test' to resume monitoring.");
+            midiInputLabel->setStyleSheet("color: #666; font-size: 10px; padding: 5px; border: 1px solid #444; border-radius: 3px; background-color: #2a2a2a;");
+            midiActivityLabel->setText("● Stopped");
+            midiActivityLabel->setStyleSheet("color: #666; font-size: 9px;");
+            
+            qDebug() << "PreferencesDialog: MIDI Test mode deactivated";
+        }
+    });
+    
+    connect(clearTestButton, &QPushButton::clicked, [this]() {
+        if (midiTestButton->isChecked()) {
+            midiInputLabel->setText("Listening for MIDI input... Move any control on your device.");
+        } else {
+            midiInputLabel->setText("Click 'Start MIDI Test' and move controls on your MIDI device");
+        }
+    });
+    
+    layout->addWidget(learningGroup, 0); // Minimal space for learning section
+
+    // MIDI Info Group
+    QGroupBox* infoGroup = new QGroupBox("MIDI Information");
+    QVBoxLayout* infoLayout = new QVBoxLayout(infoGroup);
+    
+    QLabel* infoText = new QLabel(
+        "<b>Quick Setup:</b> Connect USB → Select Device → Connect → Learn Controls"
+    );
+    infoText->setWordWrap(true);
+    infoText->setStyleSheet("color: #999; font-size: 10px; padding: 5px;");
+    infoLayout->addWidget(infoText);
+    
+    // Make info group much smaller
+    infoGroup->setMaximumHeight(60);
+    layout->addWidget(infoGroup, 0); // Minimal space for info section
+    
+    // Populate MIDI devices on creation
+    populateMidiDevices();
+    
+    // Connect signals
+    connect(midiEnabled, &QCheckBox::toggled, [this](bool enabled) {
+        midiDeviceCombo->setEnabled(enabled);
+        midiRefreshButton->setEnabled(enabled);
+        midiActivateButton->setEnabled(enabled && midiDeviceCombo->currentIndex() > 0);
+        midiLearnMode->setEnabled(enabled);
+        midiTestButton->setEnabled(enabled);
+        
+        if (enabled && midiDeviceCombo->count() > 1) {
+            midiStatusLabel->setText("Ready");
+            midiStatusLabel->setStyleSheet("color: #4CAF50; font-weight: bold;");
+        } else {
+            midiStatusLabel->setText(enabled ? "No device selected" : "MIDI disabled");
+            midiStatusLabel->setStyleSheet("color: #888; font-style: italic;");
+        }
+    });
+    
+    connect(midiEnabled, &QCheckBox::toggled, this, &PreferencesDialog::onMidiEnabledChanged);
+    connect(midiRefreshButton, &QPushButton::clicked, this, &PreferencesDialog::onMidiDeviceRefresh);
+    connect(midiActivateButton, &QPushButton::clicked, this, &PreferencesDialog::onMidiDeviceActivate);
+    connect(midiTestButton, &QPushButton::clicked, this, &PreferencesDialog::onMidiDeviceTest);
+    connect(midiDeviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+            this, &PreferencesDialog::onMidiDeviceChanged);
+    connect(midiLearnMode, &QCheckBox::toggled, this, &PreferencesDialog::onMidiLearnToggle);
+    
+    // Initialize UI state
+    midiEnabled->setChecked(false);
+    midiDeviceCombo->setEnabled(false);
+    midiRefreshButton->setEnabled(false);
+    midiActivateButton->setEnabled(false);
+    midiLearnMode->setEnabled(false);
+    midiTestButton->setEnabled(false);
+}
+
 void PreferencesDialog::createAdvancedTab() {
     advancedTab = new QWidget();
     tabWidget->addTab(advancedTab, QIcon(":/icons/advanced.png"), "Advanced");
@@ -735,6 +1086,14 @@ void PreferencesDialog::loadSettings() {
     settings.backgroundProcessing = config.value("Performance/BackgroundProcessing", true).toBool();
     settings.diskCacheMB = config.value("Performance/DiskCacheMB", 256).toInt();
     
+    // Load MIDI settings through MidiEngine
+    midiEngine->loadSettings(config);
+    
+    // Load local MIDI UI settings
+    settings.midiEnabled = config.value("MIDI/Enabled", false).toBool();
+    settings.midiDevice = config.value("MIDI/Device", "").toString();
+    settings.midiLearnMode = config.value("MIDI/LearnMode", false).toBool();
+    
     // Load Advanced settings
     settings.configPath = config.value("Advanced/ConfigPath", AppConfig::instance().getConfigDirectory()).toString();
     settings.debugLogging = config.value("Advanced/DebugLogging", false).toBool();
@@ -799,6 +1158,14 @@ void PreferencesDialog::saveSettings() {
     config.setValue("Performance/RenderQuality", renderQualityCombo->currentText());
     config.setValue("Performance/BackgroundProcessing", backgroundProcessing->isChecked());
     config.setValue("Performance/DiskCacheMB", diskCacheSlider->value());
+    
+    // Save MIDI settings through MidiEngine
+    midiEngine->saveSettings(config);
+    
+    // Save local MIDI UI settings
+    config.setValue("MIDI/Enabled", midiEnabled->isChecked());
+    config.setValue("MIDI/Device", midiDeviceCombo->currentText());
+    config.setValue("MIDI/LearnMode", midiLearnMode->isChecked());
     
     // Save Advanced settings
     config.setValue("Advanced/ConfigPath", configPathEdit->text());
@@ -888,6 +1255,22 @@ void PreferencesDialog::updateUIFromSettings() {
     backgroundProcessing->setChecked(settings.backgroundProcessing);
     diskCacheSlider->setValue(settings.diskCacheMB);
     
+    // MIDI
+    midiEnabled->setChecked(settings.midiEnabled);
+    if (!settings.midiDevice.isEmpty()) {
+        int deviceIndex = midiDeviceCombo->findText(settings.midiDevice);
+        if (deviceIndex >= 0) {
+            midiDeviceCombo->setCurrentIndex(deviceIndex);
+        }
+    }
+    midiLearnMode->setChecked(settings.midiLearnMode);
+    
+    // Initialize MIDI test mode state
+    midiTestActive = false;
+    midiTestButton->setChecked(false);
+    midiActivityLabel->setText("● No Activity");
+    midiActivityLabel->setStyleSheet("color: #666; font-size: 9px;");
+    
     // Advanced
     configPathEdit->setText(settings.configPath);
     debugLogging->setChecked(settings.debugLogging);
@@ -930,4 +1313,573 @@ void PreferencesDialog::populateThemes() {
 
 void PreferencesDialog::populateSkins() {
     skinCombo->addItems({"Default", "Professional", "Minimal", "Retro", "Custom"});
+}
+
+void PreferencesDialog::populateMidiDevices() {
+    midiDeviceCombo->clear();
+    midiDeviceCombo->addItem("No MIDI device", "");
+    
+    // Get available MIDI devices from MidiEngine
+    QStringList midiDevices = midiEngine->getAvailableMidiDevices();
+    
+    if (midiDevices.isEmpty()) {
+        midiStatusLabel->setText("No MIDI devices found");
+        midiStatusLabel->setStyleSheet("color: #FF5722; font-weight: bold;");
+    } else {
+        for (const QString& deviceName : midiDevices) {
+            midiDeviceCombo->addItem(deviceName, deviceName);
+        }
+        
+        midiStatusLabel->setText(QString("Found %1 MIDI device(s)").arg(midiDevices.size()));
+        midiStatusLabel->setStyleSheet("color: #4CAF50; font-weight: bold;");
+    }
+}
+
+void PreferencesDialog::onMidiDeviceRefresh() {
+    populateMidiDevices();
+    QMessageBox::information(this, "MIDI Devices", 
+                           QString("MIDI device list refreshed.\nFound %1 device(s).").arg(midiDeviceCombo->count() - 1));
+}
+
+void PreferencesDialog::onMidiDeviceActivate() {
+    if (midiDeviceCombo->currentIndex() == 0) {
+        QMessageBox::warning(this, "MIDI Device", "Please select a MIDI device first.");
+        return;
+    }
+    
+    QString selectedDevice = midiDeviceCombo->currentText();
+    
+    if (midiEngine && midiEngine->isDeviceOpen() && midiEngine->getCurrentDevice() == selectedDevice) {
+        // Device is already connected, disconnect it
+        qDebug() << "PreferencesDialog: Disconnecting MIDI device:" << selectedDevice;
+        midiEngine->closeMidiDevice();
+        
+        midiActivateButton->setText("Connect Device");
+        midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+        midiStatusLabel->setText("Device disconnected");
+        midiStatusLabel->setStyleSheet("color: #888; font-style: italic;");
+        
+        // Disable controls when device is disconnected
+        midiEnabled->setChecked(false);
+        midiTestButton->setEnabled(false);
+        midiLearnMode->setEnabled(false);
+        
+        return;
+    }
+    
+    // Try to connect to device
+    qDebug() << "PreferencesDialog: Connecting to MIDI device:" << selectedDevice;
+    
+    // Enable MIDI first
+    midiEnabled->setChecked(true);
+    
+    // Apply settings and open device
+    QSettings tempSettings;
+    tempSettings.setValue("midi/enabled", true);
+    tempSettings.setValue("midi/device", selectedDevice);
+    midiEngine->loadSettings(tempSettings);
+    
+    if (midiEngine->openMidiDevice(selectedDevice)) {
+        qDebug() << "PreferencesDialog: MIDI device connected successfully:" << selectedDevice;
+        
+        midiActivateButton->setText("Disconnect Device");
+        midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+        midiStatusLabel->setText("Connected: " + selectedDevice);
+        midiStatusLabel->setStyleSheet("color: #4CAF50; font-weight: bold;");
+        
+        // Enable controls when device is connected
+        midiTestButton->setEnabled(true);
+        midiLearnMode->setEnabled(true);
+        
+        QMessageBox::information(this, "MIDI Device Connected", 
+            "Successfully connected to: " + selectedDevice + 
+            "\n\nYour controller should now show activity LEDs if supported." +
+            "\n\nYou can now:\n• Use the Test button to verify input\n• Enable MIDI Learn mode to map controls");
+    } else {
+        qDebug() << "PreferencesDialog: Failed to connect to MIDI device:" << selectedDevice;
+        
+        midiStatusLabel->setText("Connection failed");
+        midiStatusLabel->setStyleSheet("color: #f44336; font-style: italic;");
+        midiEnabled->setChecked(false);
+        
+        QMessageBox::warning(this, "MIDI Connection Error", 
+            "Failed to connect to: " + selectedDevice + 
+            "\n\nPossible causes:\n"
+            "• Device is already in use by another application\n"
+            "• Device is disconnected or powered off\n"
+            "• Driver issues or permissions\n\n"
+            "Please check your device connection and try again.");
+    }
+}
+
+void PreferencesDialog::onMidiDeviceTest() {
+    if (midiDeviceCombo->currentIndex() == 0) {
+        QMessageBox::warning(this, "MIDI Test", "Please select a MIDI device first.");
+        midiTestButton->setChecked(false);
+        return;
+    }
+    
+    midiTestActive = midiTestButton->isChecked();
+    
+    if (midiTestActive) {
+        // Start test mode
+        midiInputLabel->setText("Listening for MIDI input... Move any control on your device.");
+        midiInputLabel->setStyleSheet("color: #4CAF50; font-size: 10px; padding: 5px; border: 1px solid #4CAF50; border-radius: 3px; background-color: #1a2a1a;");
+        midiActivityLabel->setText("● Listening");
+        midiActivityLabel->setStyleSheet("color: #4CAF50; font-size: 9px;");
+        
+        // Use MidiEngine to start testing
+        midiEngine->testMidiDevice();
+    } else {
+        // Stop test mode
+        midiInputLabel->setText("MIDI test stopped. Click 'Start MIDI Test' to resume monitoring.");
+        midiInputLabel->setStyleSheet("color: #666; font-size: 10px; padding: 5px; border: 1px solid #444; border-radius: 3px; background-color: #2a2a2a;");
+        midiActivityLabel->setText("● Stopped");
+        midiActivityLabel->setStyleSheet("color: #666; font-size: 9px;");
+    }
+}
+
+void PreferencesDialog::onMidiDeviceChanged() {
+    QString deviceName = midiDeviceCombo->currentText();
+    
+    // Enable activate button only when a device is selected
+    midiActivateButton->setEnabled(midiDeviceCombo->currentIndex() > 0);
+    
+    if (midiDeviceCombo->currentIndex() > 0) {
+        // Check if this device is already connected
+        if (midiEngine && midiEngine->isDeviceOpen() && midiEngine->getCurrentDevice() == deviceName) {
+            midiActivateButton->setText("Disconnect Device");
+            midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+            midiStatusLabel->setText("Connected: " + deviceName);
+            midiStatusLabel->setStyleSheet("color: #4CAF50; font-weight: bold;");
+        } else {
+            midiActivateButton->setText("Connect Device");
+            midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+            midiStatusLabel->setText("Device selected: " + deviceName);
+            midiStatusLabel->setStyleSheet("color: #2196F3; font-weight: bold;");
+        }
+    } else {
+        midiActivateButton->setText("Connect Device");
+        midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+        midiStatusLabel->setText("No device selected");
+        midiStatusLabel->setStyleSheet("color: #888; font-style: italic;");
+    }
+}
+
+void PreferencesDialog::onMidiEnabledChanged() {
+    bool enabled = midiEnabled->isChecked();
+    
+    midiDeviceCombo->setEnabled(enabled);
+    midiRefreshButton->setEnabled(enabled);
+    midiActivateButton->setEnabled(enabled && midiDeviceCombo->currentIndex() > 0);
+    midiLearnMode->setEnabled(enabled);
+    midiTestButton->setEnabled(enabled && midiEngine && midiEngine->isDeviceOpen());
+    
+    if (enabled) {
+        onMidiDeviceChanged(); // Update UI based on device selection
+    } else {
+        if (midiEngine && midiEngine->isDeviceOpen()) {
+            midiEngine->closeMidiDevice();
+        }
+        midiStatusLabel->setText("MIDI disabled");
+        midiStatusLabel->setStyleSheet("color: #888; font-style: italic;");
+        midiActivateButton->setText("Connect Device");
+        midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+    }
+}
+
+void PreferencesDialog::onMidiLearnToggle() {
+    bool learnMode = midiLearnMode->isChecked();
+    midiEngine->setLearnMode(learnMode);
+    
+    if (learnMode) {
+        midiInputLabel->setText("MIDI Learn mode active. Click any DJ control, then move MIDI controller.");
+        midiInputLabel->setStyleSheet("color: #FF9800; font-weight: bold;");
+    } else {
+        midiInputLabel->setText("MIDI Learn mode disabled.");
+        midiInputLabel->setStyleSheet("color: #666; font-style: italic;");
+    }
+}
+
+// MIDI Engine event handlers
+void PreferencesDialog::onMidiDeviceOpened(const QString& deviceName) {
+    midiStatusLabel->setText("Connected: " + deviceName);
+    midiStatusLabel->setStyleSheet("color: #4CAF50; font-weight: bold;");
+    
+    // Update activate button state
+    midiActivateButton->setText("Disconnect Device");
+    midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+    midiActivateButton->setEnabled(true);
+    
+    // Enable test and learn controls
+    midiTestButton->setEnabled(true);
+    midiLearnMode->setEnabled(true);
+    
+    qDebug() << "MIDI device opened:" << deviceName;
+}
+
+void PreferencesDialog::onMidiDeviceClosed() {
+    if (midiEnabled->isChecked()) {
+        midiStatusLabel->setText("Device disconnected");
+        midiStatusLabel->setStyleSheet("color: #FFC107; font-weight: bold;");
+    } else {
+        midiStatusLabel->setText("MIDI disabled");
+        midiStatusLabel->setStyleSheet("color: #888; font-style: italic;");
+    }
+    
+    // Update activate button state
+    midiActivateButton->setText("Connect Device");
+    midiActivateButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+    midiActivateButton->setEnabled(midiDeviceCombo->currentIndex() > 0);
+    
+    // Disable test and learn controls
+    midiTestButton->setEnabled(false);
+    midiLearnMode->setEnabled(false);
+    
+    // Stop any active test
+    if (midiTestActive) {
+        midiTestActive = false;
+        midiTestButton->setChecked(false);
+        midiTestButton->setText("Start MIDI Test");
+        midiTestButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+        midiInputLabel->setText("MIDI test stopped - device disconnected.");
+        midiInputLabel->setStyleSheet("color: #666; font-size: 10px; padding: 5px; border: 1px solid #444; border-radius: 3px; background-color: #2a2a2a;");
+    }
+    
+    qDebug() << "MIDI device closed";
+}
+
+void PreferencesDialog::onMidiDeviceError(const QString& error) {
+    midiStatusLabel->setText("Error: " + error);
+    midiStatusLabel->setStyleSheet("color: #FF5722; font-weight: bold;");
+    QMessageBox::warning(this, "MIDI Error", error);
+}
+
+void PreferencesDialog::onMidiMessageReceived(int channel, int controlNumber, int value, bool isNote) {
+    QString messageType = isNote ? "Note" : "CC";
+    QString message = QString("MIDI %1: CH%2 %3=%4").arg(messageType).arg(channel).arg(controlNumber).arg(value);
+    
+    // Debug output to both qDebug and std::cout for visibility
+    qDebug() << "PreferencesDialog::onMidiMessageReceived -" << message << "TestActive:" << midiTestActive << "ButtonChecked:" << (midiTestButton ? midiTestButton->isChecked() : false);
+    std::cout << "=== PREFERENCES MIDI MESSAGE ===" << std::endl;
+    std::cout << "Message: " << message.toStdString() << std::endl;
+    std::cout << "Channel: " << channel << ", Control: " << controlNumber << ", Value: " << value << ", IsNote: " << (isNote ? "true" : "false") << std::endl;
+    
+    // Only show live updates when test mode is active
+    if (midiTestActive && midiTestButton && midiTestButton->isChecked()) {
+        // Create detailed message with timestamp
+        QTime currentTime = QTime::currentTime();
+        QString timestamp = currentTime.toString("hh:mm:ss.zzz");
+        
+        QString detailedMessage = QString("[%1] %2 Input: Channel %3, %4 %5, Value %6")
+            .arg(timestamp)
+            .arg(messageType)
+            .arg(channel)
+            .arg(isNote ? "Note" : "Controller")
+            .arg(controlNumber)
+            .arg(value);
+        
+        // Update input display with the new message
+        QString currentText = midiInputLabel->text();
+        QStringList lines = currentText.split("\n");
+        
+        // Keep only the last 4 messages to prevent overflow
+        if (lines.size() >= 5) {
+            lines = lines.mid(lines.size() - 4);
+        }
+        
+        lines.append(detailedMessage);
+        midiInputLabel->setText(lines.join("\n"));
+        
+        // Update activity indicator with color coding based on message type
+        if (isNote) {
+            midiActivityLabel->setText("● Note Input");
+            midiActivityLabel->setStyleSheet("color: #FF5722; font-size: 9px; font-weight: bold;");
+        } else {
+            midiActivityLabel->setText("● Controller Input");
+            midiActivityLabel->setStyleSheet("color: #2196F3; font-size: 9px; font-weight: bold;");
+        }
+        
+        // Reset activity indicator after 2 seconds
+        QTimer::singleShot(2000, [this]() {
+            if (midiTestActive && midiTestButton && midiTestButton->isChecked()) {
+                midiActivityLabel->setText("● Listening");
+                midiActivityLabel->setStyleSheet("color: #4CAF50; font-size: 9px;");
+            }
+        });
+    } else {
+        qDebug() << "PreferencesDialog: MIDI message not displayed - test conditions not met";
+    }
+    
+    // Check for MIDI learning mode
+    if (midiLearnMode->isChecked()) {
+        // Look for a control that is in "Learning..." state
+        for (int row = 0; row < midiMappingTable->rowCount(); ++row) {
+            QTableWidgetItem* statusItem = midiMappingTable->item(row, 2);
+            if (statusItem && statusItem->text() == "Learning...") {
+                // Found a control waiting for mapping
+                QString controlName = midiMappingTable->item(row, 0)->text();
+                QString midiInputStr = QString("CH%1 %2%3")
+                    .arg(channel)
+                    .arg(isNote ? "Note" : "CC")
+                    .arg(controlNumber);
+                
+                // Update the mapping
+                midiMappingTable->item(row, 1)->setText(midiInputStr);
+                midiMappingTable->item(row, 2)->setText("Mapped");
+                midiMappingTable->item(row, 2)->setForeground(QBrush(QColor(76, 175, 80))); // Green
+                
+                // Create actual MIDI mapping in the engine
+                if (midiEngine) {
+                    MidiControlMapping mapping;
+                    mapping.midiChannel = channel;
+                    mapping.controlNumber = controlNumber;
+                    mapping.isNote = isNote;
+                    mapping.minValue = 0;
+                    mapping.maxValue = 127;
+                    
+                    // Determine control type and deck from control name
+                    if (controlName.contains("Play/Pause") && controlName.contains("Deck A")) {
+                        mapping.controlType = MidiControlType::PlayPause;
+                        mapping.deckId = "A";
+                    } else if (controlName.contains("Play/Pause") && controlName.contains("Deck B")) {
+                        mapping.controlType = MidiControlType::PlayPause;
+                        mapping.deckId = "B";
+                    } else if (controlName.contains("Cue") && controlName.contains("Deck A")) {
+                        mapping.controlType = MidiControlType::Cue;
+                        mapping.deckId = "A";
+                    } else if (controlName.contains("Cue") && controlName.contains("Deck B")) {
+                        mapping.controlType = MidiControlType::Cue;
+                        mapping.deckId = "B";
+                    } else if (controlName.contains("Tempo") && controlName.contains("Deck A")) {
+                        mapping.controlType = MidiControlType::PitchBend;
+                        mapping.deckId = "A";
+                    } else if (controlName.contains("Tempo") && controlName.contains("Deck B")) {
+                        mapping.controlType = MidiControlType::PitchBend;
+                        mapping.deckId = "B";
+                    } else if (controlName.contains("Volume") && controlName.contains("Deck A")) {
+                        mapping.controlType = MidiControlType::ChannelFader;
+                        mapping.deckId = "A";
+                    } else if (controlName.contains("Volume") && controlName.contains("Deck B")) {
+                        mapping.controlType = MidiControlType::ChannelFader;
+                        mapping.deckId = "B";
+                    } else if (controlName.contains("Crossfader")) {
+                        mapping.controlType = MidiControlType::Crossfader;
+                        mapping.deckId = "";
+                    } else if (controlName.contains("Channel Fader Deck A")) {
+                        mapping.controlType = MidiControlType::ChannelFader;
+                        mapping.deckId = "A";
+                    } else if (controlName.contains("Channel Fader Deck B")) {
+                        mapping.controlType = MidiControlType::ChannelFader;
+                        mapping.deckId = "B";
+                    }
+                    
+                    // Add the mapping to the MIDI engine
+                    midiEngine->addControlMapping(mapping);
+                    
+                    qDebug() << "PreferencesDialog: Added MIDI mapping to engine:" << controlName 
+                             << "-> CH" << channel << (isNote ? "Note" : "CC") << controlNumber 
+                             << "Type:" << static_cast<int>(mapping.controlType) << "Deck:" << mapping.deckId;
+                }
+                
+                qDebug() << "PreferencesDialog: Mapped" << controlName << "to MIDI input" << midiInputStr;
+                
+                QMessageBox::information(this, "Mapping Complete", 
+                    QString("Successfully mapped '%1' to:\n%2\n\nThe mapping is now active!")
+                    .arg(controlName).arg(midiInputStr));
+                
+                // Disable learn mode after successful mapping
+                midiLearnMode->setChecked(false);
+                break;
+            }
+        }
+    }
+    
+    qDebug() << "MIDI Input:" << message;
+}
+
+// MIDI Mapping Functions
+void PreferencesDialog::addMidiMappingRow(const QString& controlName, const QString& midiInput, const QString& status) {
+    int row = midiMappingTable->rowCount();
+    midiMappingTable->insertRow(row);
+    
+    // Control name (not editable)
+    QTableWidgetItem* controlItem = new QTableWidgetItem(controlName);
+    controlItem->setFlags(controlItem->flags() & ~Qt::ItemIsEditable);
+    midiMappingTable->setItem(row, 0, controlItem);
+    
+    // MIDI input (shows mapped control)
+    QTableWidgetItem* midiItem = new QTableWidgetItem(midiInput);
+    midiItem->setFlags(midiItem->flags() & ~Qt::ItemIsEditable);
+    midiMappingTable->setItem(row, 1, midiItem);
+    
+    // Status
+    QTableWidgetItem* statusItem = new QTableWidgetItem(status);
+    statusItem->setFlags(statusItem->flags() & ~Qt::ItemIsEditable);
+    if (status == "Not Mapped") {
+        statusItem->setForeground(QBrush(QColor(255, 87, 34))); // Orange
+    } else if (status == "Mapped") {
+        statusItem->setForeground(QBrush(QColor(76, 175, 80))); // Green
+    } else if (status == "Learning...") {
+        statusItem->setForeground(QBrush(QColor(33, 150, 243))); // Blue
+    }
+    midiMappingTable->setItem(row, 2, statusItem);
+    
+    // Action buttons
+    QWidget* actionWidget = new QWidget();
+    QHBoxLayout* actionLayout = new QHBoxLayout(actionWidget);
+    actionLayout->setContentsMargins(4, 2, 4, 2);
+    actionLayout->setSpacing(4);
+    
+    QPushButton* learnButton = new QPushButton("Learn");
+    learnButton->setFixedSize(50, 24);
+    learnButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+    learnButton->setToolTip("Click to learn MIDI input for this control");
+    
+    QPushButton* clearButton = new QPushButton("✕");
+    clearButton->setFixedSize(24, 24);
+    clearButton->setToolTip("Clear mapping for this control");
+    clearButton->setStyleSheet("QPushButton { background-color: #f44336; color: white; border-radius: 12px; } QPushButton:hover { background-color: #d32f2f; }");
+    
+    actionLayout->addWidget(learnButton);
+    actionLayout->addWidget(clearButton);
+    actionLayout->addStretch();
+    
+    midiMappingTable->setCellWidget(row, 3, actionWidget);
+    
+    // Connect button signals
+    connect(learnButton, &QPushButton::clicked, [this, row]() {
+        onMidiMappingLearn(row);
+    });
+    
+    connect(clearButton, &QPushButton::clicked, [this, row]() {
+        onMidiMappingClear(row);
+    });
+}
+
+void PreferencesDialog::onMidiMappingLearn(int row) {
+    if (!midiEngine || !midiEngine->isDeviceOpen()) {
+        QMessageBox::warning(this, "MIDI Learning", 
+            "Please connect to a MIDI device first using the 'Connect Device' button.");
+        return;
+    }
+    
+    QString controlName = midiMappingTable->item(row, 0)->text();
+    
+    // Set status to learning
+    midiMappingTable->item(row, 2)->setText("Learning...");
+    midiMappingTable->item(row, 2)->setForeground(QBrush(QColor(33, 150, 243))); // Blue
+    
+    // Enable learn mode if not already enabled
+    midiLearnMode->setChecked(true);
+    
+    QMessageBox::information(this, "MIDI Learning", 
+        QString("Learning mode activated for: %1\n\n"
+                "Now press/move the control on your MIDI device that you want to map to '%2'.\n"
+                "The mapping will be created automatically when MIDI input is detected.")
+        .arg(controlName).arg(controlName));
+    
+    qDebug() << "PreferencesDialog: Started MIDI learning for" << controlName << "at row" << row;
+}
+
+void PreferencesDialog::onMidiMappingClear(int row) {
+    QString controlName = midiMappingTable->item(row, 0)->text();
+    QString midiInput = midiMappingTable->item(row, 1)->text();
+    
+    // Parse MIDI input to remove from engine
+    if (midiEngine && !midiInput.isEmpty()) {
+        // Parse format like "CH1 CC16" or "CH1 Note64"
+        QRegularExpression regex("CH(\\d+)\\s+(CC|Note)(\\d+)");
+        QRegularExpressionMatch match = regex.match(midiInput);
+        if (match.hasMatch()) {
+            int channel = match.captured(1).toInt();
+            bool isNote = (match.captured(2) == "Note");
+            int controlNumber = match.captured(3).toInt();
+            
+            // Remove the mapping from the MIDI engine
+            midiEngine->removeControlMapping(channel, controlNumber, isNote);
+            
+            qDebug() << "PreferencesDialog: Removed MIDI mapping from engine:" 
+                     << "CH" << channel << (isNote ? "Note" : "CC") << controlNumber;
+        }
+    }
+    
+    // Clear the mapping in the UI
+    midiMappingTable->item(row, 1)->setText("");
+    midiMappingTable->item(row, 2)->setText("Not Mapped");
+    midiMappingTable->item(row, 2)->setForeground(QBrush(QColor(255, 87, 34))); // Orange
+    
+    qDebug() << "PreferencesDialog: Cleared MIDI mapping for" << controlName;
+    
+    QMessageBox::information(this, "Mapping Cleared", 
+        QString("MIDI mapping cleared for: %1").arg(controlName));
+}
+
+void PreferencesDialog::saveMidiMappings(const QString& fileName) {
+    QSettings preset(fileName, QSettings::IniFormat);
+    
+    preset.clear();
+    preset.beginGroup("MIDIMappings");
+    
+    for (int row = 0; row < midiMappingTable->rowCount(); ++row) {
+        QString controlName = midiMappingTable->item(row, 0)->text();
+        QString midiInput = midiMappingTable->item(row, 1)->text();
+        QString status = midiMappingTable->item(row, 2)->text();
+        
+        if (!midiInput.isEmpty() && status == "Mapped") {
+            preset.setValue(controlName, midiInput);
+        }
+    }
+    
+    preset.endGroup();
+    preset.sync();
+    
+    QMessageBox::information(this, "Preset Saved", 
+        QString("MIDI mapping preset saved to:\n%1").arg(fileName));
+    
+    qDebug() << "PreferencesDialog: MIDI mappings saved to" << fileName;
+}
+
+void PreferencesDialog::loadMidiMappings(const QString& fileName) {
+    QSettings preset(fileName, QSettings::IniFormat);
+    
+    preset.beginGroup("MIDIMappings");
+    QStringList keys = preset.allKeys();
+    
+    if (keys.isEmpty()) {
+        QMessageBox::warning(this, "Load Failed", 
+            "No MIDI mappings found in the selected preset file.");
+        return;
+    }
+    
+    // Clear existing mappings first
+    for (int row = 0; row < midiMappingTable->rowCount(); ++row) {
+        midiMappingTable->item(row, 1)->setText("");
+        midiMappingTable->item(row, 2)->setText("Not Mapped");
+        midiMappingTable->item(row, 2)->setForeground(QBrush(QColor(255, 87, 34))); // Orange
+    }
+    
+    // Load mappings from preset
+    int loadedCount = 0;
+    for (const QString& controlName : keys) {
+        QString midiInput = preset.value(controlName).toString();
+        
+        // Find the row for this control
+        for (int row = 0; row < midiMappingTable->rowCount(); ++row) {
+            if (midiMappingTable->item(row, 0)->text() == controlName) {
+                midiMappingTable->item(row, 1)->setText(midiInput);
+                midiMappingTable->item(row, 2)->setText("Mapped");
+                midiMappingTable->item(row, 2)->setForeground(QBrush(QColor(76, 175, 80))); // Green
+                loadedCount++;
+                break;
+            }
+        }
+    }
+    
+    preset.endGroup();
+    
+    QMessageBox::information(this, "Preset Loaded", 
+        QString("Successfully loaded %1 MIDI mappings from:\n%2").arg(loadedCount).arg(fileName));
+    
+    qDebug() << "PreferencesDialog: Loaded" << loadedCount << "MIDI mappings from" << fileName;
 }

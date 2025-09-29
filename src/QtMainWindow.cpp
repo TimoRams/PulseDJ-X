@@ -1542,6 +1542,117 @@ void QtMainWindow::onCrossfader(int v) {
     }
 }
 
+// MIDI control access method
+void QtMainWindow::setCrossfaderPosition(float normalizedValue) {
+    // normalizedValue: 0.0 = full A, 1.0 = full B
+    // Convert to slider range: 0-100
+    int sliderValue = static_cast<int>(normalizedValue * 100.0f);
+    sliderValue = std::max(0, std::min(100, sliderValue));
+    
+    if (crossfader) {
+        crossfader->setValue(sliderValue);
+        // This will trigger onCrossfader automatically through the signal connection
+        std::cout << "MIDI: Crossfader set to " << sliderValue << " (normalized: " << normalizedValue << ")" << std::endl;
+    }
+}
+
+// MIDI control access methods for Play/Pause
+void QtMainWindow::setDeckAPlayPause(bool shouldPlay) {
+    if (deckA) {
+        // The onPlayPause() method handles both play and pause - it toggles the state
+        // For MIDI, we can trigger it when shouldPlay changes the current state
+        deckA->onPlayPause();
+        std::cout << "MIDI: Deck A Play/Pause triggered (target state: " << (shouldPlay ? "PLAY" : "PAUSE") << ")" << std::endl;
+    }
+}
+
+void QtMainWindow::setDeckBPlayPause(bool shouldPlay) {
+    if (deckB) {
+        // The onPlayPause() method handles both play and pause - it toggles the state  
+        // For MIDI, we can trigger it when shouldPlay changes the current state
+        deckB->onPlayPause();
+        std::cout << "MIDI: Deck B Play/Pause triggered (target state: " << (shouldPlay ? "PLAY" : "PAUSE") << ")" << std::endl;
+    }
+}
+
+// MIDI control access methods for Tempo/Pitch
+void QtMainWindow::setDeckATempo(float normalizedValue) {
+    if (playerA && deckA) {
+        // Get the current tempo range from the deck widget
+        double minTempo = deckA->getMinTempoFactor();
+        double maxTempo = deckA->getMaxTempoFactor();
+        
+        // Convert 0.0-1.0 MIDI range to the actual tempo range of the deck
+        // 0.0 = minimum tempo, 0.5 = normal (1.0), 1.0 = maximum tempo
+        double pitchValue;
+        if (normalizedValue <= 0.5f) {
+            // Scale from min to 1.0
+            pitchValue = minTempo + (normalizedValue * 2.0f) * (1.0 - minTempo);
+        } else {
+            // Scale from 1.0 to max
+            pitchValue = 1.0 + ((normalizedValue - 0.5f) * 2.0f) * (maxTempo - 1.0);
+        }
+        
+        // Clamp to the deck's actual range
+        pitchValue = std::max(minTempo, std::min(maxTempo, pitchValue));
+        
+        // Update both the player and the UI via deck widget
+        deckA->setTempoFactor(pitchValue);
+        std::cout << "MIDI: Deck A Tempo set to " << pitchValue << " (normalized: " << normalizedValue 
+                  << ", range: " << minTempo << " - " << maxTempo << ")" << std::endl;
+    }
+}
+
+void QtMainWindow::setDeckBTempo(float normalizedValue) {
+    if (playerB && deckB) {
+        // Get the current tempo range from the deck widget
+        double minTempo = deckB->getMinTempoFactor();
+        double maxTempo = deckB->getMaxTempoFactor();
+        
+        // Convert 0.0-1.0 MIDI range to the actual tempo range of the deck
+        // 0.0 = minimum tempo, 0.5 = normal (1.0), 1.0 = maximum tempo
+        double pitchValue;
+        if (normalizedValue <= 0.5f) {
+            // Scale from min to 1.0
+            pitchValue = minTempo + (normalizedValue * 2.0f) * (1.0 - minTempo);
+        } else {
+            // Scale from 1.0 to max
+            pitchValue = 1.0 + ((normalizedValue - 0.5f) * 2.0f) * (maxTempo - 1.0);
+        }
+        
+        // Clamp to the deck's actual range
+        pitchValue = std::max(minTempo, std::min(maxTempo, pitchValue));
+        
+        // Update both the player and the UI via deck widget
+        deckB->setTempoFactor(pitchValue);
+        std::cout << "MIDI: Deck B Tempo set to " << pitchValue << " (normalized: " << normalizedValue 
+                  << ", range: " << minTempo << " - " << maxTempo << ")" << std::endl;
+    }
+}
+
+// MIDI control access methods for Volume
+void QtMainWindow::setDeckAVolume(float normalizedValue) {
+    if (playerA && stereoCallback) {
+        // Convert 0.0-1.0 to volume range: 0.0 = mute, 1.0 = full volume
+        float volumeValue = std::max(0.0f, std::min(1.0f, normalizedValue));
+        
+        // Update the mixer volume for Deck A
+        stereoCallback->setVolumeA(volumeValue);
+        std::cout << "MIDI: Deck A Volume set to " << volumeValue << " (normalized: " << normalizedValue << ")" << std::endl;
+    }
+}
+
+void QtMainWindow::setDeckBVolume(float normalizedValue) {
+    if (playerB && stereoCallback) {
+        // Convert 0.0-1.0 to volume range: 0.0 = mute, 1.0 = full volume
+        float volumeValue = std::max(0.0f, std::min(1.0f, normalizedValue));
+        
+        // Update the mixer volume for Deck B
+        stereoCallback->setVolumeB(volumeValue);
+        std::cout << "MIDI: Deck B Volume set to " << volumeValue << " (normalized: " << normalizedValue << ")" << std::endl;
+    }
+}
+
 // EQ/filter slot implementations
 void QtMainWindow::onLeftHighChanged(int v) {
     std::cout << "onLeftHighChanged called with value: " << v << std::endl;

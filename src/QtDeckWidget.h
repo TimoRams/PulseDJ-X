@@ -41,6 +41,8 @@ public:
     double getTempoFactor() const;                 // Current speed factor (1.0 = original)
     double getDetectedBpm() const { return detectedBpm; }
     void setTempoFactor(double factor);            // Programmatically set tempo
+    double getMinTempoFactor() const { return minTempoFactor; } // Get current minimum tempo range
+    double getMaxTempoFactor() const { return maxTempoFactor; } // Get current maximum tempo range
     // Turntable control
     void setPlatterSeconds(double seconds) { if (turntable) turntable->setPositionSeconds(seconds); }
     
@@ -63,9 +65,9 @@ public slots:
     void onQuantizeToggle();
     void onUnload();
     void onTempoRangeSelected();
+    void onPlayPause();  // Made public for MIDI integration
 
 private slots:
-    void onPlayPause();
     void onLoad();
     void onCue();
     void onCuePressed();

@@ -22,8 +22,18 @@
 #include <QStyleFactory>
 #include <QColorDialog>
 #include <QFontDialog>
+#include <QTableWidget>
+#include <QHeaderView>
+#include <QBrush>
+#include <QSettings>
+#include <QRegularExpression>
 #include "DeckSettings.h"
+#include "MidiEngine.h"
+
+// Forward declaration
+class QtMainWindow;
 #include "AppConfig.h"
+#include "MidiEngine.h"
 
 /**
  * BetaPulseX Preferences Dialog
@@ -41,6 +51,9 @@ class PreferencesDialog : public QDialog {
 public:
     explicit PreferencesDialog(QWidget* parent = nullptr);
     ~PreferencesDialog() = default;
+    
+    // Set references to players and main window for MIDI integration
+    void setPlayerReferences(DJAudioPlayer* playerA, DJAudioPlayer* playerB, QtMainWindow* mainWindow);
 
 signals:
     void settingsChanged();
@@ -80,6 +93,7 @@ private:
     void createInterfaceTab();
     void createLibraryTab();
     void createPerformanceTab();
+    void createMidiTab();
     void createAdvancedTab();
     
     void loadSettings();
@@ -163,6 +177,20 @@ private:
     QCheckBox* backgroundProcessing;
     QSlider* diskCacheSlider;
     
+    // === MIDI TAB ===
+    QWidget* midiTab;
+    QComboBox* midiDeviceCombo;
+    QCheckBox* midiEnabled;
+    QLabel* midiStatusLabel;
+    QPushButton* midiRefreshButton;
+    QPushButton* midiActivateButton;
+    QCheckBox* midiLearnMode;
+    QTableWidget* midiMappingTable;
+    QPushButton* midiTestButton;
+    QLabel* midiInputLabel;
+    QLabel* midiActivityLabel;
+    bool midiTestActive = false;
+    
     // === ADVANCED TAB ===
     QWidget* advancedTab;
     QLineEdit* configPathEdit;
@@ -229,6 +257,11 @@ private:
         bool backgroundProcessing = true;
         int diskCacheMB = 256;
         
+        // MIDI
+        bool midiEnabled = false;
+        QString midiDevice = "";
+        bool midiLearnMode = false;
+        
         // Advanced
         QString configPath;
         bool debugLogging = false;
@@ -238,6 +271,12 @@ private:
     
     AppSettings originalSettings; // Für Cancel-Funktionalität
     
+    // MIDI Engine
+    MidiEngine* midiEngine;
+    
+    // Main Window Reference
+    QtMainWindow* mainWindowRef;
+    
     // Helper methods
     void updateVolumeLabel(QSlider* slider, QLabel* label, const QString& prefix);
     void setColorButtonColor(QPushButton* button, const QColor& color);
@@ -246,4 +285,22 @@ private:
     void populateAudioDevices();
     void populateThemes();
     void populateSkins();
+    void populateMidiDevices();
+    void addMidiMappingRow(const QString& controlName, const QString& midiInput, const QString& status);
+    void onMidiDeviceRefresh();
+    void onMidiDeviceActivate();
+    void onMidiDeviceTest();
+    void onMidiDeviceChanged();
+    void onMidiEnabledChanged();
+    void onMidiLearnToggle();
+    void onMidiMappingLearn(int row);
+    void onMidiMappingClear(int row);
+    void saveMidiMappings(const QString& fileName);
+    void loadMidiMappings(const QString& fileName);
+    
+    // MIDI Engine slots
+    void onMidiDeviceOpened(const QString& deviceName);
+    void onMidiDeviceClosed();
+    void onMidiDeviceError(const QString& error);
+    void onMidiMessageReceived(int channel, int controlNumber, int value, bool isNote);
 };

@@ -438,6 +438,14 @@ void MenuBar::showPreferences() {
     if (!preferencesDialog) {
         preferencesDialog = new PreferencesDialog(mainWindow);
         
+        // Set player references for MIDI integration
+        if (mainWindow && mainWindow->playerA && mainWindow->playerB) {
+            preferencesDialog->setPlayerReferences(mainWindow->playerA, mainWindow->playerB, mainWindow);
+            qDebug() << "MenuBar: Player references set for PreferencesDialog MIDI integration";
+        } else {
+            qDebug() << "MenuBar: Warning - Player references not available for MIDI integration";
+        }
+        
         // Connect settings change signal
         connect(preferencesDialog, &PreferencesDialog::settingsChanged, [this]() {
             qDebug() << "BetaPulseX: Settings changed, reloading configuration";

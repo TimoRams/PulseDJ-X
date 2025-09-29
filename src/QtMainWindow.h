@@ -96,6 +96,15 @@ public:
                                 const std::string& algorithm, double firstBeatOffset, bool isDeckA);
     // Performance optimization: Make BPM analyzer accessible to threaded tasks
     BpmAnalyzer* bpmAnalyzer{nullptr};
+    
+    // MIDI control access methods
+    void setCrossfaderPosition(float normalizedValue); // 0.0 = full A, 1.0 = full B
+    void setDeckAPlayPause(bool shouldPlay); // MIDI control for Deck A play/pause
+    void setDeckBPlayPause(bool shouldPlay); // MIDI control for Deck B play/pause
+    void setDeckATempo(float normalizedValue); // MIDI control for Deck A tempo/pitch (0.0 = -100%, 0.5 = normal, 1.0 = +100%)
+    void setDeckBTempo(float normalizedValue); // MIDI control for Deck B tempo/pitch (0.0 = -100%, 0.5 = normal, 1.0 = +100%)
+    void setDeckAVolume(float normalizedValue); // MIDI control for Deck A channel volume (0.0 = mute, 1.0 = full)
+    void setDeckBVolume(float normalizedValue); // MIDI control for Deck B channel volume (0.0 = mute, 1.0 = full)
     // THREADING FIX: Make waveform displays accessible to threads
     class WaveformDisplay* overviewTopA;
     class WaveformDisplay* overviewTopB;

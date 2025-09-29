@@ -124,6 +124,8 @@ target_sources(David
     src/MenuBar.h
     src/PreferencesDialog.cpp
     src/PreferencesDialog.h
+    src/MidiEngine.cpp
+    src/MidiEngine.h
     src/AppConfig.h
     src/DeckSettings.h)
     # AudioMixer removed - using simplified AudioSourcePlayer approach

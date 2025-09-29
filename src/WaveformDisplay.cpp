@@ -71,9 +71,21 @@ void WaveformDisplay::paintGL()
     // Background already cleared by GL
 
     if (sourceMaxBins.empty() || audioLength <= 0.0) {
+        // Draw a perfectly centered placeholder when no track is loaded
+        // Using explicit bounding rect centering avoids tiny vertical bias on some platforms
         p.setPen(QPen(QColor(120, 120, 120), 1));
-        p.setFont(QFont("Arial", 12));
-        p.drawText(rect(), Qt::AlignCenter, "NO TRACK LOADED");
+        QFont font("Arial", 12);
+        font.setStyleStrategy(QFont::PreferAntialias);
+        p.setFont(font);
+
+        const QString text = "NO TRACK LOADED";
+        const QRect widgetRect = rect();
+        QFontMetrics fm(font);
+        // Calculate tight text bounding size (single line) and center it in the widget
+        QSize textSize = fm.size(Qt::TextSingleLine, text);
+        QRect textRect(QPoint(0, 0), textSize);
+        textRect.moveCenter(widgetRect.center());
+        p.drawText(textRect, Qt::AlignCenter, text);
         return;
     }
     
