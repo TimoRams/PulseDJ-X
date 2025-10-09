@@ -25,14 +25,18 @@
 #include <QSplitter>
 #include <QTreeView>
 #include <QFileSystemModel>
+#include <QVector>
 #include <vector>
 #include <memory>
+#include <optional>
 
 // Forward declarations
 namespace juce {
     class AudioFormatManager;
     class File;
 }
+
+class LibraryDatabase;
 
 // Structure to hold track metadata
 struct TrackInfo {
@@ -47,6 +51,15 @@ struct TrackInfo {
     QString key;
     qint64 fileSize = 0;
     QString comment;
+    qint64 lastModified = 0;
+    qint64 addedAt = 0;
+    qint64 updatedAt = 0;
+    qint64 analyzedAt = 0;
+    QString analysisAlgorithm;
+    double firstBeatOffset = 0.0;
+    double trackLengthSeconds = 0.0;
+    QVector<double> beatPositions;
+    bool analysisFailed = false;
     
     TrackInfo() = default;
     TrackInfo(const QString& path) : filePath(path) {}
@@ -88,6 +101,10 @@ struct TrackInfo {
             unitIndex++;
         }
         return QString("%1 %2").arg(QString::number(size, 'f', 1)).arg(units[unitIndex]);
+    }
+
+    bool hasBeatGrid() const {
+        return analyzedAt > 0 && !beatPositions.isEmpty();
     }
 };
 
@@ -160,11 +177,12 @@ public:
     QMimeData* mimeData(const QModelIndexList& indexes) const override;
     
     // Custom methods
-    void addTrack(const TrackInfo& track);
+    void addOrUpdateTrack(const TrackInfo& track);
     void clearTracks();
     const TrackInfo* getTrack(int row) const;
     void setSortMode(SortMode mode, Qt::SortOrder order = Qt::AscendingOrder);
     void setFilterText(const QString& filter);
+    std::optional<TrackInfo> findTrackByPath(const QString& filePath) const;
     
     // Get filtered tracks count
     int getFilteredCount() const { return filteredTracks.size(); }
@@ -220,11 +238,22 @@ public:
     void clearLibrary();
     void saveLibrary(const QString& filePath);
     void loadLibrary(const QString& filePath);
+    void applyAnalysisResult(const QString& filePath,
+                             double bpm,
+                             double firstBeatOffset,
+                             double trackLengthSeconds,
+                             const QVector<double>& beatPositions,
+                             const QString& algorithm,
+                             bool analysisFailed);
+    void notifyAnalysisStarted(const QString& filePath);
+    void notifyAnalysisProgress(const QString& filePath, double progress);
+    void notifyAnalysisFinished(const QString& filePath, bool success);
     
 signals:
     void fileSelected(const QString& filePath);
     void filesDropped(const QStringList& files);
     void loadToDeck(int deckIndex, const QString& filePath); // New signal for explicit deck loading
+    void analyzeTracksRequested(const QStringList& filePaths);
     
 private slots:
     void onTrackLoaded(const TrackInfo& track);
@@ -256,8 +285,11 @@ private:
         QAction* actionClearLibrary; // Replaced QPushButton with QAction
         QAction* actionLoadDeck1 = nullptr; // Context-menu created; keep pointers if we later need enable/disable
         QAction* actionLoadDeck2 = nullptr;
+        QAction* actionAnalyzeTrack = nullptr;
     QLabel* statusLabel;
     QProgressBar* progressBar;
+    QLabel* analysisStatusLabel = nullptr;
+    QProgressBar* analysisProgressBar = nullptr;
     
     // Background loading
     ID3LoaderThread* loaderThread;
@@ -268,6 +300,7 @@ private:
     QTimer* filterUpdateTimer;
     bool columnsSizedOnce = false; // run auto-size only after first load
     
+    void initializeStoragePaths();
     void setupUI();
     void setupFileSystemModel();
     void updateStatusLabel();
@@ -275,4 +308,15 @@ private:
     void autoSizeColumnsInitial();
     void restoreColumnState();
     void saveColumnState();
+    void loadExistingTracks();
+    void persistTrack(const TrackInfo& track);
+    void updateAnalysisUi();
+
+    QString libraryDatabasePath;
+    QString libraryXmlBackupPath;
+    QString libraryUiStatePath;
+    std::unique_ptr<LibraryDatabase> libraryDatabase;
+
+    QHash<QString, double> activeAnalyses;
+    int analysesCompleted = 0;
 };

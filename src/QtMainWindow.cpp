@@ -16,6 +16,8 @@
 #include <QJsonValue>
 #include <QJsonParseError>
 #include <QRegularExpression>
+#include <QVector>
+#include <QProgressDialog>
 
 // StereoAudioCallback - Main JUCE audio callback method
 void StereoAudioCallback::audioDeviceIOCallback(const float* const* inputChannelData, int numInputChannels,
@@ -29,16 +31,6 @@ void StereoAudioCallback::audioDeviceIOCallback(const float* const* inputChannel
 }
 
 // StereoAudioCallback implementation for proper stereo mixing of both decks
-// Library explicit deck load handler
-void QtMainWindow::onLibraryLoadToDeck(int deckIndex, const QString& filePath)
-{
-    QtDeckWidget* targetDeck = nullptr;
-    if (deckIndex == 1) targetDeck = deckA; else if (deckIndex == 2) targetDeck = deckB;
-    if (!targetDeck) return;
-    targetDeck->loadFile(filePath);
-    // Optionally set focus to the deck so keyboard controls work immediately
-    targetDeck->setFocus();
-}
 void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
                                                           float* const* outputChannelData, int numOutputChannels,
                                                           int numSamples, const juce::AudioIODeviceCallbackContext& context) {
@@ -207,6 +199,7 @@ void StereoAudioCallback::audioDeviceStopped() {
 #include "WaveformGenerator.h"
 #include "AppConfig.h"
 #include "DeckSettings.h"
+#include "AudioFormatGuard.h"
 
 // Static members for shared format manager
 juce::AudioFormatManager* QtMainWindow::sharedFormatManager = nullptr;
@@ -229,7 +222,11 @@ public:
             
             // Load audio file data in background thread
             juce::File audioFile(filePath.toStdString());
-            std::unique_ptr<juce::AudioFormatReader> reader(window->sharedFormatManager->createReaderFor(audioFile));
+            std::unique_ptr<juce::AudioFormatReader> reader;
+            {
+                AudioFormatManagerGuard formatGuard;
+                reader.reset(window->sharedFormatManager->createReaderFor(audioFile));
+            }
             
             if (reader) {
                 // Create the reader source in background thread
@@ -282,102 +279,243 @@ private:
 // Enhanced threaded BPM analysis task with better performance and UI responsiveness
 class BpmAnalysisTask : public QRunnable {
 public:
-    BpmAnalysisTask(QtMainWindow* mainWindow, juce::File file, bool isDeckA) 
-        : window(mainWindow), audioFile(std::move(file)), isDeckA(isDeckA) {
+    enum class Target { DeckA, DeckB, LibraryOnly };
+
+    BpmAnalysisTask(QtMainWindow* mainWindow, juce::File file, Target target)
+        : window(mainWindow), audioFile(std::move(file)), target(target)
+    {
         setAutoDelete(true);
     }
-    
-    void run() override {
-        if (!window) return;
-        
-        // Signal analysis start to keep user informed
-        QMetaObject::invokeMethod(window, [this]() {
-            if (window) {
-                QString filename = QString::fromStdString(audioFile.getFileNameWithoutExtension().toStdString());
-                window->setStatusTip(QString("Analyzing BPM: %1...").arg(filename));
-            if (isDeckA) { window->analysisActiveA = true; window->analysisFailedA = false; window->analysisProgressA = 0.0; }
-            else { window->analysisActiveB = true; window->analysisFailedB = false; window->analysisProgressB = 0.0; }
-            window->updateOverviewLabel(isDeckA);
-            }
-        }, Qt::QueuedConnection);
-        
-        try {
+
+    void run() override
+    {
+        QPointer<QtMainWindow> wptr = window;
+        if (!wptr)
+            return;
+
+        const bool deckTask = target != Target::LibraryOnly;
+        const bool deckIsA = target == Target::DeckA;
+        const QString filePath = QString::fromStdString(audioFile.getFullPathName().toStdString());
+        const QString displayName = QString::fromStdString(audioFile.getFileNameWithoutExtension().toStdString());
+
+        if (auto windowRaw = wptr.data()) {
+            QMetaObject::invokeMethod(windowRaw, [wptr, deckTask, deckIsA, displayName, filePath]() {
+                if (auto window = wptr.data()) {
+                    window->setStatusTip(QString("Analyzing BPM: %1...").arg(displayName));
+
+                    if (window->libraryManager)
+                        window->libraryManager->notifyAnalysisStarted(filePath);
+
+                    if (deckTask)
+                    {
+                        if (deckIsA)
+                        {
+                            window->analysisActiveA = true;
+                            window->analysisFailedA = false;
+                            window->analysisProgressA = 0.0;
+                        }
+                        else
+                        {
+                            window->analysisActiveB = true;
+                            window->analysisFailedB = false;
+                            window->analysisProgressB = 0.0;
+                        }
+
+                        window->updateOverviewLabel(deckIsA);
+                    }
+                }
+            }, Qt::QueuedConnection);
+        }
+
+        try
+        {
             std::vector<double> beatsSec;
             double totalSec = 0.0;
             std::string algorithm;
             double firstBeatOffset = 0.0;
-            
-            // PERFORMANCE: Set lower thread priority to prevent UI blocking
-            QThread::currentThread()->setPriority(QThread::LowPriority);
-            
-            // Analyze with progress updates to keep UI responsive
-            // Mark analysis active on corresponding waveform
-            QMetaObject::invokeMethod(window, [this]() {
-                if (!window) return;
-                WaveformDisplay* wf = isDeckA ? window->overviewTopA : window->overviewTopB;
-                if (wf) { wf->setAnalysisFailed(false); wf->setAnalysisActive(true); wf->setAnalysisProgress(0.0); }
-            }, Qt::QueuedConnection);
 
-        auto progressCb = [wptr = QPointer<QtMainWindow>(window), left = isDeckA](double p){
-                if (!wptr) return;
-                QMetaObject::invokeMethod(wptr, [wptr, p, left]() {
-                    if (!wptr) return;
-            WaveformDisplay* wf = left ? wptr->overviewTopA : wptr->overviewTopB;
-            if (wf) wf->setAnalysisProgress(p);
-            if (left) { wptr->analysisProgressA = p; } else { wptr->analysisProgressB = p; }
-            wptr->updateOverviewLabel(left);
+            QThread::currentThread()->setPriority(QThread::LowPriority);
+
+            if (auto windowRaw = wptr.data()) {
+                QMetaObject::invokeMethod(windowRaw, [wptr, deckTask, deckIsA]() {
+                    if (!deckTask)
+                        return;
+
+                    if (auto window = wptr.data()) {
+                        WaveformDisplay* wf = deckIsA ? window->overviewTopA : window->overviewTopB;
+                        if (wf)
+                        {
+                            wf->setAnalysisFailed(false);
+                            wf->setAnalysisActive(true);
+                            wf->setAnalysisProgress(0.0);
+                        }
+                    }
+                }, Qt::QueuedConnection);
+            }
+
+            auto progressCb = [wptr = QPointer<QtMainWindow>(window), deckTask, deckIsA, filePath](double p) {
+                if (!wptr)
+                    return;
+
+                QMetaObject::invokeMethod(wptr, [wptr, p, deckTask, deckIsA, filePath]() {
+                    if (!wptr)
+                        return;
+
+                    if (deckTask)
+                    {
+                        WaveformDisplay* wf = deckIsA ? wptr->overviewTopA : wptr->overviewTopB;
+                        if (wf)
+                            wf->setAnalysisProgress(p);
+
+                        if (deckIsA)
+                            wptr->analysisProgressA = p;
+                        else
+                            wptr->analysisProgressB = p;
+
+                        wptr->updateOverviewLabel(deckIsA);
+                    }
+
+                    if (wptr->libraryManager)
+                        wptr->libraryManager->notifyAnalysisProgress(filePath, p);
                 }, Qt::QueuedConnection);
             };
-        auto errorCb = [wptr = QPointer<QtMainWindow>(window), left = isDeckA](const std::string&){
-                if (!wptr) return;
-                QMetaObject::invokeMethod(wptr, [wptr, left]() {
-                    if (!wptr) return;
-            WaveformDisplay* wf = left ? wptr->overviewTopA : wptr->overviewTopB;
-            if (wf) { wf->setAnalysisFailed(true); wf->setAnalysisActive(false); }
-            if (left) { wptr->analysisFailedA = true; wptr->analysisActiveA = false; }
-            else { wptr->analysisFailedB = true; wptr->analysisActiveB = false; }
-            wptr->updateOverviewLabel(left);
+
+            auto errorCb = [wptr = QPointer<QtMainWindow>(window), deckTask, deckIsA, filePath](const std::string&) {
+                if (!wptr)
+                    return;
+
+                QMetaObject::invokeMethod(wptr, [wptr, deckTask, deckIsA, filePath]() {
+                    if (!wptr)
+                        return;
+
+                    if (deckTask)
+                    {
+                        WaveformDisplay* wf = deckIsA ? wptr->overviewTopA : wptr->overviewTopB;
+                        if (wf)
+                        {
+                            wf->setAnalysisFailed(true);
+                            wf->setAnalysisActive(false);
+                        }
+
+                        if (deckIsA)
+                        {
+                            wptr->analysisFailedA = true;
+                            wptr->analysisActiveA = false;
+                        }
+                        else
+                        {
+                            wptr->analysisFailedB = true;
+                            wptr->analysisActiveB = false;
+                        }
+
+                        wptr->updateOverviewLabel(deckIsA);
+                    }
+
+                    if (wptr->libraryManager)
+                        wptr->libraryManager->notifyAnalysisFinished(filePath, false);
                 }, Qt::QueuedConnection);
             };
 
             double bpm = window->bpmAnalyzer->analyzeFile(audioFile, 120.0, &beatsSec, &totalSec, &algorithm, &firstBeatOffset, progressCb, errorCb);
-            
-            // Thread-safe result delivery with immediate status update
-    QMetaObject::invokeMethod(window, [=]() {
-                if (window) {
-            window->handleBpmAnalysisResult(bpm, beatsSec, totalSec, algorithm, firstBeatOffset, isDeckA);
-            QString filename = QString::fromStdString(audioFile.getFileNameWithoutExtension().toStdString());
-            window->setStatusTip(QString("Analysis complete: %1 (%2 BPM)")
-                .arg(filename)
-                .arg(QString::number(bpm, 'f', 1)));
-                    WaveformDisplay* wf = isDeckA ? window->overviewTopA : window->overviewTopB;
-                    if (wf) { wf->setAnalysisActive(false); wf->setAnalysisFailed(bpm <= 0.0); wf->setAnalysisProgress(1.0); }
-                    if (isDeckA) { window->analysisActiveA = false; window->analysisFailedA = (bpm <= 0.0); window->analysisProgressA = 1.0; }
-                    else { window->analysisActiveB = false; window->analysisFailedB = (bpm <= 0.0); window->analysisProgressB = 1.0; }
-                    window->updateOverviewLabel(isDeckA);
-                }
-            }, Qt::QueuedConnection);
-            
-        } catch (const std::exception& e) {
-            // Thread-safe error handling
-        QMetaObject::invokeMethod(window, [this, error = QString::fromStdString(e.what())]() {
-                if (window) {
-                    QString filename = QString::fromStdString(audioFile.getFileNameWithoutExtension().toStdString());
-                    window->setStatusTip(QString("Analysis failed: %1 - %2").arg(filename).arg(error));
-            WaveformDisplay* wf = isDeckA ? window->overviewTopA : window->overviewTopB;
-            if (wf) { wf->setAnalysisFailed(true); wf->setAnalysisActive(false); }
-            if (isDeckA) { window->analysisFailedA = true; window->analysisActiveA = false; }
-            else { window->analysisFailedB = true; window->analysisActiveB = false; }
-            window->updateOverviewLabel(isDeckA);
-                }
-            }, Qt::QueuedConnection);
+
+            if (auto windowRaw = wptr.data()) {
+                QMetaObject::invokeMethod(windowRaw, [wptr, deckTask, deckIsA, displayName, bpm, beatsSec, totalSec, algorithm, firstBeatOffset, filePath]() {
+                    if (auto window = wptr.data()) {
+                        window->setStatusTip(QString("Analysis complete: %1 (%2 BPM)")
+                                                  .arg(displayName)
+                                                  .arg(QString::number(bpm, 'f', 1)));
+
+                        if (deckTask)
+                        {
+                            window->handleBpmAnalysisResult(bpm, beatsSec, totalSec, algorithm, firstBeatOffset, deckIsA);
+
+                            WaveformDisplay* wf = deckIsA ? window->overviewTopA : window->overviewTopB;
+                            if (wf)
+                            {
+                                wf->setAnalysisActive(false);
+                                wf->setAnalysisFailed(bpm <= 0.0);
+                                wf->setAnalysisProgress(1.0);
+                            }
+
+                            if (deckIsA)
+                            {
+                                window->analysisActiveA = false;
+                                window->analysisFailedA = (bpm <= 0.0);
+                                window->analysisProgressA = 1.0;
+                            }
+                            else
+                            {
+                                window->analysisActiveB = false;
+                                window->analysisFailedB = (bpm <= 0.0);
+                                window->analysisProgressB = 1.0;
+                            }
+
+                            window->updateOverviewLabel(deckIsA);
+                        }
+                        else if (window->libraryManager)
+                        {
+                            QVector<double> beatVector;
+                            beatVector.reserve(static_cast<int>(beatsSec.size()));
+                            for (double beat : beatsSec)
+                                beatVector.append(beat);
+
+                            window->libraryManager->applyAnalysisResult(filePath,
+                                                                         bpm,
+                                                                         firstBeatOffset,
+                                                                         totalSec,
+                                                                         beatVector,
+                                                                         QString::fromStdString(algorithm),
+                                                                         bpm <= 0.0);
+                        }
+
+                        if (window->libraryManager)
+                            window->libraryManager->notifyAnalysisFinished(filePath, bpm > 0.0);
+                    }
+                }, Qt::QueuedConnection);
+            }
+        }
+        catch (const std::exception& e)
+        {
+            if (auto windowRaw = wptr.data()) {
+                QMetaObject::invokeMethod(windowRaw, [wptr, deckTask, deckIsA, displayName, error = QString::fromStdString(e.what()), filePath]() {
+                    if (auto window = wptr.data()) {
+                        window->setStatusTip(QString("Analysis failed: %1 - %2").arg(displayName).arg(error));
+
+                        if (window->libraryManager)
+                            window->libraryManager->notifyAnalysisFinished(filePath, false);
+
+                        if (deckTask)
+                        {
+                            WaveformDisplay* wf = deckIsA ? window->overviewTopA : window->overviewTopB;
+                            if (wf)
+                            {
+                                wf->setAnalysisFailed(true);
+                                wf->setAnalysisActive(false);
+                            }
+
+                            if (deckIsA)
+                            {
+                                window->analysisFailedA = true;
+                                window->analysisActiveA = false;
+                            }
+                            else
+                            {
+                                window->analysisFailedB = true;
+                                window->analysisActiveB = false;
+                            }
+
+                            window->updateOverviewLabel(deckIsA);
+                        }
+                    }
+                }, Qt::QueuedConnection);
+            }
         }
     }
-    
+
 private:
-    QPointer<QtMainWindow> window; // Safe pointer that becomes null if window is destroyed
+    QPointer<QtMainWindow> window;
     juce::File audioFile;
-    bool isDeckA;
+    Target target;
 };
 
 // NEW: Background task to generate WaveformDisplay data without blocking UI
@@ -450,7 +588,11 @@ public:
             
             // Get track length for immediate UI update
             juce::File f(filePath.toStdString());
-            auto* reader = QtMainWindow::sharedFormatManager->createReaderFor(f);
+            juce::AudioFormatReader* reader = nullptr;
+            {
+                AudioFormatManagerGuard formatGuard;
+                reader = QtMainWindow::sharedFormatManager->createReaderFor(f);
+            }
             double trackLength = 0.0;
             if (reader) {
                 trackLength = reader->lengthInSamples / reader->sampleRate;
@@ -493,6 +635,40 @@ private:
     QString filePath;
     bool isDeckA;
 };
+
+void QtMainWindow::onLibraryLoadToDeck(int deckIndex, const QString& filePath)
+{
+    if (deckIndex == 1 && deckA)
+    {
+        deckA->loadFile(filePath);
+    }
+    else if (deckIndex == 2 && deckB)
+    {
+        deckB->loadFile(filePath);
+    }
+}
+
+void QtMainWindow::onAnalyzeTracksRequested(const QStringList& filePaths)
+{
+    if (filePaths.isEmpty() || !bpmThreadPool)
+        return;
+
+    if (!bpmAnalyzer)
+        bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
+
+    for (const QString& path : filePaths)
+    {
+        juce::File file(path.toStdString());
+        if (!file.existsAsFile())
+        {
+            if (libraryManager)
+                libraryManager->notifyAnalysisFinished(path, false);
+            continue;
+        }
+
+        bpmThreadPool->start(new BpmAnalysisTask(this, file, BpmAnalysisTask::Target::LibraryOnly));
+    }
+}
 
 QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 {
@@ -611,13 +787,13 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         // PREROLL SUPPORT: Allow unlimited negative positions for DJ cueing
         // Remove clamping to allow preroll positions
         absRel = std::min(1.0, absRel); // Only clamp maximum, allow unlimited negative
-        // Only update audio player position - UI is already updated by the waveform itself
+        // Update ONLY Deck A audio player - no cross-deck interference
         playerA->setPositionRelative(absRel);
-        // Update deck waveform to stay in sync
+        // Update ONLY Deck A waveform to stay in sync - no cross-deck updates
         if (deckA && deckA->getWaveform()) {
             deckA->getWaveform()->setPlayhead(absRel);
         }
-        // Update beat indicator and platter rotation using absolute seconds (preroll-aware)
+        // Update ONLY Deck A beat indicator and platter - completely independent
         if (beatIndicator && playerA && deckA) {
             double lenSec = std::max(1e-9, playerA->getLengthInSeconds());
             constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
@@ -668,13 +844,13 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         // PREROLL SUPPORT: Allow unlimited negative positions for DJ cueing
         // Remove clamping to allow preroll positions
         absRel = std::min(1.0, absRel); // Only clamp maximum, allow unlimited negative
-        // Only update audio player position - UI is already updated by the waveform itself
+        // Update ONLY Deck B audio player - no cross-deck interference
         playerB->setPositionRelative(absRel);
-        // Update deck waveform to stay in sync
+        // Update ONLY Deck B waveform to stay in sync - no cross-deck updates
         if (deckB && deckB->getWaveform()) {
             deckB->getWaveform()->setPlayhead(absRel);
         }
-        // Update beat indicator and platter rotation using absolute seconds (preroll-aware)
+        // Update ONLY Deck B beat indicator and platter - completely independent
         if (beatIndicator && playerB && deckB) {
             double lenSec = std::max(1e-9, playerB->getLengthInSeconds());
             constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
@@ -736,7 +912,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             // Start BPM analysis asynchronously using thread pool
             if (!bpmAnalyzer) bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
             juce::File f(filePath.toStdString());
-            bpmThreadPool->start(new BpmAnalysisTask(this, f, true));
+            bpmThreadPool->start(new BpmAnalysisTask(this, f, BpmAnalysisTask::Target::DeckA));
         }
     });
 
@@ -749,7 +925,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             // Start BPM analysis asynchronously using thread pool for Deck B (beat grid later)
             if (!bpmAnalyzer) bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
             juce::File f(filePath.toStdString());
-            bpmThreadPool->start(new BpmAnalysisTask(this, f, false));
+            bpmThreadPool->start(new BpmAnalysisTask(this, f, BpmAnalysisTask::Target::DeckB));
         }
     });
 
@@ -795,10 +971,16 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         double totalDelay = visualDelay + uiFudgeSec + std::clamp(userVisualTrimA, -0.05, 0.05);
         // Compute audible-relative playhead and feed it directly
         if (playerA) {
-            double len = std::max(1e-9, playerA->getLengthInSeconds());
-            double audibleRel = std::clamp(relative - (totalDelay / len), 0.0, 1.0);
-            overviewTopA->setPlayhead(audibleRel);
-            if (deckA && deckA->getWaveform()) deckA->getWaveform()->setPlayhead(audibleRel);
+            double displayRel = relative;
+            if (relative >= 0.0) {
+                double len = playerA->getLengthInSeconds();
+                if (len > 1e-6) {
+                    displayRel = relative - (totalDelay / len);
+                }
+                displayRel = std::clamp(displayRel, 0.0, 1.0);
+            }
+            overviewTopA->setPlayhead(displayRel);
+            if (deckA && deckA->getWaveform()) deckA->getWaveform()->setPlayhead(displayRel);
         } else {
             overviewTopA->setPlayhead(relative);
             if (deckA && deckA->getWaveform()) deckA->getWaveform()->setPlayhead(relative);
@@ -825,10 +1007,16 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     constexpr double uiFudgeSec = 0.012; // ~12 ms safety (display/vsync)
     double totalDelay = visualDelay + uiFudgeSec + std::clamp(userVisualTrimB, -0.05, 0.05);
         if (playerB) {
-            double len = std::max(1e-9, playerB->getLengthInSeconds());
-            double audibleRel = std::clamp(relative - (totalDelay / len), 0.0, 1.0);
-            overviewTopB->setPlayhead(audibleRel);
-            if (deckB && deckB->getWaveform()) deckB->getWaveform()->setPlayhead(audibleRel);
+            double displayRel = relative;
+            if (relative >= 0.0) {
+                double len = playerB->getLengthInSeconds();
+                if (len > 1e-6) {
+                    displayRel = relative - (totalDelay / len);
+                }
+                displayRel = std::clamp(displayRel, 0.0, 1.0);
+            }
+            overviewTopB->setPlayhead(displayRel);
+            if (deckB && deckB->getWaveform()) deckB->getWaveform()->setPlayhead(displayRel);
         } else {
             overviewTopB->setPlayhead(relative);
             if (deckB && deckB->getWaveform()) deckB->getWaveform()->setPlayhead(relative);
@@ -1065,6 +1253,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 
     // Explicit context-menu deck loading
     connect(libraryManager, &LibraryManager::loadToDeck, this, &QtMainWindow::onLibraryLoadToDeck);
+    connect(libraryManager, &LibraryManager::analyzeTracksRequested, this, &QtMainWindow::onAnalyzeTracksRequested);
     
     // Auto-populate with user's Music folder on startup
     QTimer::singleShot(500, this, [this]() {
@@ -1504,29 +1693,66 @@ void QtMainWindow::performCleanup()
 
 void QtMainWindow::closeEvent(QCloseEvent* event)
 {
+    if (shutdownInitiated)
+    {
+        event->accept();
+        return;
+    }
+
+    QMessageBox confirmBox(this);
+    confirmBox.setIcon(QMessageBox::Question);
+    confirmBox.setWindowTitle(tr("BetaPulseX beenden?"));
+    confirmBox.setText(tr("Möchtest du BetaPulseX wirklich schließen?\nAlle laufenden Analysen werden gestoppt und die Datenbank wird sauber getrennt."));
+    confirmBox.setStandardButtons(QMessageBox::Cancel | QMessageBox::Ok);
+    confirmBox.setDefaultButton(QMessageBox::Ok);
+
+    if (confirmBox.exec() != QMessageBox::Ok)
+    {
+        event->ignore();
+        return;
+    }
+
+    shutdownInitiated = true;
+
+    QProgressDialog shutdownProgress(tr("Programm wird beendet..."), QString(), 0, 0, this);
+    shutdownProgress.setWindowTitle(tr("Beenden"));
+    shutdownProgress.setCancelButton(nullptr);
+    shutdownProgress.setWindowModality(Qt::ApplicationModal);
+    shutdownProgress.setAutoClose(false);
+    shutdownProgress.setAutoReset(false);
+    shutdownProgress.setMinimumDuration(0);
+    shutdownProgress.setLabelText(tr("Deck-Einstellungen werden gespeichert..."));
+    shutdownProgress.show();
+    QApplication::processEvents();
+
     std::cout << "QtMainWindow::closeEvent called - shutting down..." << std::endl;
+
     // BetaPulseX: Speichere alle Deck-Einstellungen
     try {
-        // Aktualisiere Visual Trim in den Deck-Settings
         DeckSettings::instance().setVisualTrim(0, userVisualTrimA);  // Deck A
         DeckSettings::instance().setVisualTrim(1, userVisualTrimB);  // Deck B
-        
-        // Speichere alle Deck-Settings zentral
+
         DeckSettings::instance().saveSettings();
-        
         qDebug() << "BetaPulseX: All deck settings saved successfully";
     } catch (...) {
-        // Continue even if settings fail
         qWarning() << "Failed to save deck settings";
     }
-    
-    // Disable deck controls immediately
+
+    shutdownProgress.setLabelText(tr("Decks werden deaktiviert..."));
+    QApplication::processEvents();
+
     if (deckA) deckA->getControlsWidget()->setEnabled(false);
     if (deckB) deckB->getControlsWidget()->setEnabled(false);
-    
-    // Perform cleanup
+
+    shutdownProgress.setLabelText(tr("Audio-Engine wird heruntergefahren..."));
+    QApplication::processEvents();
+
     performCleanup();
-    
+
+    shutdownProgress.setLabelText(tr("Aufräumen abgeschlossen"));
+    QApplication::processEvents();
+    shutdownProgress.close();
+
     std::cout << "Accepting close event and quitting application" << std::endl;
     event->accept();
     QApplication::quit();
@@ -1828,12 +2054,15 @@ void QtMainWindow::keyPressEvent(QKeyEvent* event) {
 
 void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>& beatsSec, double totalSec, 
                                          const std::string& algorithm, double firstBeatOffset, bool isDeckA) {
+    QString analyzedFilePath;
+
     if (isDeckA) {
         // Skip applying if deck has no file anymore
         if (!deckA || deckA->getCurrentFilePath().isEmpty()) {
             if (beatIndicator) beatIndicator->setBeatGridAvailableDeckA(false);
             return;
         }
+        analyzedFilePath = deckA->getCurrentFilePath();
         // Handle Deck A results
         if (deckA) deckA->setDetectedBpm(bpm);
         if (deckA && deckA->getWaveform()) {
@@ -1866,6 +2095,7 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
             if (beatIndicator) beatIndicator->setBeatGridAvailableDeckB(false);
             return;
         }
+        analyzedFilePath = deckB->getCurrentFilePath();
         // Handle Deck B results
         if (deckB) deckB->setDetectedBpm(bpm);
         if (deckB && deckB->getWaveform()) {
@@ -1893,6 +2123,22 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
             algorithmB = QString::fromStdString(algorithm);
             updateOverviewLabel(false);
         }
+    }
+
+    if (libraryManager && !analyzedFilePath.isEmpty()) {
+        QVector<double> beatVector;
+        beatVector.reserve(static_cast<int>(beatsSec.size()));
+        for (double beat : beatsSec)
+            beatVector.append(beat);
+
+        libraryManager->applyAnalysisResult(
+            analyzedFilePath,
+            bpm,
+            firstBeatOffset,
+            totalSec,
+            beatVector,
+            QString::fromStdString(algorithm),
+            bpm <= 0.0);
     }
 }
 
@@ -2500,23 +2746,34 @@ void QtMainWindow::updatePlaybackPositions() {
                   << ", B: " << (playerB ? playerB->getPositionRelative() : -999.0) << std::endl;
     }
     
-    // Update Deck A position - with post-scratch delay to prevent conflicts
+    // Update Deck A position - keep UI synced, even when paused in preroll
     bool canUpdateA = playerA && overviewTopA && !overviewTopA->isScratching() && 
                       (currentTime - lastScratchEndA > 100); // 100ms delay after scratch end
     
     if (canUpdateA) {
         double relativePos = playerA->getPositionRelative();
         
+        // PREROLL PROTECTION: Only skip when paused in positive song area
+        bool isPlaybackUpdate = playerA->isPlaying() || relativePos < 0.0;
+        
         // Even smarter threshold: very small in preroll for smooth movement, moderate in song
         double threshold = (relativePos < 0.0) ? 0.0002 : 0.008; // Preroll: 0.0002, Song: 0.008
         
-        if (std::abs(relativePos - lastPosA) > threshold) {
+        if (isPlaybackUpdate && std::abs(relativePos - lastPosA) > threshold) {
             lastPosA = relativePos;
             
             // Update waveform displays - be explicit about the position
             overviewTopA->setPlayhead(relativePos);
             if (deckA && deckA->getWaveform()) {
                 deckA->getWaveform()->setPlayhead(relativePos);
+            }
+            
+            // UPDATE BEAT INDICATOR: Convert relative position to seconds
+            if (beatIndicator && playerA) {
+                double lenSec = std::max(1e-9, playerA->getLengthInSeconds());
+                constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
+                double seconds = (relativePos < 0.0) ? (relativePos * prerollSec) : (relativePos * lenSec);
+                beatIndicator->setTrackPositionDeckA(seconds);
             }
             
             // Debug: Log significant position changes
@@ -2529,23 +2786,34 @@ void QtMainWindow::updatePlaybackPositions() {
         lastScratchEndA = currentTime;
     }
     
-    // Update Deck B position independently - with post-scratch delay
+    // Update Deck B position independently - keep UI synced in preroll too
     bool canUpdateB = playerB && overviewTopB && !overviewTopB->isScratching() && 
                       (currentTime - lastScratchEndB > 100); // 100ms delay after scratch end
     
     if (canUpdateB) {
         double relativePos = playerB->getPositionRelative();
         
+        // PREROLL PROTECTION: Only skip when paused in positive song area
+        bool isPlaybackUpdate = playerB->isPlaying() || relativePos < 0.0;
+        
         // Even smarter threshold: very small in preroll for smooth movement, moderate in song
         double threshold = (relativePos < 0.0) ? 0.0002 : 0.008; // Preroll: 0.0002, Song: 0.008
         
-        if (std::abs(relativePos - lastPosB) > threshold) {
+        if (isPlaybackUpdate && std::abs(relativePos - lastPosB) > threshold) {
             lastPosB = relativePos;
             
             // Update waveform displays - be explicit about the position
             overviewTopB->setPlayhead(relativePos);
             if (deckB && deckB->getWaveform()) {
                 deckB->getWaveform()->setPlayhead(relativePos);
+            }
+            
+            // UPDATE BEAT INDICATOR: Convert relative position to seconds
+            if (beatIndicator && playerB) {
+                double lenSec = std::max(1e-9, playerB->getLengthInSeconds());
+                constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
+                double seconds = (relativePos < 0.0) ? (relativePos * prerollSec) : (relativePos * lenSec);
+                beatIndicator->setTrackPositionDeckB(seconds);
             }
             
             // Debug: Log significant position changes

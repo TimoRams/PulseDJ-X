@@ -38,7 +38,7 @@ public:
     void pause() { stop(); }
     bool isPlaying();
     // Transport helpers
-    double getCurrentPositionSeconds() const { return transportSource.getCurrentPosition(); }
+    double getCurrentPositionSeconds() const;
     double getLengthInSeconds() const { return transportSource.getLengthInSeconds(); }
     void setPositionSeconds(double secs) { setPosition(secs); }
     // Total processing latency added by the DSP pipeline (e.g., Rubber Band), in seconds

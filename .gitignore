@@ -193,3 +193,5 @@ htmlcov/
 *.7z
 
 # Fonts and assets that are part of repo should remain tracked (do not ignore assets/ unless you intend to)
+
+BetaPulseX/

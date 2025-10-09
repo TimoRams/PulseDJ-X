@@ -306,11 +306,10 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     connect(t, &QTimer::timeout, [this]() {
         if (!player) return;
         // Always reflect current position, even when paused, to keep displays in sync
-        static double lastPos = -1.0;
-        double len = std::max(1e-9, player->getLengthInSeconds());
-        double curSec = player->getCurrentPositionSeconds();
-        double pos = std::clamp(curSec / len, 0.0, 1.0);
-        waveform->setPlayhead(pos);
+    static double lastPos = -1.0;
+    double curSec = player->getCurrentPositionSeconds();
+    double relative = player->getPositionRelative();
+    waveform->setPlayhead(relative);
 
         // Update turntable with absolute seconds and BPM for beat synchronization
         double trackLengthSec = player->getLengthInSeconds();
@@ -323,9 +322,9 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
         }
 
         // Emit only when the position changed to minimize redundant updates
-        if (std::abs(pos - lastPos) > 1e-6) {
-            emit playheadUpdated(pos);
-            lastPos = pos;
+        if (std::abs(relative - lastPos) > 1e-6) {
+            emit playheadUpdated(relative);
+            lastPos = relative;
         }
     });
     t->start();
@@ -377,13 +376,23 @@ void QtDeckWidget::loadFile(const QString &path) {
         loadBtn->setText("Loading...");
         loadBtn->setEnabled(false);
         
-        waveform->setPlayhead(0.0);
+        // PREROLL ENHANCEMENT: Load new tracks in preroll mode for professional DJ workflow
+        // Position track at -4 seconds (half of the 8-second preroll range) for optimal cueing
+        const double prerollPosition = -0.5; // -0.5 in relative coordinates = -4 seconds in preroll
+        waveform->setPlayhead(prerollPosition);
         playing = false;
         turntable->stop();
         
         // Reset cue point and cueing state when loading new file
         cuePosition = 0.0;
         isCueing = false;
+        
+        // IMPORTANT: Position track in preroll for professional DJ workflow
+        if (player) {
+            player->setPositionRelative(prerollPosition); // Use relative positioning for preroll
+            std::cout << "QtDeckWidget: New track positioned in preroll at " << prerollPosition 
+                      << " relative (-4 seconds)" << std::endl;
+        }
     }
     // do NOT start turntable here
 }

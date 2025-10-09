@@ -77,6 +77,7 @@ private slots:
     void onCrossfader(int v);
     void initializeAudio();
     void onLibraryLoadToDeck(int deckIndex, const QString& filePath); // new slot
+    void onAnalyzeTracksRequested(const QStringList& filePaths);
     // EQ/filter slots
     void onLeftHighChanged(int v);
     void onLeftMidChanged(int v);
@@ -202,6 +203,7 @@ private:
     void updateOverviewLabel(bool isDeckA);
     void performCleanup(); // Safe cleanup method
     bool cleanupCompleted{false}; // Prevent double cleanup
+    bool shutdownInitiated{false};
     
     // PREROLL SUPPORT: Update playback positions automatically
     void updatePlaybackPositions();

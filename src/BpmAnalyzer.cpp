@@ -1,5 +1,6 @@
 #include "BpmAnalyzer.h"
 #include "GlobalBeatGrid.h"
+#include "AudioFormatGuard.h"
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -305,7 +306,11 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
                                 StatusFn errorOut) {
     
     if (progress) progress(0.0);
-    auto* reader = formatManager.createReaderFor(file);
+    juce::AudioFormatReader* reader = nullptr;
+    {
+        AudioFormatManagerGuard formatGuard;
+        reader = formatManager.createReaderFor(file);
+    }
     if (!reader) { if (errorOut) errorOut("reader create failed"); return 0.0; }
 
     std::unique_ptr<juce::AudioFormatReader> r(reader);
@@ -818,7 +823,11 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
                                 StatusFn errorOut) {
     
     if (progress) progress(0.0);
-    auto* reader = formatManager.createReaderFor(file);
+    juce::AudioFormatReader* reader = nullptr;
+    {
+        AudioFormatManagerGuard formatGuard;
+        reader = formatManager.createReaderFor(file);
+    }
     if (!reader) { if (errorOut) errorOut("reader create failed"); return 0.0; }
 
     std::unique_ptr<juce::AudioFormatReader> r(reader);

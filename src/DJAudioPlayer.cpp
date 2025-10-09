@@ -2,6 +2,7 @@
 #include "DJAudioPlayer.h"
 #include <QDebug>
 #include <cmath>
+#include "AudioFormatGuard.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -793,7 +794,11 @@ void DJAudioPlayer::releaseResources() {
 
 void DJAudioPlayer::loadFile(const File &file) {
     std::cout << "DJAudioPlayer::loadFile called with: " << file.getFullPathName().toStdString() << std::endl;
-    auto *reader = formatManager.createReaderFor(file);
+    juce::AudioFormatReader* reader = nullptr;
+    {
+        AudioFormatManagerGuard formatGuard;
+        reader = formatManager.createReaderFor(file);
+    }
 
     if (reader != nullptr) {
         std::cout << "Reader created successfully, sample rate: " << reader->sampleRate << ", length: " << reader->lengthInSamples << std::endl;
@@ -820,6 +825,14 @@ void DJAudioPlayer::loadFile(const File &file) {
         reinitRubberBand();
         std::cout << "RubberBand re-initialized for new audio file" << std::endl;
 #endif
+        
+        // IMPORTANT: Reset playback position to start of track when loading new file
+        transportSource.setPosition(0.0);
+        pausedPosSec = 0.0;
+        prerollPosition = 0.0;
+        inPrerollMode = false;
+        softPaused.store(false);
+        std::cout << "Position reset to 0.0 for newly loaded file" << std::endl;
         
         std::cout << "Audio file loaded successfully" << std::endl;
     } else {
@@ -858,6 +871,14 @@ void DJAudioPlayer::applyLoadedSource(std::unique_ptr<AudioFormatReaderSource> s
         reinitRubberBand();
         std::cout << "RubberBand re-initialized for new audio file" << std::endl;
 #endif
+        
+        // IMPORTANT: Reset playback position to start of track when applying new source
+        transportSource.setPosition(0.0);
+        pausedPosSec = 0.0;
+        prerollPosition = 0.0;
+        inPrerollMode = false;
+        softPaused.store(false);
+        std::cout << "Position reset to 0.0 for newly applied source" << std::endl;
         
         // If the player was playing before, restart it with the new source
         if (wasPlaying) {
@@ -958,6 +979,15 @@ double DJAudioPlayer::getPositionRelative() {
     }
 
     return currentPosInSecs / lengthInSecs;
+}
+
+double DJAudioPlayer::getCurrentPositionSeconds() const {
+    // PREROLL SUPPORT: Report negative time while in preroll to keep UI stable
+    if (inPrerollMode) {
+        return prerollPosition * prerollTimeSec;
+    }
+
+    return transportSource.getCurrentPosition();
 }
 
 void DJAudioPlayer::start() {

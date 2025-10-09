@@ -454,12 +454,12 @@ void MenuBar::showPreferences() {
 }
 
 void MenuBar::exportSettings() {
-    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/BetaPulseX_Settings.json";
+    QString defaultPath = AppConfig::instance().getSettingsExportPath();
     QString fileName = QFileDialog::getSaveFileName(this, "Export Settings", defaultPath, "JSON Files (*.json)");
     
     if (!fileName.isEmpty()) {
         // Export current settings to JSON file
-        QSettings config(AppConfig::instance().getConfigDirectory() + "/preferences.ini", QSettings::IniFormat);
+    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
         
         QJsonObject jsonObj;
         
@@ -514,7 +514,7 @@ void MenuBar::importSettings() {
                     "This will replace your current settings. Continue?") == QMessageBox::Yes) {
                     
                     QJsonObject jsonObj = doc.object();
-                    QSettings config(AppConfig::instance().getConfigDirectory() + "/preferences.ini", QSettings::IniFormat);
+                    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
                     
                     // Import all settings groups
                     for (auto it = jsonObj.begin(); it != jsonObj.end(); ++it) {
@@ -551,7 +551,7 @@ void MenuBar::resetSettings() {
     
     if (ret == QMessageBox::Yes) {
         // Clear all settings
-        QSettings config(AppConfig::instance().getConfigDirectory() + "/preferences.ini", QSettings::IniFormat);
+    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
         config.clear();
         config.sync();
         

@@ -25,10 +25,14 @@ DeckWaveformOverview::DeckWaveformOverview(QWidget* parent)
     smoothTimer = new QTimer(this);
     smoothTimer->setInterval(16); // ~60 FPS
     connect(smoothTimer, &QTimer::timeout, this, [this]() {
-        if (playheadPos < 0.0) { update(); return; }
-        if (displayedPlayheadPos < 0.0) displayedPlayheadPos = playheadPos;
+        // PREROLL SUPPORT: Allow animation for negative positions (preroll)
+        // Initialize displayedPlayheadPos to current position if not set
+        if (std::isnan(displayedPlayheadPos) || std::abs(displayedPlayheadPos) > 999.0) {
+            displayedPlayheadPos = playheadPos;
+        }
+        
         double diff = playheadPos - displayedPlayheadPos;
-        // Exponential smoothing: responsive but stable
+        // Exponential smoothing: responsive but stable (works for negative positions too)
         const double alpha = 0.35; // 0..1, higher = faster follow
         displayedPlayheadPos += diff * alpha;
         // Snap when very close to avoid micro-jitter
@@ -255,8 +259,9 @@ void DeckWaveformOverview::paintGL()
     }
 
     // Professional playhead with glow effect
-    if (displayedPlayheadPos >= 0.0f && lineProgram) {
-        // Main playhead line
+    // PREROLL SUPPORT: Show playhead even in preroll (negative positions)
+    if (lineProgram && displayedPlayheadPos > -999.0) { // Show for any valid position including preroll
+        // Main playhead line - handles negative positions (preroll) correctly
         const float x = (float)(displayedPlayheadPos * 2.0 - 1.0);
         const float verts[4] = { x, -1.0f, x, 1.0f };
         
@@ -301,17 +306,27 @@ void DeckWaveformOverview::loadFile(const QString& path)
 
 void DeckWaveformOverview::setPlayhead(double relative)
 {
-    // Adjust playhead position relative to the audio start offset and visual latency comp
+    // PREROLL SUPPORT: Allow negative positions for DJ-style cueing
+    // Don't clamp to 0.0-1.0 range; support unlimited preroll like main WaveformDisplay
+    
     if (totalLength > 0.0) {
-    // No extra visual lead here; we already feed audible-relative time from the host
-    double absoluteTime = std::clamp(relative, 0.0, 1.0) * totalLength;
-        if (absoluteTime >= audioStartOffset) {
-            double displayedDuration = totalLength - audioStartOffset;
-            playheadPos = (absoluteTime - audioStartOffset) / displayedDuration;
+        // Handle preroll positions (negative relative values)
+        if (relative < 0.0) {
+            // In preroll: show playhead position proportionally in the preroll area
+            // Map preroll range [-1.0, 0.0] to display range [-1.0, 0.0]
+            playheadPos = relative; // Direct mapping for preroll
         } else {
-            playheadPos = -1.0; // Hide playhead if before audio start
+            // Normal playback: adjust for audio start offset
+            double absoluteTime = relative * totalLength;
+            if (absoluteTime >= audioStartOffset) {
+                double displayedDuration = totalLength - audioStartOffset;
+                playheadPos = (absoluteTime - audioStartOffset) / displayedDuration;
+            } else {
+                playheadPos = -0.1; // Show playhead slightly before start
+            }
         }
     } else {
+        // Fallback: direct relative positioning
         playheadPos = relative;
     }
     update();

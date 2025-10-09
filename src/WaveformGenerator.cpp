@@ -1,4 +1,5 @@
 #include "WaveformGenerator.h"
+#include "AudioFormatGuard.h"
 
 WaveformGenerator::WaveformGenerator()
 {
@@ -12,7 +13,11 @@ bool WaveformGenerator::generate(const juce::File& file,
                                  int consecutiveChunksNeeded)
 {
     if (binCount <= 0) return false;
-    std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(file));
+    std::unique_ptr<juce::AudioFormatReader> reader;
+    {
+        AudioFormatManagerGuard formatGuard;
+        reader.reset(formatManager.createReaderFor(file));
+    }
     if (!reader) return false;
 
     const int64 totalSamples = reader->lengthInSamples;

@@ -899,8 +899,8 @@ void PreferencesDialog::createAdvancedTab() {
     
     // Connect advanced signals
     connect(exportSettingsButton, &QPushButton::clicked, [this]() {
-        QString fileName = QFileDialog::getSaveFileName(this, "Export Settings", 
-                                                       "BetaPulseX_Settings.json", 
+    QString fileName = QFileDialog::getSaveFileName(this, "Export Settings", 
+                               AppConfig::instance().getSettingsExportPath(), 
                                                        "JSON Files (*.json)");
         if (!fileName.isEmpty()) {
             saveSettings(); // Ensure current settings are saved
@@ -910,8 +910,8 @@ void PreferencesDialog::createAdvancedTab() {
     });
     
     connect(importSettingsButton, &QPushButton::clicked, [this]() {
-        QString fileName = QFileDialog::getOpenFileName(this, "Import Settings", 
-                                                       "", "JSON Files (*.json)");
+    QString fileName = QFileDialog::getOpenFileName(this, "Import Settings", 
+                               AppConfig::instance().getConfigDirectory(), "JSON Files (*.json)");
         if (!fileName.isEmpty()) {
             int ret = QMessageBox::question(this, "Import Settings", 
                                           "This will replace all current settings. Continue?",
@@ -1030,7 +1030,7 @@ void PreferencesDialog::onMemoryLimitChanged(int limitMB) {
 
 // Settings management
 void PreferencesDialog::loadSettings() {
-    QSettings config(AppConfig::instance().getConfigDirectory() + "/preferences.ini", QSettings::IniFormat);
+    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
     
     // Load Audio settings
     settings.audioDevice = config.value("Audio/Device", "").toString();
@@ -1105,7 +1105,7 @@ void PreferencesDialog::loadSettings() {
 }
 
 void PreferencesDialog::saveSettings() {
-    QSettings config(AppConfig::instance().getConfigDirectory() + "/preferences.ini", QSettings::IniFormat);
+    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
     
     // Save Audio settings
     config.setValue("Audio/Device", audioDeviceCombo->currentText());

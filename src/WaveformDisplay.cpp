@@ -102,20 +102,20 @@ void WaveformDisplay::paintGL()
     // Calculate viewport timing: BeatLocked keeps scroll speed static (pps independent of tempo)
     // Use LOCAL calculation instead of GlobalBeatGrid to prevent deck interference
     double basePps = useFixedPixelsPerSecond
-        ? 100.0  // Fixed local value instead of GlobalBeatGrid
+        ? localPixelsPerSecond  // Use instance variable instead of hardcoded value
         : ((double)width() / std::max(1.0, audioLength));
     double safeTempo = (tempoFactor > 1e-6 ? tempoFactor : 1.0);
     double pixelsPerSecond = basePps * zoomFactor; // do not scale by tempo for static scroll speed
     
     // Calculate current playhead position in seconds
-    // PREROLL SUPPORT: Allow negative playhead positions but handle them correctly
+    // PREROLL SUPPORT: Each deck handles its own preroll state independently
     double effectivePlayhead = playheadPos;
     
-    // CRITICAL FIX: Handle negative positions properly for preroll
+    // CRITICAL FIX: Independent preroll handling per deck to prevent interference
     double playheadSec;
     if (effectivePlayhead < 0.0 && prerollEnabled) {
         // In preroll area: negative position maps to negative time
-        // IMPORTANT: Don't multiply by audioLength for negative values - use direct mapping
+        // Each deck maintains its own preroll calculation completely independently
         playheadSec = effectivePlayhead * prerollTimeSec; // This gives us seconds before track start
     } else {
         // Normal area: clamp to valid range and map normally
@@ -127,14 +127,15 @@ void WaveformDisplay::paintGL()
     double displayCenterSec = (viewMode == ViewMode::BeatLocked) ? (playheadSec / safeTempo) : playheadSec;
     
     // Calculate visible time range centered on playhead
-    // PREROLL SUPPORT: Proper viewport calculation for negative times
+    // PREROLL SUPPORT: Independent viewport calculation per deck for negative times
     double bufferSec = std::max(0.05, 0.5 / std::max(1.0, zoomFactor));
     double halfViewportTime = (double)width() / (2.0 * pixelsPerSecond);
     double leftSecond = displayCenterSec - halfViewportTime - bufferSec;
     double rightSecond = displayCenterSec + halfViewportTime + bufferSec;
     
-    // IMPORTANT: Don't artificially limit leftSecond - let it go negative for preroll
-    // The rendering code will handle negative times appropriately
+    // CRITICAL: Each deck independently handles negative viewport bounds
+    // Allow unlimited negative range when this deck has preroll enabled
+    // This ensures no interference between decks with different preroll states
     
     // Convert to source bin indices for waveform data
     // PREROLL SUPPORT: Only use bins for positive time range
@@ -180,9 +181,10 @@ void WaveformDisplay::paintGL()
             }
             double audioBinFloat = (scaledTime - audioStartOffset) * binPerSecond;
             
-            // PREROLL SUPPORT: Handle negative times (before track start)
+            // PREROLL SUPPORT: Independent preroll rendering per deck
             if (scaledTime < 0.0 && prerollEnabled) {
-                // In preroll area - render NO waveform (flat center line)
+                // This deck is in preroll area - render flat center line
+                // Each deck manages its own preroll visualization independently
                 upperPoints.emplace_back(screenX, centerY);
                 lowerPoints.emplace_back(screenX, centerY);
                 continue;
@@ -436,7 +438,7 @@ void WaveformDisplay::mousePressEvent(QMouseEvent* event)
         scratchStartX = event->position().x();
         
         // Initialize timing for smooth velocity calculation
-        static auto scratchStartTime = std::chrono::steady_clock::now();
+        // FIXED: Use instance variable instead of static to prevent deck interference
         scratchStartTime = std::chrono::steady_clock::now();
         
         // CRITICAL: Emit scratchStart FIRST before any other operations
@@ -489,31 +491,35 @@ void WaveformDisplay::mouseMoveEvent(QMouseEvent* event)
         // Convert deltaX (pixels) to deltaSec (seconds)
         double deltaSec = dxSmoothed * secondsPerPixel;
 
-        // Map current playhead to absolute seconds for unified handling
+        // Map current playhead to absolute seconds - each deck handles independently
         double currentSec;
         if (playheadPos < 0.0 && prerollEnabled) {
+            // This deck is in preroll - calculate independently
             currentSec = playheadPos * prerollTimeSec;
         } else {
+            // This deck is in normal range
             currentSec = std::clamp(playheadPos, 0.0, 1.0) * audioLength;
         }
 
-        // STABILITY: Limit seconds change per frame to match the prior "perfect" preroll feel
-        // Prior clamp was 0.01 relative in preroll -> equals 0.01 * prerollTimeSec seconds
+        // STABILITY: Independent preroll limits per deck to prevent interference
+        // Each deck uses its own prerollTimeSec for consistent behavior
         double referencePrerollSec = std::max(0.001, prerollTimeSec);
         double maxDeltaSec = 0.01 * referencePrerollSec;
         deltaSec = std::clamp(deltaSec, -maxDeltaSec, maxDeltaSec);
 
-        // Calculate new absolute seconds and map back to relative
+        // Calculate new position - completely independent per deck
         double newSec = currentSec + deltaSec;
         double newPos;
         if (newSec < 0.0 && prerollEnabled) {
+            // This deck entering/staying in preroll
             newPos = newSec / referencePrerollSec;
         } else {
+            // This deck in normal range
             newPos = (audioLength > 0.0) ? (newSec / audioLength) : playheadPos;
         }
 
-        // PREROLL: UNLIMITED negative space - no minimum limit for DJ cueing
-        double minPos = prerollEnabled ? -999.0 : 0.0; // Effectively unlimited preroll
+        // PREROLL: Independent unlimited negative space per deck
+        double minPos = prerollEnabled ? -999.0 : 0.0; // Each deck has its own limit
         double maxPos = 1.0;
 
         // Clamp to valid range
@@ -523,8 +529,8 @@ void WaveformDisplay::mouseMoveEvent(QMouseEvent* event)
         if (std::abs(newPos - playheadPos) > 0.0001) {
 
             // Debug (reduced frequency to avoid spam)
-            static int debugCounter = 0;
-            if (++debugCounter % 10 == 0) { // Only every 10th movement
+            // FIXED: Use instance variable instead of static to prevent deck interference
+            if (++scratchDebugCounter % 10 == 0) { // Only every 10th movement
                 std::cout << "SCRATCH: deltaX=" << deltaX
                           << " deltaSec=" << deltaSec
                           << " oldPos=" << playheadPos
@@ -733,47 +739,66 @@ void WaveformDisplay::drawBeatGrid(QPainter& p, double playheadSec, double leftS
     
     // PREROLL BEAT GRID: Handle negative time region ONLY - completely independent
     if (leftSecond < 0.0 && prerollEnabled && localBpm > 0.0) {
-        // Use base BPM for preroll intervals; BeatLocked mapping applies tempo visually.
-        double beatInterval = 60.0 / localBpm;
-        
-        // Only draw in negative time region - start from -beatInterval and go backwards
-        for (double beatTime = -beatInterval; beatTime >= leftSecond; beatTime -= beatInterval) {
-            if (beatTime >= 0.0) continue; // Only negative times for preroll
-            
-            double visualTime;
-            if (viewMode == ViewMode::BeatLocked) {
-                visualTime = displayCenterSecLocal + (beatTime - playheadSec) / std::max(1e-6, safeTempoLocal);
-            } else {
-                visualTime = beatTime;
-            }
-            
-            double relativePos = (visualTime - leftSecond) / timeRange;
-            int screenX = (int)(relativePos * width());
-            
-            if (screenX >= 0 && screenX < width()) {
-                // Calculate which beat this is (-1, -2, -3, ...)
-                int beatNumber = (int)std::round(beatTime / beatInterval);
-                
-                // Every 4th beat gets orange line
-                if (beatNumber % 4 == 0) {
-                    p.setPen(orangeBeatPen);
-                    p.drawLine(screenX, 0, screenX, height());
-                    
-                    // Orange line number: -1, -2, -3, etc.
-                    int orangeLineNumber = beatNumber / 4;
-                    
-                    // Draw number labels
-                    p.setPen(QPen(QColor(255, 180, 100, 200), 1));
-                    p.setFont(QFont("Arial", 9, QFont::Bold));
-                    p.drawText(screenX + 3, 15, QString::number(orangeLineNumber));
+        const double beatInterval = 60.0 / localBpm;
+        if (beatInterval > 1e-6) {
+            // Determine the first beat at or after the track start so preroll spacing aligns perfectly
+            double firstBeatAfterZero = beatInterval;
+            if (!localBeats.empty()) {
+                auto it = std::find_if(localBeats.begin(), localBeats.end(), [](double t) { return t >= -1e-3; });
+                if (it != localBeats.end()) {
+                    firstBeatAfterZero = *it;
                 } else {
-                    // Regular beats - white lines
-                    p.setPen(whiteBeatPen);
-                    p.drawLine(screenX, height()/3, screenX, 2*height()/3);
+                    firstBeatAfterZero = localBeats.front();
+                }
+            } else if (firstBeatOffset > 1e-6) {
+                firstBeatAfterZero = firstBeatOffset;
+            }
+
+            // Ensure we're using a beat strictly at/after zero to anchor backwards spacing cleanly
+            if (firstBeatAfterZero < 0.0) {
+                const double shiftBeats = std::ceil((-firstBeatAfterZero) / beatInterval);
+                firstBeatAfterZero += shiftBeats * beatInterval;
+            }
+            if (firstBeatAfterZero < 1e-6) {
+                firstBeatAfterZero += beatInterval;
+            }
+
+            int backwardIndex = 0;
+            for (double beatTime = firstBeatAfterZero - beatInterval; beatTime >= leftSecond; beatTime -= beatInterval) {
+                if (beatTime >= 0.0) {
+                    continue; // Only render beats that live in the preroll region
+                }
+
+                --backwardIndex; // Track how many beats we moved backwards from the anchor
+
+                double visualTime;
+                if (viewMode == ViewMode::BeatLocked) {
+                    visualTime = displayCenterSecLocal + (beatTime - playheadSec) / std::max(1e-6, safeTempoLocal);
+                } else {
+                    visualTime = beatTime;
+                }
+
+                double relativePos = (visualTime - leftSecond) / timeRange;
+                int screenX = (int)(relativePos * width());
+
+                if (screenX >= 0 && screenX < width()) {
+                    const bool isDownBeat = (backwardIndex % 4) == 0;
+                    if (isDownBeat) {
+                        p.setPen(orangeBeatPen);
+                        p.drawLine(screenX, 0, screenX, height());
+
+                        const int orangeLineNumber = static_cast<int>(std::floor(backwardIndex / 4.0));
+                        p.setPen(QPen(QColor(255, 180, 100, 200), 1));
+                        p.setFont(QFont("Arial", 9, QFont::Bold));
+                        p.drawText(screenX + 3, 15, QString::number(orangeLineNumber));
+                    } else {
+                        p.setPen(whiteBeatPen);
+                        p.drawLine(screenX, height()/3, screenX, 2*height()/3);
+                    }
                 }
             }
         }
-        
+
         // Special case: Draw the "0" line at song start (beatTime = 0.0) if visible
         if (rightSecond > 0.0 && leftSecond < 0.1) {
             double visualTime;
@@ -782,14 +807,14 @@ void WaveformDisplay::drawBeatGrid(QPainter& p, double playheadSec, double leftS
             } else {
                 visualTime = 0.0;
             }
-            
+
             double relativePos = (visualTime - leftSecond) / timeRange;
             int screenX = (int)(relativePos * width());
-            
+
             if (screenX >= 0 && screenX < width()) {
                 p.setPen(orangeBeatPen);
                 p.drawLine(screenX, 0, screenX, height());
-                
+
                 // Draw "0" label at song start
                 p.setPen(QPen(QColor(255, 180, 100, 200), 1));
                 p.setFont(QFont("Arial", 9, QFont::Bold));
@@ -867,7 +892,7 @@ void WaveformDisplay::drawBeatGrid(QPainter& p, double playheadSec, double leftS
         }
         // Optional: pixels-per-second info on next line
         if (useFixedPixelsPerSecond) {
-            double pixelsPerSec = 100.0; // Local fixed value instead of GlobalBeatGrid
+            double pixelsPerSec = localPixelsPerSecond; // Use instance variable instead of hardcoded value
             QString ratioText = QString("%1px/s").arg(pixelsPerSec, 0, 'f', 0);
             int w = p.fontMetrics().horizontalAdvance(ratioText);
             p.setPen(QPen(QColor(150, 180, 220), 1));
@@ -881,7 +906,8 @@ void WaveformDisplay::drawCuePoints(QPainter& p, double leftSecond, double right
     if (timeRange <= 0.0 || audioLength <= 0.0) return;
     
     // Define cue point colors (rainbow-like sequence for easy identification)
-    static const QColor cueColors[8] = {
+    // FIXED: Make local const array instead of static to prevent deck interference
+    const QColor cueColors[8] = {
         QColor(255, 80, 80),   // Red
         QColor(255, 150, 80),  // Orange  
         QColor(255, 220, 80),  // Yellow

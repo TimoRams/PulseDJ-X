@@ -49,13 +49,13 @@ set(JUCE_RECOMMENDED_GLOBAL_OPTIONS "JUCE_WEB_BROWSER=0;JUCE_USE_CURL=1;JUCE_USE
 # Qt frontend target that uses JUCE as backend for audio/waveform rendering
 # Prefer Qt6, but provide a Qt5 fallback if Qt6 OpenGLWidgets is unavailable
 set(QT_PACKAGE "")
-find_package(Qt6 QUIET COMPONENTS Widgets OpenGLWidgets)
+find_package(Qt6 QUIET COMPONENTS Widgets OpenGLWidgets Sql)
 if (Qt6_FOUND)
     set(QT_PACKAGE "Qt6")
     message(STATUS "Using Qt6 with OpenGLWidgets")
 else()
     message(STATUS "Qt6 not found; trying Qt5 fallback")
-    find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
+    find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL Sql)
     set(QT_PACKAGE "Qt5")
     message(STATUS "Using Qt5 with OpenGL module")
 endif()
@@ -116,8 +116,12 @@ target_sources(David
     src/WaveformGenerator.cpp
     src/WaveformGenerator.h
     src/BpmAnalyzer.cpp
+    src/AudioFormatGuard.cpp
+    src/AudioFormatGuard.h
     src/LibraryManager.cpp
     src/LibraryManager.h
+    src/LibraryDatabase.cpp
+    src/LibraryDatabase.h
     src/MasterLevelMonitor.cpp
     src/MasterLevelMonitor.h
     src/MenuBar.cpp
@@ -143,8 +147,10 @@ target_link_libraries(David
     CURL::libcurl
     $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Widgets>
     $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::OpenGLWidgets>
+    $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Sql>
     $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Widgets>
-    $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::OpenGL>)
+    $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::OpenGL>
+    $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Sql>)
 
 if (AUBIO_FOUND)
     message(STATUS "Aubio found: including headers and linking libs")

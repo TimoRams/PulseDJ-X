@@ -11,6 +11,8 @@ int main(int argc, char** argv)
     qDebug() << "=== BetaPulseX DJ Software Starting ===";
     qDebug() << "Build Type:" << (AppConfig::instance().isDebugBuild() ? "DEBUG/DEVELOPMENT" : "RELEASE");
     qDebug() << "Data Directory:" << AppConfig::instance().getAppDataDirectory();
+    qDebug() << "Config Directory:" << AppConfig::instance().getConfigDirectory();
+    qDebug() << "Library Database:" << AppConfig::instance().getLibraryDatabasePath();
     
     // Erstelle alle notwendigen Verzeichnisse
     if (!AppConfig::instance().createDirectories()) {

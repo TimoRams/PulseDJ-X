@@ -11,7 +11,8 @@
 #include <QTimer>
 #include <JuceHeader.h>
 #include <vector>
-#include "GlobalBeatGrid.h"
+#include <chrono>
+// DECK ISOLATION FIX: Removed GlobalBeatGrid.h to prevent deck interference
 
 class WaveformDisplay : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -29,8 +30,8 @@ public:
         // Capture first beat offset for use in default grid
         if (!beats.isEmpty()) {
             firstBeatOffset = beats.first() * trackLengthSec;
-            // Keep global grid aligned with analysis: bpm + firstBeatOffset + track length
-            GlobalBeatGrid::getInstance().setBeatGridParams(originalBpm, firstBeatOffset, trackLengthSec);
+            // DECK ISOLATION FIX: Remove GlobalBeatGrid dependency to prevent deck interference
+            // Each deck now manages its own beat grid independently
         }
         // Re-align the grid after new beats are provided
         recomputeBeatPhaseShift();
@@ -61,13 +62,14 @@ public:
         update();
     }
     
-    // NEW: Set beat info with global beat grid integration
+    // DECK ISOLATION FIX: Set beat info with local beat grid (no global dependency)
     void setBeatInfo(double bpm, double firstBeatOffset, double totalLength) {
         originalBpm = bpm;
         trackLengthSec = totalLength;
+        this->firstBeatOffset = firstBeatOffset;
         
-        // Update global beat grid
-        GlobalBeatGrid::getInstance().setBeatGridParams(bpm, firstBeatOffset, totalLength);
+        // DECK ISOLATION FIX: Each deck manages its own beat grid parameters
+        // No global beat grid dependency to prevent deck interference
         
         update();
     }
@@ -124,14 +126,15 @@ public:
     // PREROLL SUPPORT: Check if currently scratching to prevent timer interference
     bool isScratching() const { return scratching; }
     
-    // NEW: Fixed pixels-per-second system for consistent beat grid display
+    // DECK ISOLATION FIX: Fixed pixels-per-second system (local per-deck implementation)
     void setUseFixedPixelsPerSecond(bool use) { useFixedPixelsPerSecond = use; update(); }
     bool isUsingFixedPixelsPerSecond() const { return useFixedPixelsPerSecond; }
     void setPixelsPerSecond(double pixelsPerSec) { 
-        GlobalBeatGrid::getInstance().setPixelsPerSecond(pixelsPerSec); 
+        // DECK ISOLATION FIX: Store locally instead of global to prevent deck interference
+        localPixelsPerSecond = pixelsPerSec;
         update(); 
     }
-    double getPixelsPerSecond() const { return GlobalBeatGrid::getInstance().getPixelsPerSecond(); }
+    double getPixelsPerSecond() const { return localPixelsPerSecond; }
     // View mode control
     void setViewMode(ViewMode m) { viewMode = m; update(); }
     ViewMode getViewMode() const { return viewMode; }
@@ -278,6 +281,13 @@ private:
     double scratchViewOffset{0.0};      // Current view offset during scratching
     double lastScratchX{0.0};           // Last mouse X position
     double scratchInitialDisplayPos{0.0}; // Initial display position when scratch started
+    
+    // DECK ISOLATION FIX: Replace static variables with instance variables
+    int scratchDebugCounter{0};         // Debug counter for scratch events (was static)
+    std::chrono::steady_clock::time_point scratchStartTime; // Scratch timing (was static)
+    
+    // DECK ISOLATION FIX: Local pixels-per-second storage (was GlobalBeatGrid)
+    double localPixelsPerSecond{100.0}; // Local pixels per second instead of global
     double scratchInitialAbsPos{0.0};   // Initial absolute position when scratch started
     
     // Preroll functionality for DJ-style cueing before track start

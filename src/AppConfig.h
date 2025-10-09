@@ -30,36 +30,56 @@ public:
     }
     
     QString getLibraryDirectory() const {
-        return appDataDir + "/library";
+        return join(appDataDir, "library");
     }
     
     QString getCacheDirectory() const {
-        return appDataDir + "/cache";
+        return join(appDataDir, "cache");
     }
     
     QString getWaveformCacheDirectory() const {
-        return appDataDir + "/waveforms";
+        return join(appDataDir, "waveforms");
     }
     
     QString getBpmCacheDirectory() const {
-        return appDataDir + "/bpm_cache";
+        return join(appDataDir, "bpm_cache");
     }
     
     QString getPresetsDirectory() const {
-        return appDataDir + "/presets";
+        return join(appDataDir, "presets");
     }
     
     QString getLogsDirectory() const {
-        return appDataDir + "/logs";
+        return join(appDataDir, "logs");
     }
     
     // Spezifische Dateipfade
     QString getLibraryDatabasePath() const {
-        return getLibraryDirectory() + "/libraryItems.xml";
+        return join(getLibraryDirectory(), "PulseDJLibrary.sqlite");
     }
-    
+
+    QString getLibraryXmlBackupPath() const {
+        return join(getLibraryDirectory(), "libraryItems.xml");
+    }
+
     QString getSettingsPath() const {
-        return getConfigDirectory() + "/settings.ini";
+        return join(getConfigDirectory(), "settings.ini");
+    }
+
+    QString getDeckSettingsPath() const {
+        return join(getConfigDirectory(), "deck_settings.ini");
+    }
+
+    QString getPreferencesPath() const {
+        return join(getConfigDirectory(), "preferences.ini");
+    }
+
+    QString getSettingsExportPath() const {
+        return join(getConfigDirectory(), "BetaPulseX_Settings.json");
+    }
+
+    QString getUiStatePath(const QString& name) const {
+        return join(getConfigDirectory(), name);
     }
     
     // Prüft ob Debug/Development Build
@@ -99,7 +119,7 @@ private:
     
     void initializeDirectories() {
         // Debug-Build erkennen (verschiedene Methoden)
-        debugBuild = false;
+    debugBuild = false;
         
 #ifdef _DEBUG
         debugBuild = true;
@@ -123,6 +143,17 @@ private:
         QString execPath = QCoreApplication::applicationDirPath();
         if (execPath.contains("/build") || execPath.endsWith("/build")) {
             debugBuild = true;
+        }
+
+        // Allow explicit override through environment variable BETAPULSEX_DATA_ROOT
+        const QByteArray overrideBytes = qgetenv("BETAPULSEX_DATA_ROOT");
+        if (!overrideBytes.isEmpty()) {
+            const QString overridePath = QDir::cleanPath(QString::fromLocal8Bit(overrideBytes));
+            if (!overridePath.isEmpty()) {
+                appDataDir = overridePath;
+                qDebug() << "App data directory overridden via BETAPULSEX_DATA_ROOT:" << appDataDir;
+                return;
+            }
         }
         
         if (debugBuild) {
@@ -151,6 +182,10 @@ private:
         
         // Normalisiere Pfad
         appDataDir = QDir::cleanPath(appDataDir);
+    }
+    
+    static QString join(const QString& base, const QString& child) {
+        return QDir(base).filePath(child);
     }
     
     QString appDataDir;

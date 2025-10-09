@@ -24,11 +24,325 @@
 #include <QProgressBar>
 #include <QToolButton>
 #include <QMenu>
+#include <QFile>
+#include <QHash>
+#include <QItemSelectionModel>
+#include <QRegularExpression>
+#include <QLocale>
+#include <optional>
+#include <cstring>
+#include <cmath>
 #include <iostream>
+#include <QDebug>
+#include <algorithm>
+#include <QDateTime>
+#include "AppConfig.h"
+#include "LibraryDatabase.h"
+#include "AudioFormatGuard.h"
 
 // JUCE includes for audio format reading and ID3 tag extraction
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_core/juce_core.h>
+
+namespace
+{
+QString fromJuceString (const juce::String& value)
+{
+    return QString::fromUtf8 (value.toRawUTF8());
+}
+
+QString cleanupMetadataString (QString text)
+{
+    if (text.isEmpty())
+        return text;
+
+    text.replace (QRegularExpression (QStringLiteral ("[\\x00\\r\\n\\t]+")), QStringLiteral (" "));
+    text = text.simplified();
+    return text.trimmed();
+}
+
+QString normaliseKey (const QString& key)
+{
+    QString lowered = key.trimmed().toLower();
+    QString result;
+    result.reserve (lowered.size());
+    for (const QChar ch : lowered)
+    {
+        if (ch.isLetterOrNumber())
+            result.append (ch);
+    }
+    return result;
+}
+
+QHash<QString, QString> buildMetadataLookup (const juce::StringPairArray& metadata)
+{
+    QHash<QString, QString> map;
+    const auto keys = metadata.getAllKeys();
+    const auto values = metadata.getAllValues();
+
+    for (int i = 0; i < metadata.size(); ++i)
+    {
+        QString key = cleanupMetadataString (fromJuceString (keys[i]));
+        QString value = cleanupMetadataString (fromJuceString (values[i]));
+
+        if (value.isEmpty())
+            continue;
+
+        const QString normalisedKey = normaliseKey (key);
+        if (! normalisedKey.isEmpty() && ! map.contains (normalisedKey))
+            map.insert (normalisedKey, value);
+
+        if (key.contains (QLatin1Char (':')))
+        {
+            const auto parts = key.split (QLatin1Char (':'), Qt::SkipEmptyParts);
+            for (const auto& part : parts)
+            {
+                const QString altKey = normaliseKey (part);
+                if (! altKey.isEmpty() && ! map.contains (altKey))
+                    map.insert (altKey, value);
+            }
+        }
+    }
+
+    return map;
+}
+
+QString metadataValueFor (const QHash<QString, QString>& map, std::initializer_list<const char*> candidateKeys)
+{
+    for (const char* key : candidateKeys)
+    {
+        const QString lookupKey = normaliseKey (QString::fromUtf8 (key));
+        auto it = map.constFind (lookupKey);
+        if (it != map.cend())
+            return it.value();
+    }
+    return {};
+}
+
+double parseBpmString (const QString& raw)
+{
+    if (raw.isEmpty())
+        return 0.0;
+
+    QString candidate = raw.trimmed();
+    candidate.replace (QLatin1Char (','), QLatin1Char ('.'));
+
+    static const QRegularExpression numericPattern (QStringLiteral ("([0-9]+(?:\\.[0-9]+)?)"));
+    const auto match = numericPattern.match (candidate);
+    if (match.hasMatch())
+    {
+        bool ok = false;
+        const double bpm = match.captured (1).toDouble (&ok);
+        if (ok)
+            return bpm;
+    }
+
+    bool ok = false;
+    const double bpm = candidate.toDouble (&ok);
+    return ok ? bpm : 0.0;
+}
+
+QString extractYearString (const QString& raw)
+{
+    if (raw.isEmpty())
+        return {};
+
+    static const QRegularExpression yearPattern (QStringLiteral ("((?:19|20)\\d{2})"));
+    const auto match = yearPattern.match (raw);
+    if (match.hasMatch())
+        return match.captured (1);
+
+    const QString trimmed = raw.trimmed();
+    if (trimmed.size() >= 4)
+    {
+        bool ok = false;
+        const QString prefix = trimmed.left (4);
+        prefix.toInt (&ok);
+        if (ok)
+            return prefix;
+    }
+    return {};
+}
+
+QString id3v1GenreName (unsigned char index)
+{
+    static const QStringList genres = {
+        QStringLiteral ("Blues"), QStringLiteral ("Classic Rock"), QStringLiteral ("Country"), QStringLiteral ("Dance"),
+        QStringLiteral ("Disco"), QStringLiteral ("Funk"), QStringLiteral ("Grunge"), QStringLiteral ("Hip-Hop"),
+        QStringLiteral ("Jazz"), QStringLiteral ("Metal"), QStringLiteral ("New Age"), QStringLiteral ("Oldies"),
+        QStringLiteral ("Other"), QStringLiteral ("Pop"), QStringLiteral ("R&B"), QStringLiteral ("Rap"),
+        QStringLiteral ("Reggae"), QStringLiteral ("Rock"), QStringLiteral ("Techno"), QStringLiteral ("Industrial"),
+        QStringLiteral ("Alternative"), QStringLiteral ("Ska"), QStringLiteral ("Death Metal"), QStringLiteral ("Pranks"),
+        QStringLiteral ("Soundtrack"), QStringLiteral ("Euro-Techno"), QStringLiteral ("Ambient"), QStringLiteral ("Trip-Hop"),
+        QStringLiteral ("Vocal"), QStringLiteral ("Jazz+Funk"), QStringLiteral ("Fusion"), QStringLiteral ("Trance"),
+        QStringLiteral ("Classical"), QStringLiteral ("Instrumental"), QStringLiteral ("Acid"), QStringLiteral ("House"),
+        QStringLiteral ("Game"), QStringLiteral ("Sound Clip"), QStringLiteral ("Gospel"), QStringLiteral ("Noise"),
+        QStringLiteral ("Alternative Rock"), QStringLiteral ("Bass"), QStringLiteral ("Soul"), QStringLiteral ("Punk"),
+        QStringLiteral ("Space"), QStringLiteral ("Meditative"), QStringLiteral ("Instrumental Pop"), QStringLiteral ("Instrumental Rock"),
+        QStringLiteral ("Ethnic"), QStringLiteral ("Gothic"), QStringLiteral ("Darkwave"), QStringLiteral ("Techno-Industrial"),
+        QStringLiteral ("Electronic"), QStringLiteral ("Pop-Folk"), QStringLiteral ("Eurodance"), QStringLiteral ("Dream"),
+        QStringLiteral ("Southern Rock"), QStringLiteral ("Comedy"), QStringLiteral ("Cult"), QStringLiteral ("Gangsta"),
+        QStringLiteral ("Top 40"), QStringLiteral ("Christian Rap"), QStringLiteral ("Pop/Funk"), QStringLiteral ("Jungle"),
+        QStringLiteral ("Native American"), QStringLiteral ("Cabaret"), QStringLiteral ("New Wave"), QStringLiteral ("Psychadelic"),
+        QStringLiteral ("Rave"), QStringLiteral ("Showtunes"), QStringLiteral ("Trailer"), QStringLiteral ("Lo-Fi"),
+        QStringLiteral ("Tribal"), QStringLiteral ("Acid Punk"), QStringLiteral ("Acid Jazz"), QStringLiteral ("Polka"),
+        QStringLiteral ("Retro"), QStringLiteral ("Musical"), QStringLiteral ("Rock & Roll"), QStringLiteral ("Hard Rock"),
+        QStringLiteral ("Folk"), QStringLiteral ("Folk-Rock"), QStringLiteral ("National Folk"), QStringLiteral ("Swing"),
+        QStringLiteral ("Fast Fusion"), QStringLiteral ("Bebop"), QStringLiteral ("Latin"), QStringLiteral ("Revival"),
+        QStringLiteral ("Celtic"), QStringLiteral ("Bluegrass"), QStringLiteral ("Avantgarde"), QStringLiteral ("Gothic Rock"),
+        QStringLiteral ("Progressive Rock"), QStringLiteral ("Psychedelic Rock"), QStringLiteral ("Symphonic Rock"), QStringLiteral ("Slow Rock"),
+        QStringLiteral ("Big Band"), QStringLiteral ("Chorus"), QStringLiteral ("Easy Listening"), QStringLiteral ("Acoustic"),
+        QStringLiteral ("Humour"), QStringLiteral ("Speech"), QStringLiteral ("Chanson"), QStringLiteral ("Opera"),
+        QStringLiteral ("Chamber Music"), QStringLiteral ("Sonata"), QStringLiteral ("Symphony"), QStringLiteral ("Booty Bass"),
+        QStringLiteral ("Primus"), QStringLiteral ("Porn Groove"), QStringLiteral ("Satire"), QStringLiteral ("Slow Jam"),
+        QStringLiteral ("Club"), QStringLiteral ("Tango"), QStringLiteral ("Samba"), QStringLiteral ("Folklore"),
+        QStringLiteral ("Ballad"), QStringLiteral ("Power Ballad"), QStringLiteral ("Rhythmic Soul"), QStringLiteral ("Freestyle"),
+        QStringLiteral ("Duet"), QStringLiteral ("Punk Rock"), QStringLiteral ("Drum Solo"), QStringLiteral ("Acapella"),
+        QStringLiteral ("Euro-House"), QStringLiteral ("Dance Hall"), QStringLiteral ("Goa"), QStringLiteral ("Drum & Bass"),
+        QStringLiteral ("Club-House"), QStringLiteral ("Hardcore"), QStringLiteral ("Terror"), QStringLiteral ("Indie"),
+        QStringLiteral ("BritPop"), QStringLiteral ("Negerpunk"), QStringLiteral ("Polsk Punk"), QStringLiteral ("Beat"),
+        QStringLiteral ("Christian Gangsta"), QStringLiteral ("Heavy Metal"), QStringLiteral ("Black Metal"), QStringLiteral ("Crossover"),
+        QStringLiteral ("Contemporary Christian"), QStringLiteral ("Christian Rock"), QStringLiteral ("Merengue"), QStringLiteral ("Salsa"),
+        QStringLiteral ("Thrash Metal"), QStringLiteral ("Anime"), QStringLiteral ("JPop"), QStringLiteral ("Synthpop"),
+        QStringLiteral ("Abstract"), QStringLiteral ("Art Rock"), QStringLiteral ("Baroque"), QStringLiteral ("Bhangra"),
+        QStringLiteral ("Big Beat"), QStringLiteral ("Breakbeat"), QStringLiteral ("Chillout"), QStringLiteral ("Downtempo"),
+        QStringLiteral ("Dub"), QStringLiteral ("EBM"), QStringLiteral ("Eclectic"), QStringLiteral ("Electro"),
+        QStringLiteral ("Electroclash"), QStringLiteral ("Emo"), QStringLiteral ("Experimental"), QStringLiteral ("Garage"),
+        QStringLiteral ("Global"), QStringLiteral ("IDM"), QStringLiteral ("Illbient"), QStringLiteral ("Industro-Goth"),
+        QStringLiteral ("Jam Band"), QStringLiteral ("Krautrock"), QStringLiteral ("Leftfield"), QStringLiteral ("Lounge"),
+        QStringLiteral ("Math Rock"), QStringLiteral ("New Romantic"), QStringLiteral ("Nu-Breakz"), QStringLiteral ("Post-Punk"),
+        QStringLiteral ("Post-Rock"), QStringLiteral ("Psytrance"), QStringLiteral ("Shoegaze"), QStringLiteral ("Space Rock"),
+        QStringLiteral ("Trop Rock"), QStringLiteral ("World Music"), QStringLiteral ("Neoclassical"), QStringLiteral ("Audiobook"),
+        QStringLiteral ("Audio Theatre"), QStringLiteral ("Neue Deutsche Welle"), QStringLiteral ("Podcast"), QStringLiteral ("Indie Rock"),
+        QStringLiteral ("G-Funk"), QStringLiteral ("Dubstep"), QStringLiteral ("Garage Rock"), QStringLiteral ("Psybient")
+    };
+
+    if (index < genres.size())
+        return genres.at (index);
+
+    return {};
+}
+
+struct Id3v1TagData
+{
+    QString title;
+    QString artist;
+    QString album;
+    QString genre;
+    QString year;
+    QString comment;
+    int trackNumber = -1;
+};
+
+std::optional<Id3v1TagData> readId3v1Tag (const QString& filePath)
+{
+    QFile file (filePath);
+    if (! file.open (QIODevice::ReadOnly))
+        return std::nullopt;
+
+    if (file.size() < 128)
+        return std::nullopt;
+
+    if (! file.seek (file.size() - 128))
+        return std::nullopt;
+
+    const QByteArray data = file.read (128);
+    if (data.size() != 128)
+        return std::nullopt;
+
+    if (std::memcmp (data.constData(), "TAG", 3) != 0)
+        return std::nullopt;
+
+    Id3v1TagData tag;
+    tag.title = cleanupMetadataString (QString::fromLatin1 (data.mid (3, 30)));
+    tag.artist = cleanupMetadataString (QString::fromLatin1 (data.mid (33, 30)));
+    tag.album = cleanupMetadataString (QString::fromLatin1 (data.mid (63, 30)));
+    tag.year = cleanupMetadataString (QString::fromLatin1 (data.mid (93, 4)));
+
+    QByteArray comment = data.mid (97, 30);
+    if (comment.size() == 30)
+    {
+        if (comment[28] == 0 && comment[29] != 0)
+            tag.trackNumber = static_cast<unsigned char> (comment[29]);
+
+        comment[28] = 0;
+    }
+    tag.comment = cleanupMetadataString (QString::fromLatin1 (comment));
+
+    const unsigned char genreIndex = static_cast<unsigned char> (data[127]);
+    tag.genre = cleanupMetadataString (id3v1GenreName (genreIndex));
+
+    return tag;
+}
+
+void applyFilenameHeuristics (const QFileInfo& fileInfo, TrackInfo& track)
+{
+    const QString baseName = cleanupMetadataString (fileInfo.completeBaseName());
+
+    if (track.title.trimmed().isEmpty())
+        track.title = baseName;
+
+    if (track.artist.trimmed().isEmpty())
+    {
+    static const QRegularExpression artistTitlePattern (QStringLiteral ("^\\s*(.+?)\\s*[-–]\\s*(.+)\\s*$"));
+        const auto match = artistTitlePattern.match (fileInfo.completeBaseName());
+        if (match.hasMatch())
+        {
+            const QString artist = cleanupMetadataString (match.captured (1));
+            const QString title = cleanupMetadataString (match.captured (2));
+            if (! artist.isEmpty())
+                track.artist = artist;
+            if (! title.isEmpty())
+                track.title = title;
+        }
+    }
+}
+
+void applyId3v1Fallback (const std::optional<Id3v1TagData>& tag, TrackInfo& track)
+{
+    if (! tag)
+        return;
+
+    const auto assignIfEmpty = [] (QString& target, const QString& value)
+    {
+        if (target.trimmed().isEmpty() && ! value.trimmed().isEmpty())
+            target = value.trimmed();
+    };
+
+    assignIfEmpty (track.title, tag->title);
+    assignIfEmpty (track.artist, tag->artist);
+    assignIfEmpty (track.album, tag->album);
+    assignIfEmpty (track.genre, tag->genre);
+    assignIfEmpty (track.year, tag->year);
+    assignIfEmpty (track.comment, tag->comment);
+}
+
+void finaliseMetadata (const QFileInfo& fileInfo, TrackInfo& track)
+{
+    track.title = cleanupMetadataString (track.title);
+    track.artist = cleanupMetadataString (track.artist);
+    track.album = cleanupMetadataString (track.album);
+    track.genre = cleanupMetadataString (track.genre);
+    track.comment = cleanupMetadataString (track.comment);
+    track.year = cleanupMetadataString (track.year);
+
+    if (track.title.isEmpty())
+        track.title = cleanupMetadataString (fileInfo.completeBaseName());
+
+    if (! track.key.isEmpty())
+    {
+        track.key = cleanupMetadataString (track.key.toUpper());
+        track.key.remove (QLatin1Char (' '));
+    }
+    else
+    {
+        track.key.clear();
+    }
+	
+    if (track.trackLengthSeconds <= 0.0 && track.duration > 0.0)
+        track.trackLengthSeconds = track.duration;
+}
+}
 
 // ID3LoaderThread Implementation
 ID3LoaderThread::ID3LoaderThread(const QStringList& files, juce::AudioFormatManager* formatManager, QObject* parent)
@@ -59,92 +373,86 @@ void ID3LoaderThread::run()
 
 TrackInfo ID3LoaderThread::loadTrackInfo(const QString& filePath)
 {
-    TrackInfo track(filePath);
-    
-    try {
-        juce::File audioFile(filePath.toStdString());
-        QFileInfo fileInfo(filePath);
-        
-        // Basic file info
-        track.fileSize = fileInfo.size();
-        
-        if (!audioFile.exists()) {
-            return track;
-        }
-        
-        // Try to create a reader for the audio file
-        std::unique_ptr<juce::AudioFormatReader> reader(audioFormatManager->createReaderFor(audioFile));
-        
-        if (reader) {
-            // Get duration
-            if (reader->sampleRate > 0) {
-                track.duration = reader->lengthInSamples / reader->sampleRate;
-            }
-            
-            // Try to get metadata from the reader
-            juce::StringPairArray metadata = reader->metadataValues;
-            
-            // Extract ID3 tags
-            track.title = QString::fromStdString(metadata.getValue("TITLE", "").toStdString());
-            track.artist = QString::fromStdString(metadata.getValue("ARTIST", "").toStdString());
-            track.album = QString::fromStdString(metadata.getValue("ALBUM", "").toStdString());
-            track.genre = QString::fromStdString(metadata.getValue("GENRE", "").toStdString());
-            track.year = QString::fromStdString(metadata.getValue("YEAR", "").toStdString());
-            track.comment = QString::fromStdString(metadata.getValue("COMMENT", "").toStdString());
-            
-            // Try alternative tag names
-            if (track.title.isEmpty()) {
-                track.title = QString::fromStdString(metadata.getValue("TIT2", "").toStdString());
-            }
-            if (track.artist.isEmpty()) {
-                track.artist = QString::fromStdString(metadata.getValue("TPE1", "").toStdString());
-            }
-            if (track.album.isEmpty()) {
-                track.album = QString::fromStdString(metadata.getValue("TALB", "").toStdString());
-            }
-            if (track.genre.isEmpty()) {
-                track.genre = QString::fromStdString(metadata.getValue("TCON", "").toStdString());
-            }
-            if (track.year.isEmpty()) {
-                track.year = QString::fromStdString(metadata.getValue("TYER", "").toStdString());
-                if (track.year.isEmpty()) {
-                    track.year = QString::fromStdString(metadata.getValue("TDRC", "").toStdString());
-                }
-            }
-            
-            // Try to extract BPM
-            QString bpmStr = QString::fromStdString(metadata.getValue("BPM", "").toStdString());
-            if (bpmStr.isEmpty()) {
-                bpmStr = QString::fromStdString(metadata.getValue("TBPM", "").toStdString());
-            }
-            if (!bpmStr.isEmpty()) {
-                bool ok;
-                double bpm = bpmStr.toDouble(&ok);
-                if (ok && bpm > 0) {
-                    track.bpm = bpm;
-                }
-            }
-            
-            // Try to extract key
-            track.key = QString::fromStdString(metadata.getValue("KEY", "").toStdString());
-            if (track.key.isEmpty()) {
-                track.key = QString::fromStdString(metadata.getValue("TKEY", "").toStdString());
-            }
-        }
-        
-        // If we couldn't get title from metadata, use filename
-        if (track.title.isEmpty()) {
-            track.title = fileInfo.baseName();
-        }
-        
-    } catch (const std::exception& e) {
-        std::cout << "Error loading metadata for " << filePath.toStdString() << ": " << e.what() << std::endl;
-        // Set basic info from filename if metadata loading fails
-        QFileInfo fileInfo(filePath);
-        track.title = fileInfo.baseName();
-        track.fileSize = fileInfo.size();
+    TrackInfo track (filePath);
+    const QFileInfo fileInfo (filePath);
+    track.fileSize = fileInfo.size();
+    track.lastModified = fileInfo.lastModified().toSecsSinceEpoch();
+    if (track.addedAt == 0)
+    {
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        track.addedAt = now;
+        track.updatedAt = now;
     }
-    
+
+    const auto id3v1Tag = readId3v1Tag (filePath);
+
+    try
+    {
+        juce::File audioFile (filePath.toStdString());
+
+        if (audioFile.exists())
+        {
+            std::unique_ptr<juce::AudioFormatReader> reader;
+            {
+                AudioFormatManagerGuard formatGuard;
+                reader.reset(audioFormatManager->createReaderFor(audioFile));
+            }
+
+            if (reader)
+            {
+                if (reader->sampleRate > 0)
+                    {
+                        track.duration = reader->lengthInSamples / reader->sampleRate;
+                        track.trackLengthSeconds = track.duration;
+                    }
+
+                const auto metadataMap = buildMetadataLookup (reader->metadataValues);
+
+                const auto titleValue = metadataValueFor (metadataMap, { "title", "id3title", "tit2", "tt2", "tracktitle", "song", "name" });
+                if (! titleValue.isEmpty())
+                    track.title = titleValue;
+
+                QString artistValue = metadataValueFor (metadataMap, { "artist", "id3artist", "tpe1", "albumartist", "tpe2", "band", "orchestra", "performer", "leadartist" });
+                if (! artistValue.isEmpty())
+                    track.artist = artistValue;
+
+                const auto albumValue = metadataValueFor (metadataMap, { "album", "id3album", "talb", "record", "release", "albumtitle" });
+                if (! albumValue.isEmpty())
+                    track.album = albumValue;
+
+                const auto genreValue = metadataValueFor (metadataMap, { "genre", "id3genre", "tcon", "style", "category" });
+                if (! genreValue.isEmpty())
+                    track.genre = genreValue;
+
+                const auto yearValue = metadataValueFor (metadataMap, { "year", "tyer", "tdrc", "id3date", "date", "releasedate", "recordingtime" });
+                const auto parsedYear = extractYearString (yearValue);
+                if (! parsedYear.isEmpty())
+                    track.year = parsedYear;
+
+                const auto commentValue = metadataValueFor (metadataMap, { "comment", "id3comment", "comm", "description", "notes", "text" });
+                if (! commentValue.isEmpty())
+                    track.comment = commentValue;
+
+                const auto keyValue = metadataValueFor (metadataMap, { "key", "tkey", "initialkey", "initial key", "musickey", "keysig", "keysignature" });
+                if (! keyValue.isEmpty())
+                    track.key = keyValue;
+
+                const auto bpmValue = metadataValueFor (metadataMap, { "bpm", "tbpm", "tmpo", "tempo", "beatsperminute" });
+                const double bpm = parseBpmString (bpmValue);
+                if (bpm > 0.0)
+                    track.bpm = bpm;
+            }
+        }
+    }
+    catch (const std::exception& e)
+    {
+        qWarning() << "Error loading metadata for" << filePath << ":" << e.what();
+    }
+
+    applyId3v1Fallback (id3v1Tag, track);
+    applyFilenameHeuristics (fileInfo, track);
+    finaliseMetadata (fileInfo, track);
+
     return track;
 }
 
@@ -188,7 +496,17 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
             default: return QVariant();
         }
     } else if (role == Qt::ToolTipRole) {
-        return track->filePath;
+        QStringList tooltipLines;
+        tooltipLines << QStringLiteral("Title: %1").arg(track->getDisplayTitle());
+        tooltipLines << QStringLiteral("Artist: %1").arg(track->getDisplayArtist());
+        if (!track->album.isEmpty())      tooltipLines << QStringLiteral("Album: %1").arg(track->album);
+        if (!track->genre.isEmpty())      tooltipLines << QStringLiteral("Genre: %1").arg(track->genre);
+        if (!track->year.isEmpty())       tooltipLines << QStringLiteral("Year: %1").arg(track->year);
+        if (!track->key.isEmpty())        tooltipLines << QStringLiteral("Key: %1").arg(track->key);
+        if (track->bpm > 0.0)             tooltipLines << QStringLiteral("BPM: %1").arg(track->getBpmString());
+        if (!track->comment.isEmpty())    tooltipLines << QStringLiteral("Comment: %1").arg(track->comment);
+        tooltipLines << QStringLiteral("Path: %1").arg(track->filePath);
+        return tooltipLines.join(QLatin1Char('\n'));
     } else if (role == Qt::TextAlignmentRole) {
         // Right-align numeric-ish columns for readability
         switch (index.column()) {
@@ -282,9 +600,17 @@ QMimeData* LibraryTableModel::mimeData(const QModelIndexList& indexes) const
     return mimeData;
 }
 
-void LibraryTableModel::addTrack(const TrackInfo& track)
+void LibraryTableModel::addOrUpdateTrack(const TrackInfo& track)
 {
-    allTracks.push_back(track);
+    auto it = std::find_if(allTracks.begin(), allTracks.end(), [&track](const TrackInfo& existing) {
+        return existing.filePath.compare(track.filePath, Qt::CaseInsensitive) == 0;
+    });
+
+    if (it != allTracks.end())
+        *it = track;
+    else
+        allTracks.push_back(track);
+
     updateFilteredTracks();
 }
 
@@ -302,6 +628,18 @@ const TrackInfo* LibraryTableModel::getTrack(int row) const
         return filteredTracks[row];
     }
     return nullptr;
+}
+
+std::optional<TrackInfo> LibraryTableModel::findTrackByPath(const QString& filePath) const
+{
+    auto it = std::find_if(allTracks.begin(), allTracks.end(), [&filePath](const TrackInfo& track) {
+        return track.filePath.compare(filePath, Qt::CaseInsensitive) == 0;
+    });
+
+    if (it == allTracks.end())
+        return std::nullopt;
+
+    return *it;
 }
 
 void LibraryTableModel::setSortMode(SortMode mode, Qt::SortOrder order)
@@ -351,7 +689,10 @@ bool LibraryTableModel::matchesFilter(const TrackInfo& track) const
     return track.getDisplayTitle().toLower().contains(filterText) ||
            track.getDisplayArtist().toLower().contains(filterText) ||
            track.album.toLower().contains(filterText) ||
-           track.genre.toLower().contains(filterText);
+           track.genre.toLower().contains(filterText) ||
+           track.year.toLower().contains(filterText) ||
+           track.comment.toLower().contains(filterText) ||
+           track.key.toLower().contains(filterText);
 }
 
 bool LibraryTableModel::isLessThan(const TrackInfo* a, const TrackInfo* b) const
@@ -404,7 +745,7 @@ LibraryTableView::LibraryTableView(QWidget* parent)
     // Prefer the title column to get more space when window grows
     hh->setStretchLastSection(false);
     hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
-    hh->resizeSection(LibraryTableModel::TitleColumn, 560); // make title wider by default
+    hh->resizeSection(LibraryTableModel::TitleColumn, 480); // allow artist column to claim some space
     // Other columns keep their initial width but remain resizable by user
     for (int col = LibraryTableModel::ArtistColumn; col < LibraryTableModel::ColumnCount; ++col) {
         hh->setSectionResizeMode(col, QHeaderView::Interactive);
@@ -414,13 +755,13 @@ LibraryTableView::LibraryTableView(QWidget* parent)
     
     // Set column widths
     setColumnWidth(LibraryTableModel::TitleColumn, 560);
-    setColumnWidth(LibraryTableModel::ArtistColumn, 140);
-    setColumnWidth(LibraryTableModel::AlbumColumn, 120);
-    setColumnWidth(LibraryTableModel::DurationColumn, 60);
-    setColumnWidth(LibraryTableModel::BpmColumn, 50);
-    setColumnWidth(LibraryTableModel::GenreColumn, 80);
-    setColumnWidth(LibraryTableModel::YearColumn, 50);
-    setColumnWidth(LibraryTableModel::FileSizeColumn, 60);
+    setColumnWidth(LibraryTableModel::ArtistColumn, 180);
+    setColumnWidth(LibraryTableModel::AlbumColumn, 160);
+    setColumnWidth(LibraryTableModel::DurationColumn, 70);
+    setColumnWidth(LibraryTableModel::BpmColumn, 60);
+    setColumnWidth(LibraryTableModel::GenreColumn, 110);
+    setColumnWidth(LibraryTableModel::YearColumn, 60);
+    setColumnWidth(LibraryTableModel::FileSizeColumn, 70);
     setSortingEnabled(true);
     sortByColumn(LibraryTableModel::TitleColumn, Qt::AscendingOrder);
     setStyleSheet("QTableView { font-family: 'Lato', 'Arial', sans-serif; font-size: 13px; background: #181a1b; alternate-background-color: #222426; selection-background-color: #2d5aa0; border: none; gridline-color: #2a2d2e; } QHeaderView::section { font-weight: bold; font-size: 13px; background: #23272a; color: #e0e0e0; border: none; padding: 6px 4px; } QTableView::item { padding-left: 6px; padding-right: 6px; } QTableView::item:selected { color: #ffffff; } QTableView::item:hover { background: rgba(255,255,255,0.035); } ");
@@ -476,6 +817,15 @@ void LibraryTableView::mouseMoveEvent(QMouseEvent* event)
 LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget* parent)
     : QWidget(parent), audioFormatManager(formatManager), loaderThread(nullptr)
 {
+    initializeStoragePaths();
+
+    libraryDatabase = std::make_unique<LibraryDatabase>(this);
+    if (!libraryDatabase->open(libraryDatabasePath))
+    {
+        qWarning() << "Failed to open library database at" << libraryDatabasePath;
+        libraryDatabase.reset();
+    }
+
     setupUI();
     setupFileSystemModel();
     
@@ -484,6 +834,8 @@ LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget*
     filterUpdateTimer->setSingleShot(true);
     filterUpdateTimer->setInterval(300); // 300ms delay
     connect(filterUpdateTimer, &QTimer::timeout, this, &LibraryManager::onFilterTextChanged);
+
+    loadExistingTracks();
 }
 
 LibraryManager::~LibraryManager()
@@ -574,10 +926,17 @@ void LibraryManager::setupUI()
     actionAddFolder = new QAction(QIcon::fromTheme("folder-open"), "Add Folder", this);
     actionRefresh = new QAction(QIcon::fromTheme("view-refresh"), "Refresh", this);
     actionClearLibrary = new QAction(QIcon::fromTheme("edit-delete"), "Clear Library", this);
+    actionAnalyzeTrack = new QAction(QIcon::fromTheme("view-statistics"), tr("Analyze Track"), this);
+    actionAnalyzeTrack->setEnabled(false);
     connect(actionAddFiles, &QAction::triggered, this, &LibraryManager::onAddFilesClicked);
     connect(actionAddFolder, &QAction::triggered, this, &LibraryManager::onAddFolderClicked);
     connect(actionRefresh, &QAction::triggered, this, &LibraryManager::onRefreshClicked);
     connect(actionClearLibrary, &QAction::triggered, this, &LibraryManager::onClearLibraryClicked);
+    connect(actionAnalyzeTrack, &QAction::triggered, this, [this]() {
+        const QStringList selected = getSelectedFiles();
+        if (!selected.isEmpty())
+            emit analyzeTracksRequested(selected);
+    });
 
     auto addFilesBtn = new QToolButton(rightPanel); addFilesBtn->setDefaultAction(actionAddFiles); addFilesBtn->setToolTip("Add audio files");
     auto addFolderBtn = new QToolButton(rightPanel); addFolderBtn->setDefaultAction(actionAddFolder); addFolderBtn->setToolTip("Add folder");
@@ -636,10 +995,29 @@ void LibraryManager::setupUI()
     statusLayout->addWidget(statusLabel, 1);
     statusLayout->addWidget(progressBar);
     
+    analysisStatusLabel = new QLabel(tr("Analysis idle"), rightPanel);
+    analysisStatusLabel->setStyleSheet("QLabel { color: #a0a0a0; }");
+    analysisStatusLabel->setVisible(true);
+    analysisProgressBar = new QProgressBar(rightPanel);
+    analysisProgressBar->setRange(0, 100);
+    analysisProgressBar->setValue(0);
+    analysisProgressBar->setFormat(QStringLiteral("%p%"));
+    analysisProgressBar->setTextVisible(true);
+    analysisProgressBar->setEnabled(false);
+    analysisProgressBar->setVisible(true);
+    analysisProgressBar->setFixedHeight(12);
+
+    auto* analysisLayout = new QHBoxLayout();
+    analysisLayout->setContentsMargins(0, 0, 0, 0);
+    analysisLayout->setSpacing(8);
+    analysisLayout->addWidget(analysisStatusLabel, 1);
+    analysisLayout->addWidget(analysisProgressBar, 0);
+
     // Assemble right panel
     rightLayout->addLayout(topBarLayout);
     rightLayout->addWidget(tableView, 1);
     rightLayout->addLayout(statusLayout);
+    rightLayout->addLayout(analysisLayout);
     
     // Add panels to splitter
     mainSplitter->addWidget(leftPanel);
@@ -788,12 +1166,54 @@ void LibraryManager::clearLibrary()
     }
     
     model->clearTracks();
+    if (libraryDatabase)
+        libraryDatabase->removeAllTracks();
     updateStatusLabel();
 }
 
 void LibraryManager::onTrackLoaded(const TrackInfo& track)
 {
-    model->addTrack(track);
+    TrackInfo merged = track;
+
+    auto mergePersistedFields = [&merged](const TrackInfo& persisted) {
+        if (persisted.duration > 0.0 && merged.duration <= 0.0)
+            merged.duration = persisted.duration;
+        if (persisted.fileSize > 0 && merged.fileSize <= 0)
+            merged.fileSize = persisted.fileSize;
+        if (persisted.lastModified > 0)
+            merged.lastModified = persisted.lastModified;
+        if (persisted.addedAt > 0)
+            merged.addedAt = persisted.addedAt;
+
+        merged.analysisFailed = persisted.analysisFailed;
+        bool hasAnalysis = persisted.analyzedAt > 0 || persisted.bpm > 0.0 || !persisted.beatPositions.isEmpty();
+        if (hasAnalysis)
+        {
+            merged.analyzedAt = persisted.analyzedAt;
+            merged.analysisAlgorithm = persisted.analysisAlgorithm;
+            merged.bpm = persisted.bpm;
+            merged.firstBeatOffset = persisted.firstBeatOffset;
+            if (persisted.trackLengthSeconds > 0.0 && merged.trackLengthSeconds <= 0.0)
+                merged.trackLengthSeconds = persisted.trackLengthSeconds;
+            merged.beatPositions = persisted.beatPositions;
+        }
+
+        if (persisted.updatedAt > 0)
+            merged.updatedAt = persisted.updatedAt;
+    };
+
+    if (auto existing = model->findTrackByPath(track.filePath))
+    {
+        mergePersistedFields(*existing);
+    }
+    else if (libraryDatabase)
+    {
+        if (auto persisted = libraryDatabase->loadTrackByPath(track.filePath))
+            mergePersistedFields(*persisted);
+    }
+
+    model->addOrUpdateTrack(merged);
+    persistTrack(merged);
     updateStatusLabel();
 }
 
@@ -965,6 +1385,11 @@ void LibraryManager::onContextMenuRequested(const QPoint& pos)
 
     // Track-specific section only if a valid row under cursor
     QModelIndex index = tableView->indexAt(pos);
+    if (index.isValid() && tableView->selectionModel() && !tableView->selectionModel()->isSelected(index))
+    {
+        tableView->selectionModel()->select(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    }
+
     const TrackInfo* track = nullptr;
     if (index.isValid()) {
         track = model->getTrack(index.row());
@@ -985,7 +1410,13 @@ void LibraryManager::onContextMenuRequested(const QPoint& pos)
             emit loadToDeck(2, filePath);
         });
 
+        actionAnalyzeTrack->setEnabled(true);
+        menu.addAction(actionAnalyzeTrack);
         menu.addSeparator();
+    }
+    else
+    {
+        actionAnalyzeTrack->setEnabled(false);
     }
 
     menu.addAction(actionRefresh);
@@ -1013,13 +1444,13 @@ void LibraryManager::autoSizeColumnsInitial()
         int w = hh->sectionSize(col);
         if (w > maxWidth) hh->resizeSection(col, maxWidth);
     };
-    clamp(LibraryTableModel::ArtistColumn,   200);
-    clamp(LibraryTableModel::AlbumColumn,    200);
-    clamp(LibraryTableModel::DurationColumn, 70);
-    clamp(LibraryTableModel::BpmColumn,      60);
-    clamp(LibraryTableModel::GenreColumn,    140);
-    clamp(LibraryTableModel::YearColumn,     70);
-    clamp(LibraryTableModel::FileSizeColumn, 90);
+    clamp(LibraryTableModel::ArtistColumn,   260);
+    clamp(LibraryTableModel::AlbumColumn,    240);
+    clamp(LibraryTableModel::DurationColumn, 80);
+    clamp(LibraryTableModel::BpmColumn,      80);
+    clamp(LibraryTableModel::GenreColumn,    180);
+    clamp(LibraryTableModel::YearColumn,     80);
+    clamp(LibraryTableModel::FileSizeColumn, 110);
 
     // Restore resize modes: Title stretches, others interactive
     hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
@@ -1032,7 +1463,10 @@ void LibraryManager::autoSizeColumnsInitial()
 
 void LibraryManager::restoreColumnState()
 {
-    QSettings s("PulseDJ-X", "Library");
+    if (libraryUiStatePath.isEmpty()) {
+        return;
+    }
+    QSettings s(libraryUiStatePath, QSettings::IniFormat);
     QByteArray headerState = s.value("library/headerState").toByteArray();
     if (!headerState.isEmpty()) {
         tableView->horizontalHeader()->restoreState(headerState);
@@ -1041,7 +1475,178 @@ void LibraryManager::restoreColumnState()
 
 void LibraryManager::saveColumnState()
 {
-    if (!tableView) return;
-    QSettings s("PulseDJ-X", "Library");
+    if (!tableView || libraryUiStatePath.isEmpty()) return;
+    QSettings s(libraryUiStatePath, QSettings::IniFormat);
     s.setValue("library/headerState", tableView->horizontalHeader()->saveState());
+}
+
+void LibraryManager::initializeStoragePaths()
+{
+    auto& config = AppConfig::instance();
+    config.createDirectories();
+    libraryDatabasePath = config.getLibraryDatabasePath();
+    libraryXmlBackupPath = config.getLibraryXmlBackupPath();
+    libraryUiStatePath = config.getUiStatePath("library_ui.ini");
+
+    qDebug() << "LibraryManager storage initialized:";
+    qDebug() << "  App data root:" << config.getAppDataDirectory();
+    qDebug() << "  Library database:" << libraryDatabasePath;
+    qDebug() << "  Legacy XML backup:" << libraryXmlBackupPath;
+    qDebug() << "  UI state file:" << libraryUiStatePath;
+}
+
+void LibraryManager::loadExistingTracks()
+{
+    if (!libraryDatabase || !model)
+        return;
+
+    const QVector<TrackInfo> tracks = libraryDatabase->loadAllTracks();
+    if (tracks.isEmpty())
+        return;
+
+    for (const auto& track : tracks)
+        model->addOrUpdateTrack(track);
+
+    updateStatusLabel();
+    autoSizeColumnsInitial();
+}
+
+void LibraryManager::persistTrack(const TrackInfo& track)
+{
+    if (!libraryDatabase)
+        return;
+
+    if (!libraryDatabase->upsertTrack(track))
+        qWarning() << "Failed to persist track metadata for" << track.filePath;
+}
+
+void LibraryManager::applyAnalysisResult(const QString& filePath,
+                                         double bpm,
+                                         double firstBeatOffset,
+                                         double trackLengthSeconds,
+                                         const QVector<double>& beatPositions,
+                                         const QString& algorithm,
+                                         bool analysisFailed)
+{
+    if (!model)
+        return;
+
+    TrackInfo updated(filePath);
+
+    if (auto existing = model->findTrackByPath(filePath))
+    {
+        updated = *existing;
+    }
+    else
+    {
+        QFileInfo info(filePath);
+        updated.title = info.baseName();
+        updated.fileSize = info.exists() ? info.size() : 0;
+        updated.lastModified = info.exists() ? info.lastModified().toSecsSinceEpoch() : 0;
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        updated.addedAt = now;
+        updated.updatedAt = now;
+        if (updated.duration <= 0.0 && trackLengthSeconds > 0.0)
+            updated.duration = trackLengthSeconds;
+        if (updated.trackLengthSeconds <= 0.0)
+            updated.trackLengthSeconds = updated.duration;
+    }
+
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    updated.bpm = bpm > 0.0 ? bpm : 0.0;
+    updated.firstBeatOffset = firstBeatOffset;
+    if (trackLengthSeconds > 0.0)
+    {
+        updated.trackLengthSeconds = trackLengthSeconds;
+        if (updated.duration <= 0.0)
+            updated.duration = trackLengthSeconds;
+    }
+    updated.beatPositions = beatPositions;
+    updated.analysisAlgorithm = algorithm;
+    updated.analysisFailed = analysisFailed || bpm <= 0.0;
+    updated.analyzedAt = now;
+    updated.updatedAt = now;
+
+    model->addOrUpdateTrack(updated);
+    persistTrack(updated);
+    updateStatusLabel();
+}
+
+void LibraryManager::notifyAnalysisStarted(const QString& filePath)
+{
+    if (filePath.isEmpty())
+        return;
+
+    activeAnalyses.insert(filePath, 0.0);
+    updateAnalysisUi();
+}
+
+void LibraryManager::notifyAnalysisProgress(const QString& filePath, double progress)
+{
+    if (!activeAnalyses.contains(filePath))
+        return;
+
+    const double clamped = std::clamp(progress, 0.0, 1.0);
+    activeAnalyses[filePath] = clamped;
+    updateAnalysisUi();
+}
+
+void LibraryManager::notifyAnalysisFinished(const QString& filePath, bool success)
+{
+    if (activeAnalyses.remove(filePath) > 0)
+        ++analysesCompleted;
+
+    if (analysisStatusLabel && activeAnalyses.isEmpty())
+    {
+        const QString fileName = QFileInfo(filePath).fileName();
+        if (success)
+            analysisStatusLabel->setText(QStringLiteral("Analysis finished for %1").arg(fileName));
+        else
+            analysisStatusLabel->setText(QStringLiteral("Analysis failed for %1").arg(fileName));
+    }
+
+    updateAnalysisUi();
+}
+
+void LibraryManager::updateAnalysisUi()
+{
+    if (!analysisProgressBar || !analysisStatusLabel)
+        return;
+
+    analysisProgressBar->setVisible(true);
+    analysisStatusLabel->setVisible(true);
+
+    if (activeAnalyses.isEmpty())
+    {
+        analysisProgressBar->setEnabled(false);
+        analysisProgressBar->setRange(0, 100);
+        analysisProgressBar->setValue(0);
+
+        const QString currentText = analysisStatusLabel->text();
+        if (currentText.trimmed().isEmpty() || currentText.startsWith(QStringLiteral("Analyzing")))
+            analysisStatusLabel->setText(QStringLiteral("Analysis idle"));
+
+        analysesCompleted = 0;
+        return;
+    }
+
+    analysisProgressBar->setEnabled(true);
+
+    double sum = 0.0;
+    for (auto it = activeAnalyses.cbegin(); it != activeAnalyses.cend(); ++it)
+        sum += it.value();
+
+    const int activeCount = activeAnalyses.size();
+    const double average = activeCount > 0 ? sum / static_cast<double>(activeCount) : 0.0;
+    analysisProgressBar->setRange(0, 100);
+    analysisProgressBar->setValue(static_cast<int>(std::round(average * 100.0)));
+
+    const int totalTasks = analysesCompleted + activeCount;
+    const QString labelText = QStringLiteral("Analyzing %1 track%2 (%3/%4 done)")
+                                  .arg(activeCount)
+                                  .arg(activeCount == 1 ? QString() : QStringLiteral("s"))
+                                  .arg(analysesCompleted)
+                                  .arg(std::max(totalTasks, 1));
+
+    analysisStatusLabel->setText(labelText);
 }

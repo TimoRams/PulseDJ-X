@@ -70,7 +70,7 @@ public:
     
     // Lade alle Deck-Settings - NUR KEYLOCK UND QUANTIZE
     void loadSettings() {
-        QString settingsPath = AppConfig::instance().getConfigDirectory() + "/deck_settings.ini";
+    QString settingsPath = AppConfig::instance().getDeckSettingsPath();
         QSettings settings(settingsPath, QSettings::IniFormat);
         
         // Deck A laden - NUR keylock und quantize
@@ -97,7 +97,7 @@ public:
         // Stelle sicher, dass Config-Verzeichnis existiert
         AppConfig::instance().createDirectories();
         
-        QString settingsPath = AppConfig::instance().getConfigDirectory() + "/deck_settings.ini";
+    QString settingsPath = AppConfig::instance().getDeckSettingsPath();
         QSettings settings(settingsPath, QSettings::IniFormat);
         
         // Lösche alte Settings komplett für saubere Neuanlage
@@ -207,7 +207,7 @@ public:
         deckB = DeckConfig(); // Default constructor - alle Werte auf Standard
         
         // Lösche alle gespeicherten Settings
-        QString settingsPath = AppConfig::instance().getConfigDirectory() + "/deck_settings.ini";
+    QString settingsPath = AppConfig::instance().getDeckSettingsPath();
         QSettings settings(settingsPath, QSettings::IniFormat);
         settings.clear();
         

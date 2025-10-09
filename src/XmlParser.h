@@ -43,7 +43,7 @@ public:
     
     // Persistente Daten im konfigurierten Library-Verzeichnis
     inline static std::string getPersistentDataFilePath() {
-        return AppConfig::instance().getLibraryDatabasePath().toStdString();
+        return AppConfig::instance().getLibraryXmlBackupPath().toStdString();
     }
     
     // Legacy compatibility - deprecated, use methods above
