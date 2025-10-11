@@ -64,6 +64,7 @@ class QtMainWindow : public QWidget {
     
     // Forward declaration and friend class for threaded BPM analysis
     friend class BpmAnalysisTask;
+    friend class TopWaveformDisplayTask;
     
 public:
     explicit QtMainWindow(QWidget* parent = nullptr);
@@ -78,6 +79,7 @@ private slots:
     void initializeAudio();
     void onLibraryLoadToDeck(int deckIndex, const QString& filePath); // new slot
     void onAnalyzeTracksRequested(const QStringList& filePaths);
+    void onAnalyzeTracksAdvancedRequested(const QStringList& filePaths, double minBpm, double maxBpm);
     // EQ/filter slots
     void onLeftHighChanged(int v);
     void onLeftMidChanged(int v);
@@ -177,6 +179,18 @@ private:
     bool scratchWasPlayingA{false};
     bool scratchWasPlayingB{false};
     // Sync state (follower flags): if true, that deck follows the other deck's tempo
+
+    // Scratch inertia handling per deck
+    QTimer* scratchInertiaTimerA{nullptr};
+    QTimer* scratchInertiaTimerB{nullptr};
+    double scratchInertiaVelocityA{0.0};
+    double scratchInertiaVelocityB{0.0};
+    double scratchInertiaElapsedA{0.0};
+    double scratchInertiaElapsedB{0.0};
+    bool scratchInertiaActiveA{false};
+    bool scratchInertiaActiveB{false};
+    bool scratchInertiaResumeA{false};
+    bool scratchInertiaResumeB{false};
     bool syncAEnabled{false};
     bool syncBEnabled{false};
     // Prevent sync feedback loops
@@ -190,6 +204,9 @@ private:
     // Window drag functionality for frameless window
     bool isDragging{false};
     QPoint dragStartPosition;
+
+    bool shouldAnalyzeTrackOnLoad(const QString& filePath) const;
+    void startDeckAnalysisIfNeeded(const QString& filePath, bool isDeckA);
     
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -212,4 +229,13 @@ private:
     // BetaPulseX: Deck Settings Management
     void applyDeckSettings();       // Wendet geladene Settings auf die Decks an
     void connectDeckSettings();     // Verbindet Deck-Controls mit Settings-System
+    void applyStoredCuePoints(QtDeckWidget* deck, bool isDeckA);
+    void applyStoredBeatGrid(QtDeckWidget* deck, bool isDeckA);
+    void reapplyStoredDeckMetadata(bool isDeckA);
+
+    // Scratch helper routines
+    void applyScratchPosition(bool isDeckA, double absRel);
+    void startScratchInertia(bool isDeckA, double initialVelocity, bool resumePlayback);
+    void stopScratchInertia(bool isDeckA, bool resumePlayback);
+    void handleScratchInertiaTick(bool isDeckA);
 };

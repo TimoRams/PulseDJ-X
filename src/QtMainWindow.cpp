@@ -10,6 +10,7 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -18,6 +19,9 @@
 #include <QRegularExpression>
 #include <QVector>
 #include <QProgressDialog>
+#include <array>
+#include <algorithm>
+#include <cmath>
 
 // StereoAudioCallback - Main JUCE audio callback method
 void StereoAudioCallback::audioDeviceIOCallback(const float* const* inputChannelData, int numInputChannels,
@@ -281,8 +285,13 @@ class BpmAnalysisTask : public QRunnable {
 public:
     enum class Target { DeckA, DeckB, LibraryOnly };
 
-    BpmAnalysisTask(QtMainWindow* mainWindow, juce::File file, Target target)
-        : window(mainWindow), audioFile(std::move(file)), target(target)
+    BpmAnalysisTask(QtMainWindow* mainWindow, juce::File file, Target target,
+                    double minBpm = 40.0, double maxBpm = 260.0)
+        : window(mainWindow),
+          audioFile(std::move(file)),
+          target(target),
+          minBpm(std::min(minBpm, maxBpm)),
+          maxBpm(std::max(minBpm, maxBpm))
     {
         setAutoDelete(true);
     }
@@ -416,7 +425,18 @@ public:
                 }, Qt::QueuedConnection);
             };
 
-            double bpm = window->bpmAnalyzer->analyzeFile(audioFile, 120.0, &beatsSec, &totalSec, &algorithm, &firstBeatOffset, progressCb, errorCb);
+            const double minRange = std::clamp(minBpm, 30.0, 400.0);
+            const double maxRange = std::clamp(maxBpm, std::max(minRange + 1.0, 30.5), 420.0);
+            double bpm = window->bpmAnalyzer->analyzeFile(audioFile,
+                                                          120.0,
+                                                          &beatsSec,
+                                                          &totalSec,
+                                                          &algorithm,
+                                                          &firstBeatOffset,
+                                                          progressCb,
+                                                          errorCb,
+                                                          minRange,
+                                                          maxRange);
 
             if (auto windowRaw = wptr.data()) {
                 QMetaObject::invokeMethod(windowRaw, [wptr, deckTask, deckIsA, displayName, bpm, beatsSec, totalSec, algorithm, firstBeatOffset, filePath]() {
@@ -466,6 +486,24 @@ public:
                                                                          beatVector,
                                                                          QString::fromStdString(algorithm),
                                                                          bpm <= 0.0);
+
+                            bool reAppliedToDeck = false;
+                            if (window->deckA && window->deckA->getCurrentFilePath() == filePath)
+                            {
+                                window->reapplyStoredDeckMetadata(true);
+                                reAppliedToDeck = true;
+                            }
+                            if (window->deckB && window->deckB->getCurrentFilePath() == filePath)
+                            {
+                                window->reapplyStoredDeckMetadata(false);
+                                reAppliedToDeck = true;
+                            }
+
+                            if (reAppliedToDeck)
+                            {
+                                window->setStatusTip(QStringLiteral("Reapplied analysis to loaded deck: %1")
+                                                         .arg(displayName));
+                            }
                         }
 
                         if (window->libraryManager)
@@ -516,6 +554,8 @@ private:
     QPointer<QtMainWindow> window;
     juce::File audioFile;
     Target target;
+    double minBpm;
+    double maxBpm;
 };
 
 // NEW: Background task to generate WaveformDisplay data without blocking UI
@@ -550,7 +590,11 @@ public:
                 if (!deck) return;
                 if (deck->getCurrentFilePath() != filePath) return;
                 WaveformDisplay* wf = onDeckA ? w->overviewTopA : w->overviewTopB;
-                if (wf) wf->setSourceBins(*maxBins, *minBins, audioStart, lengthSec);
+                if (wf)
+                {
+                    wf->setSourceBins(*maxBins, *minBins, audioStart, lengthSec);
+                    w->reapplyStoredDeckMetadata(onDeckA);
+                }
             }, Qt::QueuedConnection);
         } catch (...) {
             // Ignore errors; overview is non-critical
@@ -648,6 +692,164 @@ void QtMainWindow::onLibraryLoadToDeck(int deckIndex, const QString& filePath)
     }
 }
 
+void QtMainWindow::applyStoredCuePoints(QtDeckWidget* deck, bool isDeckA)
+{
+    if (!deck)
+        return;
+
+    auto* pads = deck->getPerformancePads();
+    if (!pads)
+        return;
+
+    DeckWaveformOverview* deckWaveform = deck->getWaveform();
+    WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB;
+
+    if (!libraryManager)
+    {
+        pads->clearAllCuePoints(false);
+        if (deckWaveform)
+            deckWaveform->clearCuePoints();
+        if (overview)
+            overview->clearCuePoints();
+        return;
+    }
+
+    const QString filePath = deck->getCurrentFilePath();
+    if (filePath.isEmpty())
+    {
+        pads->clearAllCuePoints(false);
+        if (deckWaveform)
+            deckWaveform->clearCuePoints();
+        if (overview)
+            overview->clearCuePoints();
+        return;
+    }
+
+    auto storedCues = libraryManager->getCuePointsForTrack(filePath);
+    if (storedCues)
+    {
+        pads->applyCuePoints(*storedCues);
+    }
+    else
+    {
+        pads->clearAllCuePoints();
+        if (deckWaveform)
+            deckWaveform->clearCuePoints();
+        if (overview)
+            overview->clearCuePoints();
+    }
+}
+
+void QtMainWindow::applyStoredBeatGrid(QtDeckWidget* deck, bool isDeckA)
+{
+    if (!deck || !libraryManager)
+        return;
+
+    const QString filePath = deck->getCurrentFilePath();
+    if (filePath.isEmpty())
+        return;
+
+    auto trackInfo = libraryManager->getTrackInfo(filePath);
+    if (!trackInfo)
+        return;
+
+    const TrackInfo& track = *trackInfo;
+    const bool hasBpm = track.bpm > 0.0;
+    const bool hasBeats = !track.beatPositions.isEmpty();
+    const bool hasAnalysisData = hasBpm || hasBeats;
+    if (!hasAnalysisData)
+        return;
+
+    double trackLength = track.trackLengthSeconds > 0.0 ? track.trackLengthSeconds : track.duration;
+    if (trackLength <= 0.0)
+    {
+        if (auto* player = isDeckA ? playerA : playerB)
+            trackLength = player->getLengthInSeconds();
+    }
+
+    if (trackLength <= 0.0)
+        return;
+
+    QVector<double> relativeBeats;
+    if (hasBeats)
+    {
+        relativeBeats.reserve(track.beatPositions.size());
+        for (double beatSec : track.beatPositions)
+        {
+            const double rel = beatSec / trackLength;
+            relativeBeats.append(std::clamp(rel, 0.0, 1.0));
+        }
+    }
+
+    if (auto* deckWaveform = deck->getWaveform())
+        deckWaveform->setBeatInfo(track.bpm, track.firstBeatOffset, trackLength);
+
+    deck->setDetectedBpm(track.bpm);
+
+    if (auto* player = isDeckA ? playerA : playerB)
+        player->setBeatInfo(track.bpm, track.firstBeatOffset, trackLength);
+
+    if (WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB)
+    {
+        overview->setOriginalBpm(track.bpm, trackLength);
+        overview->setBeatInfo(track.bpm, track.firstBeatOffset, trackLength);
+        overview->setAnalysisActive(false);
+        overview->setAnalysisFailed(track.analysisFailed);
+        overview->setAnalysisProgress(hasAnalysisData ? 1.0 : 0.0);
+        if (!relativeBeats.isEmpty())
+            overview->setBeats(relativeBeats);
+        else
+            overview->refreshBeatGrid();
+    }
+
+    if (beatIndicator)
+    {
+        if (isDeckA)
+        {
+            beatIndicator->setBpmDeckA(track.bpm);
+            beatIndicator->setFirstBeatOffsetDeckA(track.firstBeatOffset);
+            beatIndicator->setBeatGridAvailableDeckA(hasBeats || hasBpm);
+        }
+        else
+        {
+            beatIndicator->setBpmDeckB(track.bpm);
+            beatIndicator->setFirstBeatOffsetDeckB(track.firstBeatOffset);
+            beatIndicator->setBeatGridAvailableDeckB(hasBeats || hasBpm);
+        }
+    }
+
+    if (isDeckA)
+    {
+        algorithmA = track.analysisAlgorithm;
+        analysisActiveA = false;
+        analysisFailedA = track.analysisFailed;
+        analysisProgressA = hasAnalysisData ? 1.0 : 0.0;
+    }
+    else
+    {
+        algorithmB = track.analysisAlgorithm;
+        analysisActiveB = false;
+        analysisFailedB = track.analysisFailed;
+        analysisProgressB = hasAnalysisData ? 1.0 : 0.0;
+    }
+
+    updateOverviewLabel(isDeckA);
+}
+
+void QtMainWindow::reapplyStoredDeckMetadata(bool isDeckA)
+{
+    QtDeckWidget* deck = isDeckA ? deckA : deckB;
+    if (!deck)
+        return;
+
+    const QString filePath = deck->getCurrentFilePath();
+    if (filePath.isEmpty())
+        return;
+
+    applyStoredBeatGrid(deck, isDeckA);
+    applyStoredCuePoints(deck, isDeckA);
+}
+
 void QtMainWindow::onAnalyzeTracksRequested(const QStringList& filePaths)
 {
     if (filePaths.isEmpty() || !bpmThreadPool)
@@ -667,6 +869,31 @@ void QtMainWindow::onAnalyzeTracksRequested(const QStringList& filePaths)
         }
 
         bpmThreadPool->start(new BpmAnalysisTask(this, file, BpmAnalysisTask::Target::LibraryOnly));
+    }
+}
+
+void QtMainWindow::onAnalyzeTracksAdvancedRequested(const QStringList& filePaths, double minBpm, double maxBpm)
+{
+    if (filePaths.isEmpty() || !bpmThreadPool)
+        return;
+
+    if (!bpmAnalyzer)
+        bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
+
+    const double minClamped = std::clamp(minBpm, 30.0, 400.0);
+    const double maxClamped = std::clamp(maxBpm, minClamped + 1.0, 420.0);
+
+    for (const QString& path : filePaths)
+    {
+        juce::File file(path.toStdString());
+        if (!file.existsAsFile())
+        {
+            if (libraryManager)
+                libraryManager->notifyAnalysisFinished(path, false);
+            continue;
+        }
+
+        bpmThreadPool->start(new BpmAnalysisTask(this, file, BpmAnalysisTask::Target::LibraryOnly, minClamped, maxClamped));
     }
 }
 
@@ -775,115 +1002,79 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     // Scratch interactions for overview waveforms - proper vinyl-style scratching
     connect(overviewTopA, &WaveformDisplay::scratchStart, this, [this]() {
         if (!playerA) return;
-        // Remember previous state, but ensure audio flows during scratching
-        scratchWasPlayingA = playerA->isPlaying();
+        if (scratchInertiaActiveA) {
+            stopScratchInertia(true, scratchInertiaResumeA);
+        }
+        const bool wasAudible = playerA->isAudible();
+        scratchWasPlayingA = wasAudible;
         playerA->enableScratch(true);
-        if (!playerA->isPlaying()) {
-            playerA->start(); // start transport so scratch audio is audible
+        if (!wasAudible) {
+            playerA->ensureScratchAudible();
         }
     });
     connect(overviewTopA, &WaveformDisplay::scratchMove, this, [this](double absRel) {
-        if (!playerA) return;
-        // PREROLL SUPPORT: Allow unlimited negative positions for DJ cueing
-        // Remove clamping to allow preroll positions
-        absRel = std::min(1.0, absRel); // Only clamp maximum, allow unlimited negative
-        // Update ONLY Deck A audio player - no cross-deck interference
-        playerA->setPositionRelative(absRel);
-        // Update ONLY Deck A waveform to stay in sync - no cross-deck updates
-        if (deckA && deckA->getWaveform()) {
-            deckA->getWaveform()->setPlayhead(absRel);
-        }
-        // Update ONLY Deck A beat indicator and platter - completely independent
-        if (beatIndicator && playerA && deckA) {
-            double lenSec = std::max(1e-9, playerA->getLengthInSeconds());
-            constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
-            double seconds = (absRel < 0.0) ? (absRel * prerollSec) : (absRel * lenSec);
-            beatIndicator->setTrackPositionDeckA(seconds);
-            deckA->setPlatterSeconds(seconds);
-        }
+        applyScratchPosition(true, absRel);
     });
     connect(overviewTopA, &WaveformDisplay::scratchVelocityChanged, this, [this](double velocity) {
         if (!playerA) return;
         playerA->setScratchVelocity(velocity);
     });
     connect(overviewTopA, &WaveformDisplay::scratchEnd, this, [this]() {
-        if (!playerA) return;
-        
-        // Mark exact scratch end time for timer system
+        if (!playerA || !overviewTopA) return;
+
         lastScratchEndA = QDateTime::currentMSecsSinceEpoch();
-        
-        // IMPORTANT: Don't change position when ending scratch - stay where we are
-        playerA->enableScratch(false);
+
+        double releaseVelocity = overviewTopA->getLastScratchVelocity();
         playerA->setScratchVelocity(0.0);
-        // Restore prior play state WITHOUT changing position
+
         if (scratchWasPlayingA) {
-            // keep playing if it was playing before
-            if (!playerA->isPlaying()) {
-                playerA->start();
+            playerA->enableScratch(false);
+            if (!playerA->isAudible()) {
+                playerA->ensureScratchAudible();
             }
+            scratchInertiaResumeA = true;
         } else {
-            // Only stop if it wasn't playing before AND it's currently playing
-            if (playerA->isPlaying()) {
-                // Don't call stop() as it might reset position - use pause instead
-                // Actually, just leave it playing to avoid position jumps
-            }
+            scratchInertiaResumeA = false;
+            startScratchInertia(true, releaseVelocity, false);
         }
     });
 
     connect(overviewTopB, &WaveformDisplay::scratchStart, this, [this]() {
         if (!playerB) return;
-        // Remember previous state, but ensure audio flows during scratching
-        scratchWasPlayingB = playerB->isPlaying();
+        if (scratchInertiaActiveB) {
+            stopScratchInertia(false, scratchInertiaResumeB);
+        }
+        const bool wasAudible = playerB->isAudible();
+        scratchWasPlayingB = wasAudible;
         playerB->enableScratch(true);
-        if (!playerB->isPlaying()) {
-            playerB->start(); // start transport so scratch audio is audible
+        if (!wasAudible) {
+            playerB->ensureScratchAudible();
         }
     });
     connect(overviewTopB, &WaveformDisplay::scratchMove, this, [this](double absRel) {
-        if (!playerB) return;
-        // PREROLL SUPPORT: Allow unlimited negative positions for DJ cueing
-        // Remove clamping to allow preroll positions
-        absRel = std::min(1.0, absRel); // Only clamp maximum, allow unlimited negative
-        // Update ONLY Deck B audio player - no cross-deck interference
-        playerB->setPositionRelative(absRel);
-        // Update ONLY Deck B waveform to stay in sync - no cross-deck updates
-        if (deckB && deckB->getWaveform()) {
-            deckB->getWaveform()->setPlayhead(absRel);
-        }
-        // Update ONLY Deck B beat indicator and platter - completely independent
-        if (beatIndicator && playerB && deckB) {
-            double lenSec = std::max(1e-9, playerB->getLengthInSeconds());
-            constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
-            double seconds = (absRel < 0.0) ? (absRel * prerollSec) : (absRel * lenSec);
-            beatIndicator->setTrackPositionDeckB(seconds);
-            deckB->setPlatterSeconds(seconds);
-        }
+        applyScratchPosition(false, absRel);
     });
     connect(overviewTopB, &WaveformDisplay::scratchVelocityChanged, this, [this](double velocity) {
         if (!playerB) return;
         playerB->setScratchVelocity(velocity);
     });
     connect(overviewTopB, &WaveformDisplay::scratchEnd, this, [this]() {
-        if (!playerB) return;
-        
-        // Mark exact scratch end time for timer system
+        if (!playerB || !overviewTopB) return;
+
         lastScratchEndB = QDateTime::currentMSecsSinceEpoch();
-        
-        // IMPORTANT: Don't change position when ending scratch - stay where we are
-        playerB->enableScratch(false);
+
+        double releaseVelocity = overviewTopB->getLastScratchVelocity();
         playerB->setScratchVelocity(0.0);
-        // Restore prior play state WITHOUT changing position
+
         if (scratchWasPlayingB) {
-            // keep playing if it was playing before
-            if (!playerB->isPlaying()) {
-                playerB->start();
+            playerB->enableScratch(false);
+            if (!playerB->isAudible()) {
+                playerB->ensureScratchAudible();
             }
+            scratchInertiaResumeB = true;
         } else {
-            // Only stop if it wasn't playing before AND it's currently playing
-            if (playerB->isPlaying()) {
-                // Don't call stop() as it might reset position - use pause instead
-                // Actually, just leave it playing to avoid position jumps
-            }
+            scratchInertiaResumeB = false;
+            startScratchInertia(false, releaseVelocity, false);
         }
     });
 
@@ -903,17 +1094,30 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
         // When deck files load, forward to overview waveforms and reset position
+    connect(deckA, &QtDeckWidget::fileLoadingStarted, this, [this](const QString&) {
+        if (overviewTopA)
+            overviewTopA->clearCuePoints();
+    });
+
     connect(deckA, &QtDeckWidget::fileLoaded, [this]() {
         QString filePath = deckA->getCurrentFilePath();
         if (!filePath.isEmpty()) {
             // PERFORMANCE FIX: Generate top overview waveform in background
             bpmThreadPool->start(new TopWaveformDisplayTask(this, filePath, true));
             
-            // Start BPM analysis asynchronously using thread pool
-            if (!bpmAnalyzer) bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
-            juce::File f(filePath.toStdString());
-            bpmThreadPool->start(new BpmAnalysisTask(this, f, BpmAnalysisTask::Target::DeckA));
+            // Start BPM analysis only if stored metadata isn't usable
+            startDeckAnalysisIfNeeded(filePath, true);
         }
+    });
+
+    connect(deckA, &QtDeckWidget::fileLoaded, this, [this]() {
+        applyStoredCuePoints(deckA, true);
+        applyStoredBeatGrid(deckA, true);
+    });
+
+    connect(deckB, &QtDeckWidget::fileLoadingStarted, this, [this](const QString&) {
+        if (overviewTopB)
+            overviewTopB->clearCuePoints();
     });
 
     connect(deckB, &QtDeckWidget::fileLoaded, [this]() {
@@ -922,11 +1126,14 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             // Generate top overview waveform in background immediately (waveform visible)
             bpmThreadPool->start(new TopWaveformDisplayTask(this, filePath, false));
 
-            // Start BPM analysis asynchronously using thread pool for Deck B (beat grid later)
-            if (!bpmAnalyzer) bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
-            juce::File f(filePath.toStdString());
-            bpmThreadPool->start(new BpmAnalysisTask(this, f, BpmAnalysisTask::Target::DeckB));
+            // Start BPM analysis only if stored metadata isn't usable
+            startDeckAnalysisIfNeeded(filePath, false);
         }
+    });
+
+    connect(deckB, &QtDeckWidget::fileLoaded, this, [this]() {
+        applyStoredCuePoints(deckB, false);
+        applyStoredBeatGrid(deckB, false);
     });
 
     // Clear visuals and indicator when a deck unloads
@@ -1036,9 +1243,25 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     // Connect cue points from performance pads to top waveform displays
     if (deckA->getPerformancePads()) {
         connect(deckA->getPerformancePads(), &PerformancePads::cuePointsChanged, overviewTopA, &WaveformDisplay::setCuePoints);
+        connect(deckA->getPerformancePads(), &PerformancePads::cuePointsChanged, this, [this](const std::array<double, 8>& cues){
+            if (!libraryManager || !deckA)
+                return;
+            const QString filePath = deckA->getCurrentFilePath();
+            if (filePath.isEmpty())
+                return;
+            libraryManager->saveCuePointsForTrack(filePath, cues);
+        });
     }
     if (deckB->getPerformancePads()) {
         connect(deckB->getPerformancePads(), &PerformancePads::cuePointsChanged, overviewTopB, &WaveformDisplay::setCuePoints);
+        connect(deckB->getPerformancePads(), &PerformancePads::cuePointsChanged, this, [this](const std::array<double, 8>& cues){
+            if (!libraryManager || !deckB)
+                return;
+            const QString filePath = deckB->getCurrentFilePath();
+            if (filePath.isEmpty())
+                return;
+            libraryManager->saveCuePointsForTrack(filePath, cues);
+        });
     }
     
     // Connect cue points from performance pads to deck waveform overviews
@@ -1254,6 +1477,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     // Explicit context-menu deck loading
     connect(libraryManager, &LibraryManager::loadToDeck, this, &QtMainWindow::onLibraryLoadToDeck);
     connect(libraryManager, &LibraryManager::analyzeTracksRequested, this, &QtMainWindow::onAnalyzeTracksRequested);
+    connect(libraryManager, &LibraryManager::analyzeTracksAdvancedRequested, this, &QtMainWindow::onAnalyzeTracksAdvancedRequested);
     
     // Auto-populate with user's Music folder on startup
     QTimer::singleShot(500, this, [this]() {
@@ -1515,6 +1739,125 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         
         qDebug() << "BetaPulseX: All deck settings loaded successfully";
     }
+}
+
+bool QtMainWindow::shouldAnalyzeTrackOnLoad(const QString& filePath) const
+{
+    if (filePath.isEmpty())
+        return false;
+
+    if (!libraryManager)
+        return true;
+
+    auto trackInfo = libraryManager->getTrackInfo(filePath);
+    if (!trackInfo)
+        return true;
+
+    const TrackInfo& track = *trackInfo;
+
+    if (track.analysisFailed)
+        return true;
+
+    if (!track.hasBeatGrid())
+        return true;
+
+    if (track.bpm <= 0.0)
+        return true;
+
+    QFileInfo fileInfo(filePath);
+    if (fileInfo.exists())
+    {
+        const qint64 currentModified = fileInfo.lastModified().toSecsSinceEpoch();
+        if (currentModified > 0 && track.lastModified > 0 && currentModified != track.lastModified)
+            return true;
+    }
+
+    return false;
+}
+
+void QtMainWindow::startDeckAnalysisIfNeeded(const QString& filePath, bool isDeckA)
+{
+    if (filePath.isEmpty())
+        return;
+
+    const bool needsAnalysis = shouldAnalyzeTrackOnLoad(filePath);
+
+    if (!needsAnalysis)
+    {
+        bool appliedFromLibrary = false;
+        if (libraryManager)
+        {
+            if (auto info = libraryManager->getTrackInfo(filePath))
+            {
+                if (isDeckA)
+                {
+                    algorithmA = info->analysisAlgorithm;
+                    analysisFailedA = info->analysisFailed;
+                    analysisProgressA = 1.0;
+                }
+                else
+                {
+                    algorithmB = info->analysisAlgorithm;
+                    analysisFailedB = info->analysisFailed;
+                    analysisProgressB = 1.0;
+                }
+
+                if (QtDeckWidget* deck = isDeckA ? deckA : deckB)
+                {
+                    applyStoredBeatGrid(deck, isDeckA);
+                    applyStoredCuePoints(deck, isDeckA);
+                }
+
+                appliedFromLibrary = true;
+            }
+        }
+
+        if (WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB)
+        {
+            overview->setAnalysisActive(false);
+            overview->setAnalysisFailed(false);
+            overview->setAnalysisProgress(1.0);
+        }
+
+        if (isDeckA)
+        {
+            analysisActiveA = false;
+            if (!appliedFromLibrary)
+            {
+                analysisFailedA = false;
+                analysisProgressA = 1.0;
+            }
+        }
+        else
+        {
+            analysisActiveB = false;
+            if (!appliedFromLibrary)
+            {
+                analysisFailedB = false;
+                analysisProgressB = 1.0;
+            }
+        }
+
+        updateOverviewLabel(isDeckA);
+
+        if (libraryManager)
+        {
+            if (auto info = libraryManager->getTrackInfo(filePath))
+            {
+                const QString displayTitle = info->getDisplayTitle();
+                setStatusTip(QStringLiteral("Loaded stored analysis for %1").arg(displayTitle));
+            }
+        }
+
+        return;
+    }
+
+    if (!bpmAnalyzer)
+        bpmAnalyzer = new BpmAnalyzer(*sharedFormatManager);
+
+    juce::File file(filePath.toStdString());
+    const auto target = isDeckA ? BpmAnalysisTask::Target::DeckA : BpmAnalysisTask::Target::DeckB;
+    bpmThreadPool->start(new BpmAnalysisTask(this, file, target));
 }
 
 void QtMainWindow::initializeAudio()
@@ -2691,6 +3034,150 @@ void QtMainWindow::connectDeckSettings() {
     }
     
     qDebug() << "BetaPulseX: Deck settings connections established";
+}
+
+void QtMainWindow::applyScratchPosition(bool isDeckA, double absRel) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    QtDeckWidget* deck = isDeckA ? deckA : deckB;
+    WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB;
+    if (!player || !overview) return;
+
+    double minRel = overview->isPrerollEnabled() ? -1.0 : 0.0;
+    absRel = std::clamp(absRel, minRel, 1.0);
+
+    player->setPositionRelative(absRel);
+    overview->setPlayhead(absRel);
+
+    if (deck && deck->getWaveform()) {
+        deck->getWaveform()->setPlayhead(absRel);
+    }
+
+    if (beatIndicator && deck) {
+        double lenSec = std::max(1e-9, player->getLengthInSeconds());
+        constexpr double prerollSec = 8.0;
+        double seconds = (absRel < 0.0) ? (absRel * prerollSec) : (absRel * lenSec);
+        if (isDeckA) {
+            beatIndicator->setTrackPositionDeckA(seconds);
+            deck->setPlatterSeconds(seconds);
+        } else {
+            beatIndicator->setTrackPositionDeckB(seconds);
+            deck->setPlatterSeconds(seconds);
+        }
+    }
+}
+
+void QtMainWindow::startScratchInertia(bool isDeckA, double initialVelocity, bool resumePlayback) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB;
+    if (!player || !overview) return;
+
+    auto& timer = isDeckA ? scratchInertiaTimerA : scratchInertiaTimerB;
+    auto& velocity = isDeckA ? scratchInertiaVelocityA : scratchInertiaVelocityB;
+    auto& elapsed = isDeckA ? scratchInertiaElapsedA : scratchInertiaElapsedB;
+    auto& active = isDeckA ? scratchInertiaActiveA : scratchInertiaActiveB;
+    auto& resume = isDeckA ? scratchInertiaResumeA : scratchInertiaResumeB;
+
+    resume = resumePlayback;
+
+    if (std::abs(initialVelocity) < 0.05) {
+        stopScratchInertia(isDeckA, resumePlayback);
+        return;
+    }
+
+    if (!timer) {
+        timer = new QTimer(this);
+        timer->setInterval(16);
+        connect(timer, &QTimer::timeout, this, [this, isDeckA]() {
+            handleScratchInertiaTick(isDeckA);
+        });
+    }
+
+    velocity = initialVelocity;
+    elapsed = 0.0;
+    active = true;
+
+    player->ensureScratchAudible();
+    player->enableScratch(true);
+
+    timer->start();
+}
+
+void QtMainWindow::stopScratchInertia(bool isDeckA, bool resumePlayback) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    auto& timer = isDeckA ? scratchInertiaTimerA : scratchInertiaTimerB;
+    auto& active = isDeckA ? scratchInertiaActiveA : scratchInertiaActiveB;
+    auto& velocity = isDeckA ? scratchInertiaVelocityA : scratchInertiaVelocityB;
+
+    if (timer) {
+        timer->stop();
+    }
+    active = false;
+    velocity = 0.0;
+
+    if (!player) return;
+
+    player->enableScratch(false);
+
+    if (resumePlayback) {
+        player->ensureScratchAudible();
+    } else {
+        player->stop();
+    }
+}
+
+void QtMainWindow::handleScratchInertiaTick(bool isDeckA) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB;
+    auto& timer = isDeckA ? scratchInertiaTimerA : scratchInertiaTimerB;
+    auto& velocity = isDeckA ? scratchInertiaVelocityA : scratchInertiaVelocityB;
+    auto& elapsed = isDeckA ? scratchInertiaElapsedA : scratchInertiaElapsedB;
+    auto& active = isDeckA ? scratchInertiaActiveA : scratchInertiaActiveB;
+    auto& resume = isDeckA ? scratchInertiaResumeA : scratchInertiaResumeB;
+
+    if (!player || !overview || !timer || !active) {
+        return;
+    }
+
+    double dt = timer->interval() / 1000.0;
+    elapsed += dt;
+
+    const double friction = 0.88;
+    velocity *= friction;
+
+    const double maxDuration = resume ? 0.35 : 0.6;
+    if (elapsed > maxDuration) {
+        velocity = 0.0;
+    }
+
+    double totalLength = player->getLengthInSeconds();
+    if (totalLength <= 0.0 && overview->trackLengthSec > 0.0) {
+        totalLength = overview->trackLengthSec;
+    }
+
+    double currentRel = overview->getPlayheadRelative();
+    double prerollSec = overview->getPrerollTimeSeconds();
+    double currentSec = (currentRel < 0.0) ? (currentRel * prerollSec) : (currentRel * totalLength);
+    double deltaSec = velocity * dt;
+    double newSec = currentSec + deltaSec;
+
+    double minSec = -prerollSec;
+    double maxSec = totalLength;
+    newSec = std::clamp(newSec, minSec, maxSec);
+
+    double newRel;
+    if (newSec < 0.0) {
+        newRel = (prerollSec > 1e-6) ? (newSec / prerollSec) : currentRel;
+    } else if (totalLength > 1e-6) {
+        newRel = newSec / totalLength;
+    } else {
+        newRel = currentRel;
+    }
+
+    applyScratchPosition(isDeckA, newRel);
+
+    if (std::abs(velocity) < 0.015) {
+        stopScratchInertia(isDeckA, resume);
+    }
 }
 
 // Event filter for double-click reset functionality

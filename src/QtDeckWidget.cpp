@@ -332,6 +332,12 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
 
 void QtDeckWidget::loadFile(const QString &path) {
     currentFilePath = path;  // Store the current file path
+    if (pads) {
+        pads->clearAllCuePoints(false);
+    }
+    if (waveform) {
+        waveform->clearCuePoints();
+    }
     // Don't generate waveform on UI thread; schedule lightweight background generation
     if (!path.isEmpty()) {
         class SmallOverviewTask : public QRunnable {
@@ -539,6 +545,9 @@ void QtDeckWidget::onUnload() {
     }
     playing = false;
     turntable->stop();
+    if (pads) {
+        pads->clearAllCuePoints(false);
+    }
     // Clear displays (waveform, cue/loop, labels, tempo)
     if (waveform) waveform->clearDisplay();
     detectedBpm = 0.0;

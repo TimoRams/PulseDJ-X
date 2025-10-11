@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 #include <limits>
+#include <utility>
 
 #if defined(AUBIO_FOUND)
     #if defined(__has_include)
@@ -89,15 +90,30 @@ namespace BpmDSP {
     }
     
     // Präzise BPM-Analyse mit verbesserter Intervall-Erkennung
-    std::vector<double> analyzePreciseBPM(const std::vector<double>& beats, double sectionQuality) {
+    std::vector<double> analyzePreciseBPM(const std::vector<double>& beats,
+                                          double sectionQuality,
+                                          double minBpm,
+                                          double maxBpm) {
         std::vector<double> bpmCandidates;
         if (beats.size() < 6) return bpmCandidates;
         
         // Berechne alle Intervalle
         std::vector<double> intervals;
+        const double clampedMinBpm = std::clamp(minBpm, 30.0, 400.0);
+        const double clampedMaxBpm = std::clamp(maxBpm, std::max(clampedMinBpm + 1.0, 30.5), 420.0);
+        double minInterval = 60.0 / clampedMaxBpm;
+        double maxInterval = 60.0 / clampedMinBpm;
+        const double lowerLimit = 0.18;
+        const double upperLimit = 1.8;
+        minInterval = std::clamp(minInterval, lowerLimit, upperLimit);
+        maxInterval = std::clamp(maxInterval, lowerLimit, upperLimit);
+        if (minInterval >= maxInterval) {
+            minInterval = std::min(lowerLimit, 0.23);
+            maxInterval = std::max(upperLimit, 1.5);
+        }
         for (size_t i = 1; i < beats.size(); ++i) {
             double interval = beats[i] - beats[i-1];
-            if (interval >= 0.23 && interval <= 1.5) { // Erweiterte Range: 40-260 BPM
+            if (interval >= minInterval && interval <= maxInterval) {
                 intervals.push_back(interval);
             }
         }
@@ -172,10 +188,10 @@ namespace BpmDSP {
             double bpm = harmonics[i];
             
             // Range-Korrektur
-            while (bpm < 40.0) bpm *= 2.0;
-            while (bpm > 260.0) bpm /= 2.0;
+            while (bpm < clampedMinBpm) bpm *= 2.0;
+            while (bpm > clampedMaxBpm) bpm /= 2.0;
             
-            if (bpm >= 40.0 && bpm <= 260.0) {
+            if (bpm >= clampedMinBpm && bpm <= clampedMaxBpm) {
                 // Gewichtung basierend auf harmonischer Wahrscheinlichkeit
                 double harmonicWeight = 1.0;
                 if (i == 0) harmonicWeight = 3.0;      // Primary
@@ -242,32 +258,35 @@ namespace BpmDSP {
     }
     
     // Section-Qualitätsbewertung
-    double evaluateSectionQuality(const ScanSection& section, const std::vector<float>& audio, int sampleRate) {
+    double evaluateSectionQuality(const ScanSection& section,
+                                  const std::vector<float>& audio,
+                                  int sampleRate,
+                                  double trackDurationSeconds) {
         int startSample = (int)(section.start * sampleRate);
         int endSample = std::min((int)(section.end * sampleRate), (int)audio.size());
         int length = endSample - startSample;
-        
+
         if (length < sampleRate) return 0.0;
-        
+
         // Energie-Analyse
         double energy = 0.0;
         for (int i = startSample; i < endSample; ++i) {
             energy += audio[i] * audio[i];
         }
         energy = std::sqrt(energy / length);
-        
+
         // Dynamik-Analyse (RMS-Varianz)
         const int frameSize = sampleRate / 100; // 10ms Frames
         std::vector<double> frameEnergies;
-        
-        for (int i = startSample; i + frameSize < endSample; i += frameSize/2) {
+
+        for (int i = startSample; i + frameSize < endSample; i += frameSize / 2) {
             double frameEnergy = 0.0;
             for (int j = 0; j < frameSize; ++j) {
                 frameEnergy += audio[i + j] * audio[i + j];
             }
             frameEnergies.push_back(std::sqrt(frameEnergy / frameSize));
         }
-        
+
         double dynamicRange = 0.0;
         if (!frameEnergies.empty()) {
             double meanEnergy = std::accumulate(frameEnergies.begin(), frameEnergies.end(), 0.0) / frameEnergies.size();
@@ -277,22 +296,108 @@ namespace BpmDSP {
             }
             dynamicRange = std::sqrt(variance / frameEnergies.size());
         }
-        
+
         // Kombinierte Qualität
         double quality = 0.0;
         quality += std::min(50.0, energy * 20000.0);        // Energie-Komponente
         quality += std::min(30.0, dynamicRange * 10000.0);  // Dynamik-Komponente
-        
+
         // Position-Bonus (mittlere Sections sind oft besser)
         double trackPosition = (section.start + section.end) * 0.5;
-        double totalDuration = section.end + section.start; // Approximation
-        double relativePosition = trackPosition / totalDuration;
-        
+        double relativePosition = 0.5;
+        if (trackDurationSeconds > 0.0) {
+            relativePosition = std::clamp(trackPosition / trackDurationSeconds, 0.0, 1.0);
+        }
+
         if (relativePosition > 0.2 && relativePosition < 0.8) {
             quality += 20.0; // Mittlere Sections bevorzugen
         }
-        
+
         return quality;
+    }
+
+    struct AnchorEstimate {
+        double offset {-1.0};
+        double score {0.0};
+        double tolerance {0.0};
+    };
+
+    double evaluateAnchorScore(const std::vector<std::pair<double, double>>& weightedOnsets,
+                               double bpm,
+                               double tolerance,
+                               double offset) {
+        if (weightedOnsets.empty() || bpm <= 0.0 || tolerance <= 0.0) {
+            return 0.0;
+        }
+
+        double period = 60.0 / bpm;
+        if (period <= 0.0) {
+            return 0.0;
+        }
+
+        double score = 0.0;
+        for (const auto& [onset, weight] : weightedOnsets) {
+            double diff = std::fmod(onset - offset, period);
+            if (diff < 0.0) diff += period;
+            diff = std::min(diff, period - diff);
+
+            double gaussian = std::exp(-(diff * diff) / (2.0 * tolerance * tolerance));
+            double penalty = diff > tolerance ? (diff - tolerance) / (period * 0.5) : 0.0;
+            score += weight * (gaussian - penalty * 0.35);
+        }
+
+        return score;
+    }
+
+    AnchorEstimate computeOptimalAnchor(const std::vector<std::pair<double, double>>& weightedOnsets,
+                                        double bpm) {
+        AnchorEstimate estimate;
+        if (weightedOnsets.size() < 4 || bpm <= 0.0) {
+            return estimate;
+        }
+
+        double period = 60.0 / bpm;
+        if (period <= 0.0) {
+            return estimate;
+        }
+
+        estimate.tolerance = std::min(0.045, period * 0.07);
+        double tolerance = estimate.tolerance;
+
+        auto scoreAt = [&](double offset) {
+            double normalized = std::fmod(offset, period);
+            if (normalized < 0.0) normalized += period;
+            return evaluateAnchorScore(weightedOnsets, bpm, tolerance, normalized);
+        };
+
+        int coarseSteps = std::clamp((int)std::round(period / 0.004), 180, 1440);
+        double bestOffset = 0.0;
+        double bestScore = -std::numeric_limits<double>::infinity();
+
+        for (int step = 0; step < coarseSteps; ++step) {
+            double offset = (period * step) / (double)coarseSteps;
+            double score = scoreAt(offset);
+            if (score > bestScore) {
+                bestScore = score;
+                bestOffset = offset;
+            }
+        }
+
+        int fineSteps = 120;
+        double fineSpan = std::max(tolerance * 6.0, period / 60.0);
+        for (int step = -fineSteps; step <= fineSteps; ++step) {
+            double offset = bestOffset + (fineSpan * step) / (double)fineSteps;
+            double score = scoreAt(offset);
+            if (score > bestScore) {
+                bestScore = score;
+                bestOffset = offset;
+            }
+        }
+
+        estimate.offset = std::fmod(bestOffset, period);
+        if (estimate.offset < 0.0) estimate.offset += period;
+        estimate.score = bestScore;
+        return estimate;
     }
 }
 
@@ -303,7 +408,9 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
                                 std::string* outAlgorithmUsed,
                                 double* outFirstBeatOffset,
                                 ProgressFn progress,
-                                StatusFn errorOut) {
+                                StatusFn errorOut,
+                                double minBpm,
+                                double maxBpm) {
     
     if (progress) progress(0.0);
     juce::AudioFormatReader* reader = nullptr;
@@ -318,6 +425,9 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     int64 totalSamples = r->lengthInSamples;
     double totalDuration = (double)totalSamples / (double)sampleRate;
     int64 samplesToRead = std::min<int64>((int64)(maxSecondsToAnalyze * sampleRate), totalSamples);
+
+    const double minAllowedBPM = std::clamp(minBpm, 30.0, 400.0);
+    const double maxAllowedBPM = std::clamp(maxBpm, std::max(minAllowedBPM + 1.0, 30.5), 420.0);
     
     if (outTotalLengthSeconds) *outTotalLengthSeconds = totalDuration;
 
@@ -383,6 +493,8 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     fvec_t* onset_out = new_fvec(1);
     
     std::vector<double> globalCandidates;
+    std::vector<std::pair<double, double>> weightedOnsets;
+    weightedOnsets.reserve(sections.size() * 24 + 16);
     // Spectral flux novelty function across whole analysis
     std::vector<float> novelty; novelty.reserve((size_t)(samplesToRead / hop_s + 8));
     std::vector<double> noveltyTimes; noveltyTimes.reserve((size_t)(samplesToRead / hop_s + 8));
@@ -391,18 +503,18 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     for (size_t si = 0; si < sections.size(); ++si) {
         auto& section = sections[si];
         std::vector<double> tempoBeats, complexOnsets, hfcOnsets, mklOnsets;
+        double tempoConfidenceSum = 0.0;
+        int tempoConfidenceCount = 0;
         
         int startSample = (int)(section.start * sampleRate);
         int endSample = std::min((int)(section.end * sampleRate), (int)mono.size());
         
         // Section-Audio verarbeiten
-    for (int i = startSample; i + hop_s < endSample; i += hop_s) {
+        for (int i = startSample; i + hop_s < endSample; i += hop_s) {
             for (uint_t j = 0; j < hop_s; ++j) {
                 input->data[j] = mono[i + j];
             }
-            
-            double currentTime = (double)i / (double)sampleRate;
-            
+
             // Tempo-Erkennung
             aubio_tempo_do(tempo, input, tempo_out);
             if (aubio_tempo_was_tatum(tempo)) {
@@ -410,6 +522,13 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
                 if (t >= section.start && t <= section.end && 
                     (tempoBeats.empty() || t - tempoBeats.back() > 0.025)) {
                     tempoBeats.push_back(t);
+                    float instBpm = aubio_tempo_get_bpm(tempo);
+                    float instConfidence = aubio_tempo_get_confidence(tempo);
+                    if (instConfidence >= 0.25f && instBpm >= static_cast<float>(minAllowedBPM) && instBpm <= static_cast<float>(maxAllowedBPM)) {
+                        section.detectedBPMs.push_back(instBpm);
+                        tempoConfidenceSum += instConfidence;
+                        tempoConfidenceCount++;
+                    }
                 }
             }
             
@@ -443,13 +562,13 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
         }
         
         // Section-Qualität bewerten
-        double quality = BpmDSP::evaluateSectionQuality(section, mono, sampleRate);
+        double quality = BpmDSP::evaluateSectionQuality(section, mono, sampleRate, analysisDuration);
         
         // Präzise BPM-Analyse pro Methode
-        auto tempoCandidates = BpmDSP::analyzePreciseBPM(tempoBeats, quality * 1.5);
-        auto complexCandidates = BpmDSP::analyzePreciseBPM(complexOnsets, quality * 1.2);
-        auto hfcCandidates = BpmDSP::analyzePreciseBPM(hfcOnsets, quality);
-        auto mklCandidates = BpmDSP::analyzePreciseBPM(mklOnsets, quality * 1.1);
+    auto tempoCandidates = BpmDSP::analyzePreciseBPM(tempoBeats, quality * 1.5, minAllowedBPM, maxAllowedBPM);
+    auto complexCandidates = BpmDSP::analyzePreciseBPM(complexOnsets, quality * 1.2, minAllowedBPM, maxAllowedBPM);
+    auto hfcCandidates = BpmDSP::analyzePreciseBPM(hfcOnsets, quality, minAllowedBPM, maxAllowedBPM);
+    auto mklCandidates = BpmDSP::analyzePreciseBPM(mklOnsets, quality * 1.1, minAllowedBPM, maxAllowedBPM);
         
         // Alle Candidates sammeln
         globalCandidates.insert(globalCandidates.end(), tempoCandidates.begin(), tempoCandidates.end());
@@ -463,13 +582,62 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
         section.onsets.insert(section.onsets.end(), mklOnsets.begin(), mklOnsets.end());
         std::sort(section.onsets.begin(), section.onsets.end());
         
+        if (tempoConfidenceCount > 0) {
+            section.bpmConfidence = tempoConfidenceSum / (double)tempoConfidenceCount;
+        } else {
+            section.bpmConfidence = 0.0;
+        }
+        section.rhythmicStrength = (double)tempoConfidenceCount;
+        if (!section.detectedBPMs.empty()) {
+            std::sort(section.detectedBPMs.begin(), section.detectedBPMs.end());
+        }
         section.energy = quality;
+        if (!section.onsets.empty()) {
+            double baseWeight = std::clamp(section.energy / 90.0, 0.08, 3.0);
+            if (section.bpmConfidence > 0.0) {
+                baseWeight *= (0.6 + section.bpmConfidence);
+            } else {
+                baseWeight *= 0.75;
+            }
+            for (double onset : section.onsets) {
+                weightedOnsets.emplace_back(onset, baseWeight);
+            }
+        }
         if (progress) {
             double base = 0.2;
             double span = 0.5;
             double frac = (double)(si + 1) / std::max<size_t>(1, sections.size());
             progress(base + span * frac);
         }
+    }
+
+    // Ergänze globale Kandidaten aus direkten Aubio-Tempo-Schätzungen
+    std::vector<double> aubioTempoCandidates;
+    aubioTempoCandidates.reserve(sections.size() * 4);
+    for (const auto& section : sections) {
+        if (section.detectedBPMs.size() < 3) {
+            continue;
+        }
+
+        double median = section.detectedBPMs[section.detectedBPMs.size() / 2];
+        double weight = std::max(1.0, section.energy / 12.0);
+        if (section.bpmConfidence > 0.0) {
+            weight *= (0.7 + section.bpmConfidence);
+        }
+        weight += section.detectedBPMs.size() * 0.1;
+
+        int votes = std::max(1, std::min(25, (int)std::lround(weight)));
+        for (int v = 0; v < votes; ++v) {
+            aubioTempoCandidates.push_back(median);
+        }
+    }
+    if (!aubioTempoCandidates.empty()) {
+        globalCandidates.insert(globalCandidates.end(), aubioTempoCandidates.begin(), aubioTempoCandidates.end());
+    }
+
+    if (!weightedOnsets.empty()) {
+        std::sort(weightedOnsets.begin(), weightedOnsets.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
     }
 
     if (progress) progress(0.75);
@@ -531,7 +699,7 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     // Ultra-hochauflösende BPM-Clusterung (0.1 BPM Auflösung)
     std::unordered_map<int, int> histogram;
     for (double bpm : globalCandidates) {
-        if (bpm >= 40.0 && bpm <= 260.0) {
+        if (bpm >= minAllowedBPM && bpm <= maxAllowedBPM) {
             int bin = (int)(bpm * 10 + 0.5); // 0.1 BPM Bins
             histogram[bin]++;
         }
@@ -629,7 +797,7 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     };
 
     if (progress) progress(0.85);
-    auto qm = computeQMFromNovelty(60.0, 180.0);
+    auto qm = computeQMFromNovelty(minAllowedBPM, maxAllowedBPM);
     
     // Intelligente Oktav-Validierung mit Section-Consensus
     std::vector<double> octaveCandidates = {
@@ -643,7 +811,7 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     double bestScore = 0.0;
     
     for (double bpm : octaveCandidates) {
-        if (bpm < 40.0 || bpm > 260.0) continue;
+    if (bpm < minAllowedBPM || bpm > maxAllowedBPM) continue;
         
         double score = 0.0;
         int bin = (int)(bpm * 10 + 0.5);
@@ -681,8 +849,10 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
             if (!section.onsets.empty() && section.energy > 10.0) {
                 double alignment = BpmDSP::evaluateGridAlignment(
                     section.onsets, bpm, section.start, section.end);
-                
-                double sectionWeight = section.energy / 100.0;
+                double confidenceBoost = (section.bpmConfidence > 0.0)
+                                          ? (0.6 + section.bpmConfidence)
+                                          : 0.6;
+                double sectionWeight = std::max(0.05, section.energy / 120.0) * confidenceBoost;
                 totalAlignment += alignment * sectionWeight;
                 weightSum += sectionWeight;
             }
@@ -711,7 +881,10 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
         for (const auto& section : sections) {
             if (!section.onsets.empty() && section.energy > 1.0) {
                 double a = BpmDSP::evaluateGridAlignment(section.onsets, bpm, section.start, section.end);
-                double w = std::max(0.1, section.energy / 100.0);
+                double w = std::max(0.05, section.energy / 120.0);
+                if (section.bpmConfidence > 0.0) {
+                    w *= (0.7 + section.bpmConfidence);
+                }
                 totalAlignment += a * w; weightSum += w;
             }
         }
@@ -735,7 +908,7 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     double bestLocalScore = alignmentScoreForBPM(chosenBPM);
     for (double delta = -3.0; delta <= 3.0001; delta += 0.05) {
         double testBPM = chosenBPM + delta;
-        if (testBPM < 40.0 || testBPM > 260.0) continue;
+    if (testBPM < minAllowedBPM || testBPM > maxAllowedBPM) continue;
         double s = alignmentScoreForBPM(testBPM);
         if (s > bestLocalScore) { bestLocalScore = s; bestLocalBPM = testBPM; }
     }
@@ -758,30 +931,103 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
         outBeatsSeconds->clear();
         double period = 60.0 / chosenBPM;
         
-        // Best anchor: prefer QM phase if available, otherwise use onset grid fit in strongest section
+        // Best anchor: evaluate multiple candidates (global weighted onset fit, QM phase, section fit, earliest onset)
         double bestAnchor = 0.0;
-        bool haveAnchor = false;
-        if (qm.bpm > 0.0) {
-            // Map QM phase (relative to time 0) into [0, period)
-            double phase = std::fmod(qm.phase, period);
-            if (phase < 0) phase += period;
-            bestAnchor = phase; haveAnchor = true;
+        double bestAnchorScore = -std::numeric_limits<double>::infinity();
+        const auto normalizeOffset = [&](double offset) {
+            double n = std::fmod(offset, period);
+            if (n < 0.0) n += period;
+            return n;
+        };
+
+        BpmDSP::AnchorEstimate anchorEstimate;
+        double anchorTolerance = std::min(0.045, period * 0.07);
+        if (!weightedOnsets.empty()) {
+            anchorEstimate = BpmDSP::computeOptimalAnchor(weightedOnsets, chosenBPM);
+            if (anchorEstimate.tolerance > 0.0) {
+                anchorTolerance = anchorEstimate.tolerance;
+            }
         }
-        if (!haveAnchor) {
-            double maxEnergy = 0.0;
-            for (const auto& section : sections) {
-                if (section.energy > maxEnergy && !section.onsets.empty()) {
-                    maxEnergy = section.energy;
-                    double bestFit = 1e9;
-                    double bestLocalAnchor = 0.0;
-                    for (double onset : section.onsets) {
-                        double gridPos = std::fmod(onset, period);
-                        double fit = std::min(gridPos, period - gridPos);
-                        if (fit < bestFit) { bestFit = fit; bestLocalAnchor = onset - gridPos; }
+
+        const auto scoreAnchor = [&](double offset) {
+            if (weightedOnsets.empty()) {
+                return 0.0;
+            }
+            return BpmDSP::evaluateAnchorScore(weightedOnsets, chosenBPM, anchorTolerance, normalizeOffset(offset));
+        };
+
+        const auto considerAnchor = [&](double offset, double scoreHint = std::numeric_limits<double>::quiet_NaN()) {
+            double normalized = normalizeOffset(offset);
+            double score = std::isnan(scoreHint) ? scoreAnchor(normalized) : scoreHint;
+            if (score > bestAnchorScore) {
+                bestAnchorScore = score;
+                bestAnchor = normalized;
+            }
+        };
+
+        // 1) Global weighted onset optimization
+        if (anchorEstimate.offset >= 0.0) {
+            considerAnchor(anchorEstimate.offset, anchorEstimate.score);
+        }
+
+        // 2) QM spectral-flux phase estimate
+        if (qm.bpm > 0.0) {
+            double phase = normalizeOffset(qm.phase);
+            considerAnchor(phase);
+        }
+
+        // 3) High-energy section onset fit (fallback for sparse onset data)
+        double maxEnergy = 0.0;
+        double sectionCandidate = -1.0;
+        for (const auto& section : sections) {
+            if (section.energy > maxEnergy && !section.onsets.empty()) {
+                maxEnergy = section.energy;
+                double bestFit = std::numeric_limits<double>::infinity();
+                double bestLocalAnchor = 0.0;
+                for (double onset : section.onsets) {
+                    double gridPos = std::fmod(onset, period);
+                    if (gridPos < 0.0) gridPos += period;
+                    double fit = std::min(gridPos, period - gridPos);
+                    if (fit < bestFit) {
+                        bestFit = fit;
+                        bestLocalAnchor = onset - gridPos;
                     }
-                    bestAnchor = bestLocalAnchor; haveAnchor = true;
+                }
+                sectionCandidate = bestLocalAnchor;
+            }
+        }
+        if (sectionCandidate >= 0.0) {
+            considerAnchor(sectionCandidate);
+        }
+
+        // 4) Earliest weighted onset alignment to ensure first beat starts on transient
+        if (!weightedOnsets.empty()) {
+            double earliestOnset = weightedOnsets.front().first;
+            if (earliestOnset >= 0.0) {
+                double normalizedEarliest = normalizeOffset(earliestOnset);
+                considerAnchor(normalizedEarliest);
+            }
+        }
+
+        if (bestAnchorScore == -std::numeric_limits<double>::infinity()) {
+            bestAnchor = 0.0;
+            bestAnchorScore = 0.0;
+        }
+
+        // Fine-tune anchor around the best candidate to maximize onset agreement
+        if (!weightedOnsets.empty() && anchorTolerance > 0.0) {
+            double localBestScore = scoreAnchor(bestAnchor);
+            double searchSpan = std::max(anchorTolerance * 1.5, period / 120.0);
+            double step = std::max(anchorTolerance / 6.0, period / 720.0);
+            for (double delta = -searchSpan; delta <= searchSpan + 1e-9; delta += step) {
+                double testOffset = normalizeOffset(bestAnchor + delta);
+                double s = scoreAnchor(testOffset);
+                if (s > localBestScore) {
+                    localBestScore = s;
+                    bestAnchor = testOffset;
                 }
             }
+            bestAnchorScore = localBestScore;
         }
         
         // Grid generieren
@@ -820,7 +1066,9 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
                                 std::string* outAlgorithmUsed,
                                 double* outFirstBeatOffset,
                                 ProgressFn progress,
-                                StatusFn errorOut) {
+                                StatusFn errorOut,
+                                double minBpm,
+                                double maxBpm) {
     
     if (progress) progress(0.0);
     juce::AudioFormatReader* reader = nullptr;
@@ -864,7 +1112,7 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     // Analysiere jede Section
     for (size_t si = 0; si < sections.size(); ++si) {
         const auto& section = sections[si];
-        double quality = BpmDSP::evaluateSectionQuality(section, mono, sampleRate);
+        double quality = BpmDSP::evaluateSectionQuality(section, mono, sampleRate, analysisDuration);
         if (quality < 15.0) continue;
         
         // [Verkürzte Fallback-Implementierung mit gleicher Multi-Section-Logik]
@@ -884,11 +1132,12 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
     if (outFirstBeatOffset) *outFirstBeatOffset = 0.0; // Fallback: kein Beat-Offset erkannt
     
     // NEW: Update global beat grid even in fallback mode
+    double fallbackBpm = std::clamp(120.0, minAllowedBPM, maxAllowedBPM);
     if (updateGlobalGrid) {
-        GlobalBeatGrid::getInstance().setBeatGridParams(120.0, 0.0, totalDuration);
+        GlobalBeatGrid::getInstance().setBeatGridParams(fallbackBpm, 0.0, totalDuration);
     }
     
     if (progress) progress(1.0);
-    return 120.0; // Placeholder
+    return fallbackBpm; // Placeholder
 }
 #endif

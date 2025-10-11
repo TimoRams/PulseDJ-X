@@ -23,7 +23,9 @@ public:
                        std::string* outAlgorithmUsed = nullptr,
                        double* outFirstBeatOffset = nullptr,
                        ProgressFn progress = nullptr,
-                       StatusFn errorOut = nullptr);
+                       StatusFn errorOut = nullptr,
+                       double minBpm = 40.0,
+                       double maxBpm = 260.0);
 
     // NEW: Set whether this analyzer should update the global beat grid
     void setUpdateGlobalBeatGrid(bool update) { updateGlobalGrid = update; }

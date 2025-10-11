@@ -6,13 +6,12 @@
 #include <QStandardPaths>
 #include <QSettings>
 #include <QSortFilterProxyModel>
-#include <QMouseEvent>
-#include <QDrag>
 #include <QUrl>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QSplitter>
+#include <QFrame>
 #include <QTreeView>
 #include <QFileSystemModel>
 #include <QVBoxLayout>
@@ -29,6 +28,9 @@
 #include <QItemSelectionModel>
 #include <QRegularExpression>
 #include <QLocale>
+#include <QInputDialog>
+#include <QSignalBlocker>
+#include <QTabBar>
 #include <optional>
 #include <cstring>
 #include <cmath>
@@ -43,775 +45,6 @@
 // JUCE includes for audio format reading and ID3 tag extraction
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_core/juce_core.h>
-
-namespace
-{
-QString fromJuceString (const juce::String& value)
-{
-    return QString::fromUtf8 (value.toRawUTF8());
-}
-
-QString cleanupMetadataString (QString text)
-{
-    if (text.isEmpty())
-        return text;
-
-    text.replace (QRegularExpression (QStringLiteral ("[\\x00\\r\\n\\t]+")), QStringLiteral (" "));
-    text = text.simplified();
-    return text.trimmed();
-}
-
-QString normaliseKey (const QString& key)
-{
-    QString lowered = key.trimmed().toLower();
-    QString result;
-    result.reserve (lowered.size());
-    for (const QChar ch : lowered)
-    {
-        if (ch.isLetterOrNumber())
-            result.append (ch);
-    }
-    return result;
-}
-
-QHash<QString, QString> buildMetadataLookup (const juce::StringPairArray& metadata)
-{
-    QHash<QString, QString> map;
-    const auto keys = metadata.getAllKeys();
-    const auto values = metadata.getAllValues();
-
-    for (int i = 0; i < metadata.size(); ++i)
-    {
-        QString key = cleanupMetadataString (fromJuceString (keys[i]));
-        QString value = cleanupMetadataString (fromJuceString (values[i]));
-
-        if (value.isEmpty())
-            continue;
-
-        const QString normalisedKey = normaliseKey (key);
-        if (! normalisedKey.isEmpty() && ! map.contains (normalisedKey))
-            map.insert (normalisedKey, value);
-
-        if (key.contains (QLatin1Char (':')))
-        {
-            const auto parts = key.split (QLatin1Char (':'), Qt::SkipEmptyParts);
-            for (const auto& part : parts)
-            {
-                const QString altKey = normaliseKey (part);
-                if (! altKey.isEmpty() && ! map.contains (altKey))
-                    map.insert (altKey, value);
-            }
-        }
-    }
-
-    return map;
-}
-
-QString metadataValueFor (const QHash<QString, QString>& map, std::initializer_list<const char*> candidateKeys)
-{
-    for (const char* key : candidateKeys)
-    {
-        const QString lookupKey = normaliseKey (QString::fromUtf8 (key));
-        auto it = map.constFind (lookupKey);
-        if (it != map.cend())
-            return it.value();
-    }
-    return {};
-}
-
-double parseBpmString (const QString& raw)
-{
-    if (raw.isEmpty())
-        return 0.0;
-
-    QString candidate = raw.trimmed();
-    candidate.replace (QLatin1Char (','), QLatin1Char ('.'));
-
-    static const QRegularExpression numericPattern (QStringLiteral ("([0-9]+(?:\\.[0-9]+)?)"));
-    const auto match = numericPattern.match (candidate);
-    if (match.hasMatch())
-    {
-        bool ok = false;
-        const double bpm = match.captured (1).toDouble (&ok);
-        if (ok)
-            return bpm;
-    }
-
-    bool ok = false;
-    const double bpm = candidate.toDouble (&ok);
-    return ok ? bpm : 0.0;
-}
-
-QString extractYearString (const QString& raw)
-{
-    if (raw.isEmpty())
-        return {};
-
-    static const QRegularExpression yearPattern (QStringLiteral ("((?:19|20)\\d{2})"));
-    const auto match = yearPattern.match (raw);
-    if (match.hasMatch())
-        return match.captured (1);
-
-    const QString trimmed = raw.trimmed();
-    if (trimmed.size() >= 4)
-    {
-        bool ok = false;
-        const QString prefix = trimmed.left (4);
-        prefix.toInt (&ok);
-        if (ok)
-            return prefix;
-    }
-    return {};
-}
-
-QString id3v1GenreName (unsigned char index)
-{
-    static const QStringList genres = {
-        QStringLiteral ("Blues"), QStringLiteral ("Classic Rock"), QStringLiteral ("Country"), QStringLiteral ("Dance"),
-        QStringLiteral ("Disco"), QStringLiteral ("Funk"), QStringLiteral ("Grunge"), QStringLiteral ("Hip-Hop"),
-        QStringLiteral ("Jazz"), QStringLiteral ("Metal"), QStringLiteral ("New Age"), QStringLiteral ("Oldies"),
-        QStringLiteral ("Other"), QStringLiteral ("Pop"), QStringLiteral ("R&B"), QStringLiteral ("Rap"),
-        QStringLiteral ("Reggae"), QStringLiteral ("Rock"), QStringLiteral ("Techno"), QStringLiteral ("Industrial"),
-        QStringLiteral ("Alternative"), QStringLiteral ("Ska"), QStringLiteral ("Death Metal"), QStringLiteral ("Pranks"),
-        QStringLiteral ("Soundtrack"), QStringLiteral ("Euro-Techno"), QStringLiteral ("Ambient"), QStringLiteral ("Trip-Hop"),
-        QStringLiteral ("Vocal"), QStringLiteral ("Jazz+Funk"), QStringLiteral ("Fusion"), QStringLiteral ("Trance"),
-        QStringLiteral ("Classical"), QStringLiteral ("Instrumental"), QStringLiteral ("Acid"), QStringLiteral ("House"),
-        QStringLiteral ("Game"), QStringLiteral ("Sound Clip"), QStringLiteral ("Gospel"), QStringLiteral ("Noise"),
-        QStringLiteral ("Alternative Rock"), QStringLiteral ("Bass"), QStringLiteral ("Soul"), QStringLiteral ("Punk"),
-        QStringLiteral ("Space"), QStringLiteral ("Meditative"), QStringLiteral ("Instrumental Pop"), QStringLiteral ("Instrumental Rock"),
-        QStringLiteral ("Ethnic"), QStringLiteral ("Gothic"), QStringLiteral ("Darkwave"), QStringLiteral ("Techno-Industrial"),
-        QStringLiteral ("Electronic"), QStringLiteral ("Pop-Folk"), QStringLiteral ("Eurodance"), QStringLiteral ("Dream"),
-        QStringLiteral ("Southern Rock"), QStringLiteral ("Comedy"), QStringLiteral ("Cult"), QStringLiteral ("Gangsta"),
-        QStringLiteral ("Top 40"), QStringLiteral ("Christian Rap"), QStringLiteral ("Pop/Funk"), QStringLiteral ("Jungle"),
-        QStringLiteral ("Native American"), QStringLiteral ("Cabaret"), QStringLiteral ("New Wave"), QStringLiteral ("Psychadelic"),
-        QStringLiteral ("Rave"), QStringLiteral ("Showtunes"), QStringLiteral ("Trailer"), QStringLiteral ("Lo-Fi"),
-        QStringLiteral ("Tribal"), QStringLiteral ("Acid Punk"), QStringLiteral ("Acid Jazz"), QStringLiteral ("Polka"),
-        QStringLiteral ("Retro"), QStringLiteral ("Musical"), QStringLiteral ("Rock & Roll"), QStringLiteral ("Hard Rock"),
-        QStringLiteral ("Folk"), QStringLiteral ("Folk-Rock"), QStringLiteral ("National Folk"), QStringLiteral ("Swing"),
-        QStringLiteral ("Fast Fusion"), QStringLiteral ("Bebop"), QStringLiteral ("Latin"), QStringLiteral ("Revival"),
-        QStringLiteral ("Celtic"), QStringLiteral ("Bluegrass"), QStringLiteral ("Avantgarde"), QStringLiteral ("Gothic Rock"),
-        QStringLiteral ("Progressive Rock"), QStringLiteral ("Psychedelic Rock"), QStringLiteral ("Symphonic Rock"), QStringLiteral ("Slow Rock"),
-        QStringLiteral ("Big Band"), QStringLiteral ("Chorus"), QStringLiteral ("Easy Listening"), QStringLiteral ("Acoustic"),
-        QStringLiteral ("Humour"), QStringLiteral ("Speech"), QStringLiteral ("Chanson"), QStringLiteral ("Opera"),
-        QStringLiteral ("Chamber Music"), QStringLiteral ("Sonata"), QStringLiteral ("Symphony"), QStringLiteral ("Booty Bass"),
-        QStringLiteral ("Primus"), QStringLiteral ("Porn Groove"), QStringLiteral ("Satire"), QStringLiteral ("Slow Jam"),
-        QStringLiteral ("Club"), QStringLiteral ("Tango"), QStringLiteral ("Samba"), QStringLiteral ("Folklore"),
-        QStringLiteral ("Ballad"), QStringLiteral ("Power Ballad"), QStringLiteral ("Rhythmic Soul"), QStringLiteral ("Freestyle"),
-        QStringLiteral ("Duet"), QStringLiteral ("Punk Rock"), QStringLiteral ("Drum Solo"), QStringLiteral ("Acapella"),
-        QStringLiteral ("Euro-House"), QStringLiteral ("Dance Hall"), QStringLiteral ("Goa"), QStringLiteral ("Drum & Bass"),
-        QStringLiteral ("Club-House"), QStringLiteral ("Hardcore"), QStringLiteral ("Terror"), QStringLiteral ("Indie"),
-        QStringLiteral ("BritPop"), QStringLiteral ("Negerpunk"), QStringLiteral ("Polsk Punk"), QStringLiteral ("Beat"),
-        QStringLiteral ("Christian Gangsta"), QStringLiteral ("Heavy Metal"), QStringLiteral ("Black Metal"), QStringLiteral ("Crossover"),
-        QStringLiteral ("Contemporary Christian"), QStringLiteral ("Christian Rock"), QStringLiteral ("Merengue"), QStringLiteral ("Salsa"),
-        QStringLiteral ("Thrash Metal"), QStringLiteral ("Anime"), QStringLiteral ("JPop"), QStringLiteral ("Synthpop"),
-        QStringLiteral ("Abstract"), QStringLiteral ("Art Rock"), QStringLiteral ("Baroque"), QStringLiteral ("Bhangra"),
-        QStringLiteral ("Big Beat"), QStringLiteral ("Breakbeat"), QStringLiteral ("Chillout"), QStringLiteral ("Downtempo"),
-        QStringLiteral ("Dub"), QStringLiteral ("EBM"), QStringLiteral ("Eclectic"), QStringLiteral ("Electro"),
-        QStringLiteral ("Electroclash"), QStringLiteral ("Emo"), QStringLiteral ("Experimental"), QStringLiteral ("Garage"),
-        QStringLiteral ("Global"), QStringLiteral ("IDM"), QStringLiteral ("Illbient"), QStringLiteral ("Industro-Goth"),
-        QStringLiteral ("Jam Band"), QStringLiteral ("Krautrock"), QStringLiteral ("Leftfield"), QStringLiteral ("Lounge"),
-        QStringLiteral ("Math Rock"), QStringLiteral ("New Romantic"), QStringLiteral ("Nu-Breakz"), QStringLiteral ("Post-Punk"),
-        QStringLiteral ("Post-Rock"), QStringLiteral ("Psytrance"), QStringLiteral ("Shoegaze"), QStringLiteral ("Space Rock"),
-        QStringLiteral ("Trop Rock"), QStringLiteral ("World Music"), QStringLiteral ("Neoclassical"), QStringLiteral ("Audiobook"),
-        QStringLiteral ("Audio Theatre"), QStringLiteral ("Neue Deutsche Welle"), QStringLiteral ("Podcast"), QStringLiteral ("Indie Rock"),
-        QStringLiteral ("G-Funk"), QStringLiteral ("Dubstep"), QStringLiteral ("Garage Rock"), QStringLiteral ("Psybient")
-    };
-
-    if (index < genres.size())
-        return genres.at (index);
-
-    return {};
-}
-
-struct Id3v1TagData
-{
-    QString title;
-    QString artist;
-    QString album;
-    QString genre;
-    QString year;
-    QString comment;
-    int trackNumber = -1;
-};
-
-std::optional<Id3v1TagData> readId3v1Tag (const QString& filePath)
-{
-    QFile file (filePath);
-    if (! file.open (QIODevice::ReadOnly))
-        return std::nullopt;
-
-    if (file.size() < 128)
-        return std::nullopt;
-
-    if (! file.seek (file.size() - 128))
-        return std::nullopt;
-
-    const QByteArray data = file.read (128);
-    if (data.size() != 128)
-        return std::nullopt;
-
-    if (std::memcmp (data.constData(), "TAG", 3) != 0)
-        return std::nullopt;
-
-    Id3v1TagData tag;
-    tag.title = cleanupMetadataString (QString::fromLatin1 (data.mid (3, 30)));
-    tag.artist = cleanupMetadataString (QString::fromLatin1 (data.mid (33, 30)));
-    tag.album = cleanupMetadataString (QString::fromLatin1 (data.mid (63, 30)));
-    tag.year = cleanupMetadataString (QString::fromLatin1 (data.mid (93, 4)));
-
-    QByteArray comment = data.mid (97, 30);
-    if (comment.size() == 30)
-    {
-        if (comment[28] == 0 && comment[29] != 0)
-            tag.trackNumber = static_cast<unsigned char> (comment[29]);
-
-        comment[28] = 0;
-    }
-    tag.comment = cleanupMetadataString (QString::fromLatin1 (comment));
-
-    const unsigned char genreIndex = static_cast<unsigned char> (data[127]);
-    tag.genre = cleanupMetadataString (id3v1GenreName (genreIndex));
-
-    return tag;
-}
-
-void applyFilenameHeuristics (const QFileInfo& fileInfo, TrackInfo& track)
-{
-    const QString baseName = cleanupMetadataString (fileInfo.completeBaseName());
-
-    if (track.title.trimmed().isEmpty())
-        track.title = baseName;
-
-    if (track.artist.trimmed().isEmpty())
-    {
-    static const QRegularExpression artistTitlePattern (QStringLiteral ("^\\s*(.+?)\\s*[-–]\\s*(.+)\\s*$"));
-        const auto match = artistTitlePattern.match (fileInfo.completeBaseName());
-        if (match.hasMatch())
-        {
-            const QString artist = cleanupMetadataString (match.captured (1));
-            const QString title = cleanupMetadataString (match.captured (2));
-            if (! artist.isEmpty())
-                track.artist = artist;
-            if (! title.isEmpty())
-                track.title = title;
-        }
-    }
-}
-
-void applyId3v1Fallback (const std::optional<Id3v1TagData>& tag, TrackInfo& track)
-{
-    if (! tag)
-        return;
-
-    const auto assignIfEmpty = [] (QString& target, const QString& value)
-    {
-        if (target.trimmed().isEmpty() && ! value.trimmed().isEmpty())
-            target = value.trimmed();
-    };
-
-    assignIfEmpty (track.title, tag->title);
-    assignIfEmpty (track.artist, tag->artist);
-    assignIfEmpty (track.album, tag->album);
-    assignIfEmpty (track.genre, tag->genre);
-    assignIfEmpty (track.year, tag->year);
-    assignIfEmpty (track.comment, tag->comment);
-}
-
-void finaliseMetadata (const QFileInfo& fileInfo, TrackInfo& track)
-{
-    track.title = cleanupMetadataString (track.title);
-    track.artist = cleanupMetadataString (track.artist);
-    track.album = cleanupMetadataString (track.album);
-    track.genre = cleanupMetadataString (track.genre);
-    track.comment = cleanupMetadataString (track.comment);
-    track.year = cleanupMetadataString (track.year);
-
-    if (track.title.isEmpty())
-        track.title = cleanupMetadataString (fileInfo.completeBaseName());
-
-    if (! track.key.isEmpty())
-    {
-        track.key = cleanupMetadataString (track.key.toUpper());
-        track.key.remove (QLatin1Char (' '));
-    }
-    else
-    {
-        track.key.clear();
-    }
-	
-    if (track.trackLengthSeconds <= 0.0 && track.duration > 0.0)
-        track.trackLengthSeconds = track.duration;
-}
-}
-
-// ID3LoaderThread Implementation
-ID3LoaderThread::ID3LoaderThread(const QStringList& files, juce::AudioFormatManager* formatManager, QObject* parent)
-    : QThread(parent), filesToProcess(files), audioFormatManager(formatManager)
-{
-}
-
-void ID3LoaderThread::run()
-{
-    int current = 0;
-    int total = filesToProcess.size();
-    
-    for (const QString& filePath : filesToProcess) {
-        if (shouldStop) break;
-        
-        TrackInfo track = loadTrackInfo(filePath);
-        emit trackLoaded(track);
-        
-        current++;
-        emit progressUpdated(current, total);
-        
-        // Small delay to prevent UI blocking
-        msleep(1);
-    }
-    
-    emit finished();
-}
-
-TrackInfo ID3LoaderThread::loadTrackInfo(const QString& filePath)
-{
-    TrackInfo track (filePath);
-    const QFileInfo fileInfo (filePath);
-    track.fileSize = fileInfo.size();
-    track.lastModified = fileInfo.lastModified().toSecsSinceEpoch();
-    if (track.addedAt == 0)
-    {
-        const qint64 now = QDateTime::currentSecsSinceEpoch();
-        track.addedAt = now;
-        track.updatedAt = now;
-    }
-
-    const auto id3v1Tag = readId3v1Tag (filePath);
-
-    try
-    {
-        juce::File audioFile (filePath.toStdString());
-
-        if (audioFile.exists())
-        {
-            std::unique_ptr<juce::AudioFormatReader> reader;
-            {
-                AudioFormatManagerGuard formatGuard;
-                reader.reset(audioFormatManager->createReaderFor(audioFile));
-            }
-
-            if (reader)
-            {
-                if (reader->sampleRate > 0)
-                    {
-                        track.duration = reader->lengthInSamples / reader->sampleRate;
-                        track.trackLengthSeconds = track.duration;
-                    }
-
-                const auto metadataMap = buildMetadataLookup (reader->metadataValues);
-
-                const auto titleValue = metadataValueFor (metadataMap, { "title", "id3title", "tit2", "tt2", "tracktitle", "song", "name" });
-                if (! titleValue.isEmpty())
-                    track.title = titleValue;
-
-                QString artistValue = metadataValueFor (metadataMap, { "artist", "id3artist", "tpe1", "albumartist", "tpe2", "band", "orchestra", "performer", "leadartist" });
-                if (! artistValue.isEmpty())
-                    track.artist = artistValue;
-
-                const auto albumValue = metadataValueFor (metadataMap, { "album", "id3album", "talb", "record", "release", "albumtitle" });
-                if (! albumValue.isEmpty())
-                    track.album = albumValue;
-
-                const auto genreValue = metadataValueFor (metadataMap, { "genre", "id3genre", "tcon", "style", "category" });
-                if (! genreValue.isEmpty())
-                    track.genre = genreValue;
-
-                const auto yearValue = metadataValueFor (metadataMap, { "year", "tyer", "tdrc", "id3date", "date", "releasedate", "recordingtime" });
-                const auto parsedYear = extractYearString (yearValue);
-                if (! parsedYear.isEmpty())
-                    track.year = parsedYear;
-
-                const auto commentValue = metadataValueFor (metadataMap, { "comment", "id3comment", "comm", "description", "notes", "text" });
-                if (! commentValue.isEmpty())
-                    track.comment = commentValue;
-
-                const auto keyValue = metadataValueFor (metadataMap, { "key", "tkey", "initialkey", "initial key", "musickey", "keysig", "keysignature" });
-                if (! keyValue.isEmpty())
-                    track.key = keyValue;
-
-                const auto bpmValue = metadataValueFor (metadataMap, { "bpm", "tbpm", "tmpo", "tempo", "beatsperminute" });
-                const double bpm = parseBpmString (bpmValue);
-                if (bpm > 0.0)
-                    track.bpm = bpm;
-            }
-        }
-    }
-    catch (const std::exception& e)
-    {
-        qWarning() << "Error loading metadata for" << filePath << ":" << e.what();
-    }
-
-    applyId3v1Fallback (id3v1Tag, track);
-    applyFilenameHeuristics (fileInfo, track);
-    finaliseMetadata (fileInfo, track);
-
-    return track;
-}
-
-// LibraryTableModel Implementation
-LibraryTableModel::LibraryTableModel(QObject* parent)
-    : QAbstractTableModel(parent)
-{
-}
-
-int LibraryTableModel::rowCount(const QModelIndex& parent) const
-{
-    Q_UNUSED(parent);
-    return filteredTracks.size();
-}
-
-int LibraryTableModel::columnCount(const QModelIndex& parent) const
-{
-    Q_UNUSED(parent);
-    return ColumnCount;
-}
-
-QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
-{
-    if (!index.isValid() || index.row() >= filteredTracks.size()) {
-        return QVariant();
-    }
-    
-    const TrackInfo* track = filteredTracks[index.row()];
-    if (!track) return QVariant();
-    
-    if (role == Qt::DisplayRole) {
-        switch (index.column()) {
-            case TitleColumn: return track->getDisplayTitle();
-            case ArtistColumn: return track->getDisplayArtist();
-            case AlbumColumn: return track->album.isEmpty() ? "Unknown Album" : track->album;
-            case DurationColumn: return track->getDurationString();
-            case BpmColumn: return track->getBpmString();
-            case GenreColumn: return track->genre.isEmpty() ? "Unknown" : track->genre;
-            case YearColumn: return track->year.isEmpty() ? "--" : track->year;
-            case FileSizeColumn: return track->getFileSizeString();
-            default: return QVariant();
-        }
-    } else if (role == Qt::ToolTipRole) {
-        QStringList tooltipLines;
-        tooltipLines << QStringLiteral("Title: %1").arg(track->getDisplayTitle());
-        tooltipLines << QStringLiteral("Artist: %1").arg(track->getDisplayArtist());
-        if (!track->album.isEmpty())      tooltipLines << QStringLiteral("Album: %1").arg(track->album);
-        if (!track->genre.isEmpty())      tooltipLines << QStringLiteral("Genre: %1").arg(track->genre);
-        if (!track->year.isEmpty())       tooltipLines << QStringLiteral("Year: %1").arg(track->year);
-        if (!track->key.isEmpty())        tooltipLines << QStringLiteral("Key: %1").arg(track->key);
-        if (track->bpm > 0.0)             tooltipLines << QStringLiteral("BPM: %1").arg(track->getBpmString());
-        if (!track->comment.isEmpty())    tooltipLines << QStringLiteral("Comment: %1").arg(track->comment);
-        tooltipLines << QStringLiteral("Path: %1").arg(track->filePath);
-        return tooltipLines.join(QLatin1Char('\n'));
-    } else if (role == Qt::TextAlignmentRole) {
-        // Right-align numeric-ish columns for readability
-        switch (index.column()) {
-            case DurationColumn:
-            case BpmColumn:
-            case YearColumn:
-            case FileSizeColumn:
-                return int(Qt::AlignRight | Qt::AlignVCenter);
-            default:
-                return int(Qt::AlignVCenter); // default vertical centering
-        }
-    } else if (role == Qt::UserRole) {
-        // Return the file path for drag operations
-        return track->filePath;
-    }
-    
-    return QVariant();
-}
-
-QVariant LibraryTableModel::headerData(int section, Qt::Orientation orientation, int role) const
-{
-    if (orientation == Qt::Horizontal && role == Qt::DisplayRole) {
-        switch (section) {
-            case TitleColumn: return tr("Title");
-            case ArtistColumn: return tr("Artist");
-            case AlbumColumn: return tr("Album");
-            case DurationColumn: return tr("Duration");
-            case BpmColumn: return tr("BPM");
-            case GenreColumn: return tr("Genre");
-            case YearColumn: return tr("Year");
-            case FileSizeColumn: return tr("Size");
-            default: return QVariant();
-        }
-    }
-    return QVariant();
-}
-
-Qt::ItemFlags LibraryTableModel::flags(const QModelIndex& index) const
-{
-    if (!index.isValid()) {
-        return Qt::NoItemFlags;
-    }
-    return Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled;
-}
-
-void LibraryTableModel::sort(int column, Qt::SortOrder order)
-{
-    // Map view column to our SortMode
-    SortMode mode = SortByTitle;
-    switch (column) {
-        case TitleColumn:   mode = SortByTitle; break;
-        case ArtistColumn:  mode = SortByArtist; break;
-        case AlbumColumn:   mode = SortByAlbum; break;
-        case DurationColumn:mode = SortByDuration; break;
-        case BpmColumn:     mode = SortByBpm; break;
-        case GenreColumn:   mode = SortByGenre; break;
-        case YearColumn:    mode = SortByYear; break;
-        case FileSizeColumn:mode = SortByFileSize; break;
-        default:            mode = SortByTitle; break;
-    }
-    setSortMode(mode, order);
-}
-
-QStringList LibraryTableModel::mimeTypes() const
-{
-    return QStringList() << "text/uri-list";
-}
-
-QMimeData* LibraryTableModel::mimeData(const QModelIndexList& indexes) const
-{
-    QMimeData* mimeData = new QMimeData();
-    QList<QUrl> urls;
-    
-    QSet<int> rows; // Avoid duplicates from multiple columns
-    for (const QModelIndex& index : indexes) {
-        if (index.isValid()) {
-            rows.insert(index.row());
-        }
-    }
-    
-    for (int row : rows) {
-        if (row < filteredTracks.size()) {
-            const TrackInfo* track = filteredTracks[row];
-            if (track) {
-                urls.append(QUrl::fromLocalFile(track->filePath));
-            }
-        }
-    }
-    
-    mimeData->setUrls(urls);
-    return mimeData;
-}
-
-void LibraryTableModel::addOrUpdateTrack(const TrackInfo& track)
-{
-    auto it = std::find_if(allTracks.begin(), allTracks.end(), [&track](const TrackInfo& existing) {
-        return existing.filePath.compare(track.filePath, Qt::CaseInsensitive) == 0;
-    });
-
-    if (it != allTracks.end())
-        *it = track;
-    else
-        allTracks.push_back(track);
-
-    updateFilteredTracks();
-}
-
-void LibraryTableModel::clearTracks()
-{
-    beginResetModel();
-    allTracks.clear();
-    filteredTracks.clear();
-    endResetModel();
-}
-
-const TrackInfo* LibraryTableModel::getTrack(int row) const
-{
-    if (row >= 0 && row < filteredTracks.size()) {
-        return filteredTracks[row];
-    }
-    return nullptr;
-}
-
-std::optional<TrackInfo> LibraryTableModel::findTrackByPath(const QString& filePath) const
-{
-    auto it = std::find_if(allTracks.begin(), allTracks.end(), [&filePath](const TrackInfo& track) {
-        return track.filePath.compare(filePath, Qt::CaseInsensitive) == 0;
-    });
-
-    if (it == allTracks.end())
-        return std::nullopt;
-
-    return *it;
-}
-
-void LibraryTableModel::setSortMode(SortMode mode, Qt::SortOrder order)
-{
-    if (currentSortMode == mode && currentSortOrder == order)
-        return;
-    emit layoutAboutToBeChanged();
-    currentSortMode = mode;
-    currentSortOrder = order;
-    sortFilteredTracks();
-    emit layoutChanged();
-}
-
-void LibraryTableModel::setFilterText(const QString& filter)
-{
-    filterText = filter.toLower();
-    updateFilteredTracks();
-}
-
-void LibraryTableModel::updateFilteredTracks()
-{
-    beginResetModel();
-    
-    filteredTracks.clear();
-    for (const auto& track : allTracks) {
-        if (matchesFilter(track)) {
-            filteredTracks.push_back(&track);
-        }
-    }
-    
-    sortFilteredTracks();
-    endResetModel();
-}
-
-void LibraryTableModel::sortFilteredTracks()
-{
-    std::sort(filteredTracks.begin(), filteredTracks.end(), [this](const TrackInfo* a, const TrackInfo* b) {
-        bool result = isLessThan(a, b);
-        return currentSortOrder == Qt::AscendingOrder ? result : !result;
-    });
-}
-
-bool LibraryTableModel::matchesFilter(const TrackInfo& track) const
-{
-    if (filterText.isEmpty()) return true;
-    
-    return track.getDisplayTitle().toLower().contains(filterText) ||
-           track.getDisplayArtist().toLower().contains(filterText) ||
-           track.album.toLower().contains(filterText) ||
-           track.genre.toLower().contains(filterText) ||
-           track.year.toLower().contains(filterText) ||
-           track.comment.toLower().contains(filterText) ||
-           track.key.toLower().contains(filterText);
-}
-
-bool LibraryTableModel::isLessThan(const TrackInfo* a, const TrackInfo* b) const
-{
-    if (!a || !b) return false;
-    
-    switch (currentSortMode) {
-        case SortByTitle:
-            return a->getDisplayTitle().toLower() < b->getDisplayTitle().toLower();
-        case SortByArtist:
-            return a->getDisplayArtist().toLower() < b->getDisplayArtist().toLower();
-        case SortByAlbum:
-            return a->album.toLower() < b->album.toLower();
-        case SortByDuration:
-            return a->duration < b->duration;
-        case SortByBpm:
-            return a->bpm < b->bpm;
-        case SortByGenre:
-            return a->genre.toLower() < b->genre.toLower();
-        case SortByYear:
-            return a->year < b->year;
-        case SortByFileSize:
-            return a->fileSize < b->fileSize;
-        default:
-            return false;
-    }
-}
-
-// LibraryTableView Implementation
-LibraryTableView::LibraryTableView(QWidget* parent)
-    : QTableView(parent)
-{
-    setDragEnabled(true);
-    setDragDropMode(QAbstractItemView::DragOnly);
-    setSelectionBehavior(QAbstractItemView::SelectRows);
-    setSelectionMode(QAbstractItemView::ExtendedSelection);
-    setAlternatingRowColors(true);
-    setShowGrid(false);
-    setWordWrap(false);
-    setTextElideMode(Qt::ElideRight);
-    setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
-    setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-
-    // Configure headers
-    auto* hh = horizontalHeader();
-    hh->setSortIndicatorShown(true);
-    hh->setSectionsClickable(true);
-    hh->setHighlightSections(false);
-    hh->setSectionResizeMode(QHeaderView::Interactive);
-    // Prefer the title column to get more space when window grows
-    hh->setStretchLastSection(false);
-    hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
-    hh->resizeSection(LibraryTableModel::TitleColumn, 480); // allow artist column to claim some space
-    // Other columns keep their initial width but remain resizable by user
-    for (int col = LibraryTableModel::ArtistColumn; col < LibraryTableModel::ColumnCount; ++col) {
-        hh->setSectionResizeMode(col, QHeaderView::Interactive);
-    }
-    verticalHeader()->setVisible(false);
-    verticalHeader()->setDefaultSectionSize(22); // row height
-    
-    // Set column widths
-    setColumnWidth(LibraryTableModel::TitleColumn, 560);
-    setColumnWidth(LibraryTableModel::ArtistColumn, 180);
-    setColumnWidth(LibraryTableModel::AlbumColumn, 160);
-    setColumnWidth(LibraryTableModel::DurationColumn, 70);
-    setColumnWidth(LibraryTableModel::BpmColumn, 60);
-    setColumnWidth(LibraryTableModel::GenreColumn, 110);
-    setColumnWidth(LibraryTableModel::YearColumn, 60);
-    setColumnWidth(LibraryTableModel::FileSizeColumn, 70);
-    setSortingEnabled(true);
-    sortByColumn(LibraryTableModel::TitleColumn, Qt::AscendingOrder);
-    setStyleSheet("QTableView { font-family: 'Lato', 'Arial', sans-serif; font-size: 13px; background: #181a1b; alternate-background-color: #222426; selection-background-color: #2d5aa0; border: none; gridline-color: #2a2d2e; } QHeaderView::section { font-weight: bold; font-size: 13px; background: #23272a; color: #e0e0e0; border: none; padding: 6px 4px; } QTableView::item { padding-left: 6px; padding-right: 6px; } QTableView::item:selected { color: #ffffff; } QTableView::item:hover { background: rgba(255,255,255,0.035); } ");
-}
-
-void LibraryTableView::startDrag(Qt::DropActions supportedActions)
-{
-    QModelIndexList indexes = selectedIndexes();
-    if (indexes.isEmpty()) return;
-    
-    QMimeData* mimeData = model()->mimeData(indexes);
-    if (!mimeData) return;
-    
-    QDrag* drag = new QDrag(this);
-    drag->setMimeData(mimeData);
-    
-    // Create a simple drag pixmap
-    QPixmap pixmap(100, 30);
-    pixmap.fill(Qt::lightGray);
-    drag->setPixmap(pixmap);
-    
-    drag->exec(supportedActions);
-}
-
-void LibraryTableView::mousePressEvent(QMouseEvent* event)
-{
-    if (event->button() == Qt::LeftButton) {
-        dragStartPosition = event->pos();
-    }
-    QTableView::mousePressEvent(event);
-}
-
-void LibraryTableView::mouseMoveEvent(QMouseEvent* event)
-{
-    if (!(event->buttons() & Qt::LeftButton)) {
-        QTableView::mouseMoveEvent(event);
-        return;
-    }
-    
-    if ((event->pos() - dragStartPosition).manhattanLength() < QApplication::startDragDistance()) {
-        QTableView::mouseMoveEvent(event);
-        return;
-    }
-    
-    if (!dragInProgress) {
-        dragInProgress = true;
-        startDrag(Qt::CopyAction);
-        dragInProgress = false;
-    }
-}
 
 // LibraryManager Implementation
 LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget* parent)
@@ -836,6 +69,7 @@ LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget*
     connect(filterUpdateTimer, &QTimer::timeout, this, &LibraryManager::onFilterTextChanged);
 
     loadExistingTracks();
+    loadPlaylists();
 }
 
 LibraryManager::~LibraryManager()
@@ -852,63 +86,146 @@ LibraryManager::~LibraryManager()
 void LibraryManager::setupUI()
 {
     setStyleSheet(
-        "QWidget { background-color: #1a1a1a; color: #e0e0e0; }"
-        "QTableView { font-family: 'Lato', 'Arial', sans-serif; font-size: 13px; background: #181a1b; alternate-background-color: #222426; selection-background-color: #2d5aa0; border: none; }"
-        "QHeaderView::section { font-weight: bold; font-size: 13px; background: #23272a; color: #e0e0e0; border: none; padding: 6px 4px; }"
-        "QTableView::item { padding-left: 6px; padding-right: 6px; }"
-        "QPushButton { background-color: #23272a; border: 1px solid #444; padding: 4px 10px; border-radius: 3px; font-size: 12px; color: #e0e0e0; }"
-        "QPushButton:hover { background-color: #3a3a3a; }"
-        "QPushButton:pressed { background-color: #1a1a1a; }"
-        "QComboBox { background-color: #23272a; border: 1px solid #444; padding: 2px 6px; font-size: 12px; color: #e0e0e0; min-width: 90px; }"
-        "QLineEdit { background-color: #23272a; border: 1px solid #444; padding: 2px 6px; font-size: 12px; color: #e0e0e0; min-width: 180px; }"
-        "QProgressBar { height: 12px; background: #23272a; border: 1px solid #444; border-radius: 3px; }"
-        "QProgressBar::chunk { background: #4a9eff; }"
-        "QTreeView { background-color: #1a1a1a; border: 1px solid #555; }"
-        "QTreeView::item:selected { background-color: #2d5aa0; }"
-        "QTreeView::item:hover { background-color: #2a2a2a; }"
-        "QSplitter::handle { background-color: #555; }"
+        "QWidget { background-color: #101114; color: #f0f0f0; font-family: 'Lato', 'Arial', sans-serif; }"
+        "QSplitter::handle { background-color: #23262e; }"
         "QSplitter::handle:horizontal { width: 2px; }"
+        "#libraryNavPanel { background: #14161a; border-right: 1px solid #262931; }"
+        "QTabWidget::pane { border: none; }"
+    "QTabBar::tab { background: transparent; color: #a8acb3; padding: 7px 6px; margin: 1px; border-radius: 7px; min-width: 70px; font-size: 9px; font-weight: 600; }"
+        "QTabBar::tab:selected { background: #2f6ae0; color: #ffffff; }"
+    "QListWidget { background-color: transparent; border: none; font-size: 9px; }"
+    "QListWidget::item { padding: 3px 6px; border-radius: 5px; margin: 1px 2px; }"
+        "QListWidget::item:selected { background-color: #2f6ae0; color: #ffffff; }"
+        "QListWidget::item:hover { background-color: rgba(47,106,224,0.16); }"
+        "#libraryToolbar { background: #14171d; border: 1px solid #242832; border-radius: 8px; }"
+        "#librarySearchContainer { background: #1a1d24; border: 1px solid #2b303c; border-radius: 6px; }"
+    "#librarySearchContainer QLabel { color: #8b92a3; }"
+        "#libraryFooterBar { background: #14171d; border: 1px solid #242832; border-radius: 8px; }"
+    "QToolButton[class=\"primaryAction\"] { background: #1b1f27; border: 1px solid #2b303c; border-radius: 6px; padding: 3px 6px; font-size: 9px; min-width: 0px; min-height: 24px; color: #d8dce8; }"
+        "QToolButton[class=\"primaryAction\"]:hover { border-color: #3c7cff; color: #ffffff; }"
+        "QToolButton[class=\"primaryAction\"]:pressed { background: #161a21; }"
+    "#filterCaption { color: #9aa3b5; font-size: 9px; font-weight: 600; padding-right: 2px; }"
+        "#searchIcon { color: #7f8899; padding-right: 4px; }"
+    "QLineEdit { background-color: #1f232c; border: 1px solid #323845; padding: 3px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; }"
+        "QLineEdit:focus { border-color: #4188ff; }"
+    "#librarySearchContainer QLineEdit { background: transparent; border: none; padding: 0; font-size: 9px; }"
+        "#librarySearchContainer QLineEdit:focus { border: none; }"
+    "QComboBox { background-color: #1f232c; border: 1px solid #323845; padding: 2px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; min-width: 96px; }"
+        "QComboBox::drop-down { border: none; }"
+    "QTableView { font-size: 10px; background: #0f1014; alternate-background-color: #15171d; selection-background-color: #2f6ae0; border: none; gridline-color: #1f232c; }"
+    "QHeaderView::section { font-weight: 600; font-size: 9px; background: #181b22; color: #d8dce8; border: none; padding: 4px 3px; }"
+        "QTableView::item { padding-left: 5px; padding-right: 5px; }"
+        "QProgressBar { height: 9px; background: #1f232c; border: 1px solid #323845; border-radius: 4px; }"
+        "QProgressBar::chunk { background: #4188ff; border-radius: 4px; }"
+        "QTreeView { background-color: transparent; border: none; }"
+        "QTreeView::item:selected { background-color: #2f6ae0; }"
+        "QTreeView::item:hover { background-color: rgba(47,106,224,0.16); }"
     );
-    
+
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(5);
-    mainLayout->setContentsMargins(5, 5, 5, 5);
+    mainLayout->setContentsMargins(6, 6, 6, 6);
     
     // Create main splitter (horizontal)
     mainSplitter = new QSplitter(Qt::Horizontal, this);
     
-    // === LEFT PANEL: File System Browser ===
+    // === LEFT PANEL: Navigation Tabs ===
     auto* leftPanel = new QWidget();
-    leftPanel->setMinimumWidth(160);
-    leftPanel->setMaximumWidth(260);
-    
+    leftPanel->setObjectName("libraryNavPanel");
+    leftPanel->setMinimumWidth(120);
+    leftPanel->setMaximumWidth(180);
+
     auto* leftLayout = new QVBoxLayout(leftPanel);
-    leftLayout->setContentsMargins(0, 0, 0, 0);
-    // File browser header
-    auto* browserHeader = new QLabel("Music Folders", leftPanel);
-    browserHeader->setStyleSheet("font-weight: bold; font-size: 13px; padding: 6px 8px; background: #23272a; color: #e0e0e0; border-bottom: 1px solid #444;");
-    
-    // File system tree view
-    fileSystemTree = new QTreeView(leftPanel);
+    leftLayout->setContentsMargins(2, 4, 2, 4);
+    leftLayout->setSpacing(5);
+
+    navigationTabs = new QTabWidget(leftPanel);
+    navigationTabs->setTabPosition(QTabWidget::West);
+    navigationTabs->setDocumentMode(true);
+    navigationTabs->setMovable(false);
+    navigationTabs->setIconSize(QSize(16, 16));
+    if (auto* bar = navigationTabs->tabBar())
+    {
+        bar->setIconSize(QSize(16, 16));
+        bar->setFocusPolicy(Qt::NoFocus);
+        bar->setExpanding(false);
+        bar->setMinimumWidth(64);
+    }
+
+    // Collection tab
+    auto* collectionPage = new QWidget(navigationTabs);
+    auto* collectionLayout = new QVBoxLayout(collectionPage);
+    collectionLayout->setContentsMargins(0, 0, 0, 0);
+    collectionLayout->setSpacing(4);
+    auto* collectionHeader = new QLabel(tr("Collection"), collectionPage);
+    collectionHeader->setObjectName("collectionHeader");
+    collectionHeader->setStyleSheet("font-weight: 600; font-size: 10px; padding: 4px 8px; color: #f0f0f0;");
+    collectionList = new QListWidget(collectionPage);
+    collectionList->setSelectionMode(QAbstractItemView::SingleSelection);
+    collectionList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    collectionList->setSpacing(2);
+    collectionList->addItem(tr("All Tracks"));
+    collectionLayout->addWidget(collectionHeader);
+    collectionLayout->addWidget(collectionList, 1);
+    navigationTabs->addTab(collectionPage, QIcon::fromTheme("media-playlist-shuffle"), tr("Collection"));
+
+    // Playlists tab
+    auto* playlistPage = new QWidget(navigationTabs);
+    auto* playlistLayout = new QVBoxLayout(playlistPage);
+    playlistLayout->setContentsMargins(0, 0, 0, 0);
+    playlistLayout->setSpacing(4);
+
+    auto* playlistHeader = new QWidget(playlistPage);
+    auto* playlistHeaderLayout = new QHBoxLayout(playlistHeader);
+    playlistHeaderLayout->setContentsMargins(8, 4, 8, 4);
+    playlistHeaderLayout->setSpacing(4);
+    auto* playlistLabel = new QLabel(tr("Playlists"), playlistHeader);
+    playlistLabel->setStyleSheet("font-weight: 600; font-size: 9px; color: #f0f0f0;");
+    auto* addPlaylistButton = new QToolButton(playlistHeader);
+    addPlaylistButton->setIcon(QIcon::fromTheme("list-add"));
+    addPlaylistButton->setIconSize(QSize(12, 12));
+    addPlaylistButton->setAutoRaise(true);
+    addPlaylistButton->setCursor(Qt::PointingHandCursor);
+    addPlaylistButton->setToolTip(tr("Create new playlist"));
+    playlistHeaderLayout->addWidget(playlistLabel, 1);
+    playlistHeaderLayout->addWidget(addPlaylistButton, 0, Qt::AlignRight);
+
+    playlistList = new QListWidget(playlistPage);
+    playlistList->setSelectionMode(QAbstractItemView::SingleSelection);
+    playlistList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    playlistList->setSpacing(2);
+    playlistList->setContextMenuPolicy(Qt::CustomContextMenu);
+
+    playlistLayout->addWidget(playlistHeader);
+    playlistLayout->addWidget(playlistList, 1);
+
+    navigationTabs->addTab(playlistPage, QIcon::fromTheme("view-media-playlist"), tr("Playlists"));
+
+    // Explorer tab
+    auto* explorerPage = new QWidget(navigationTabs);
+    auto* explorerLayout = new QVBoxLayout(explorerPage);
+    explorerLayout->setContentsMargins(0, 0, 0, 0);
+    explorerLayout->setSpacing(4);
+    auto* explorerHeader = new QLabel(tr("Folders"), explorerPage);
+    explorerHeader->setStyleSheet("font-weight: 600; font-size: 10px; padding: 5px 9px; color: #f0f0f0;");
+    fileSystemTree = new QTreeView(explorerPage);
     fileSystemTree->setHeaderHidden(true);
     fileSystemTree->setRootIsDecorated(true);
     fileSystemTree->setDragEnabled(true);
     fileSystemTree->setDragDropMode(QAbstractItemView::DragOnly);
-    
-    leftLayout->addWidget(browserHeader);
-    leftLayout->addWidget(fileSystemTree);
+    explorerLayout->addWidget(explorerHeader);
+    explorerLayout->addWidget(fileSystemTree, 1);
+    navigationTabs->addTab(explorerPage, QIcon::fromTheme("folder"), tr("Explorer"));
+
+    leftLayout->addWidget(navigationTabs);
     
     // === RIGHT PANEL: Track Table ===
     auto* rightPanel = new QWidget();
     auto* rightLayout = new QVBoxLayout(rightPanel);
     rightLayout->setContentsMargins(0, 0, 0, 0);
-    
-    // Compact top bar: icons + search (no big buttons)
-    auto* topBarLayout = new QHBoxLayout();
-    topBarLayout->setSpacing(6);
-    topBarLayout->setContentsMargins(0,0,0,0);
+    rightLayout->setSpacing(6);
 
-    // Hidden sort combo (logic only) - we still use header click sorting; hide it.
+    // Sort combo is now exposed in filter row
     sortComboBox = new QComboBox(rightPanel);
     sortComboBox->addItem("Title", LibraryTableModel::SortByTitle);
     sortComboBox->addItem("Artist", LibraryTableModel::SortByArtist);
@@ -918,7 +235,8 @@ void LibraryManager::setupUI()
     sortComboBox->addItem("Genre", LibraryTableModel::SortByGenre);
     sortComboBox->addItem("Year", LibraryTableModel::SortByYear);
     sortComboBox->addItem("File Size", LibraryTableModel::SortByFileSize);
-    sortComboBox->setVisible(false);
+    sortComboBox->setMinimumWidth(108);
+    sortComboBox->setFixedHeight(22);
     connect(sortComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &LibraryManager::onSortModeChanged);
 
     // Actions
@@ -928,6 +246,8 @@ void LibraryManager::setupUI()
     actionClearLibrary = new QAction(QIcon::fromTheme("edit-delete"), "Clear Library", this);
     actionAnalyzeTrack = new QAction(QIcon::fromTheme("view-statistics"), tr("Analyze Track"), this);
     actionAnalyzeTrack->setEnabled(false);
+    actionAnalyzeAdvanced = new QAction(QIcon::fromTheme("tools-wizard"), tr("Analyze (adv)"), this);
+    actionAnalyzeAdvanced->setEnabled(false);
     connect(actionAddFiles, &QAction::triggered, this, &LibraryManager::onAddFilesClicked);
     connect(actionAddFolder, &QAction::triggered, this, &LibraryManager::onAddFolderClicked);
     connect(actionRefresh, &QAction::triggered, this, &LibraryManager::onRefreshClicked);
@@ -937,42 +257,157 @@ void LibraryManager::setupUI()
         if (!selected.isEmpty())
             emit analyzeTracksRequested(selected);
     });
+    connect(actionAnalyzeAdvanced, &QAction::triggered, this, [this]() {
+        const QStringList selected = getSelectedFiles();
+        if (selected.isEmpty())
+            return;
 
-    auto addFilesBtn = new QToolButton(rightPanel); addFilesBtn->setDefaultAction(actionAddFiles); addFilesBtn->setToolTip("Add audio files");
-    auto addFolderBtn = new QToolButton(rightPanel); addFolderBtn->setDefaultAction(actionAddFolder); addFolderBtn->setToolTip("Add folder");
-    auto refreshBtn = new QToolButton(rightPanel); refreshBtn->setDefaultAction(actionRefresh); refreshBtn->setToolTip("Refresh view");
-    auto clearBtn = new QToolButton(rightPanel); clearBtn->setDefaultAction(actionClearLibrary); clearBtn->setToolTip("Clear library");
-    for (auto tb : {addFilesBtn, addFolderBtn, refreshBtn, clearBtn}) {
-        tb->setAutoRaise(true);
-        tb->setIconSize(QSize(16,16));
-        tb->setCursor(Qt::PointingHandCursor);
+        struct Preset { QString label; double minBpm; double maxBpm; };
+        const QVector<Preset> presets = {
+            {tr("78–155 BPM"), 78.0, 155.0},
+            {tr("70–140 BPM"), 70.0, 140.0},
+            {tr("90–180 BPM"), 90.0, 180.0},
+            {tr("100–200 BPM"), 100.0, 200.0},
+            {tr("120–240 BPM"), 120.0, 240.0}
+        };
+
+        QDialog dialog(this);
+        dialog.setWindowTitle(tr("Advanced Analysis"));
+        dialog.setModal(true);
+
+        auto* layout = new QVBoxLayout(&dialog);
+        layout->setContentsMargins(16, 16, 16, 16);
+        layout->setSpacing(12);
+
+        auto* label = new QLabel(tr("Select a BPM range preset:"), &dialog);
+        label->setWordWrap(true);
+        layout->addWidget(label);
+
+        auto* presetCombo = new QComboBox(&dialog);
+        for (const auto& preset : presets) {
+            QVariantList range;
+            range << preset.minBpm << preset.maxBpm;
+            presetCombo->addItem(preset.label, range);
+        }
+        presetCombo->setCurrentIndex(0);
+        layout->addWidget(presetCombo);
+
+        auto* buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+        layout->addWidget(buttonBox);
+
+        connect(buttonBox, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+        if (dialog.exec() != QDialog::Accepted)
+            return;
+
+        const QVariant data = presetCombo->currentData();
+        double minBpm = 78.0;
+        double maxBpm = 155.0;
+        if (data.canConvert<QVariantList>()) {
+            const auto list = data.toList();
+            if (list.size() == 2) {
+                minBpm = list.at(0).toDouble();
+                maxBpm = list.at(1).toDouble();
+            }
+        }
+
+        emit analyzeTracksAdvancedRequested(selected, minBpm, maxBpm);
+    });
+
+    // Compact toolbar with search, sort and actions
+    auto* toolbar = new QFrame(rightPanel);
+    toolbar->setObjectName("libraryToolbar");
+    auto* toolbarLayout = new QHBoxLayout(toolbar);
+    toolbarLayout->setContentsMargins(10, 6, 10, 6);
+    toolbarLayout->setSpacing(6);
+
+    auto makeActionButton = [toolbar](QAction* action, const QString& tooltip) {
+        auto* button = new QToolButton(toolbar);
+        button->setDefaultAction(action);
+        button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        button->setIconSize(QSize(12, 12));
+        button->setCursor(Qt::PointingHandCursor);
+        button->setAutoRaise(false);
+        button->setProperty("class", "primaryAction");
+        button->setMinimumHeight(24);
+        button->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+        if (!tooltip.isEmpty())
+            button->setToolTip(tooltip);
+        return button;
+    };
+
+    auto* searchContainer = new QFrame(toolbar);
+    searchContainer->setObjectName("librarySearchContainer");
+    auto* searchLayout = new QHBoxLayout(searchContainer);
+    searchLayout->setContentsMargins(8, 0, 8, 0);
+    searchLayout->setSpacing(4);
+    auto* searchIcon = new QLabel(searchContainer);
+    searchIcon->setObjectName("searchIcon");
+    searchIcon->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+    const auto searchPixmap = QIcon::fromTheme("edit-find").pixmap(11, 11);
+    if (!searchPixmap.isNull())
+    {
+        searchIcon->setPixmap(searchPixmap);
+    }
+    else
+    {
+        searchIcon->setText(QString::fromUtf8("\xE2\x8C\x95"));
     }
 
-    filterLineEdit = new QLineEdit(rightPanel);
-    filterLineEdit->setPlaceholderText("Search...");
+    filterLineEdit = new QLineEdit(searchContainer);
+    filterLineEdit->setPlaceholderText(tr("Search library"));
     filterLineEdit->setClearButtonEnabled(true);
-    filterLineEdit->setFixedHeight(24);
-    filterLineEdit->setStyleSheet("QLineEdit { padding-left: 22px; background:#23272a; border:1px solid #444; border-radius:4px; font-size:12px; } QLineEdit:focus { border:1px solid #4a9eff; }");
+    filterLineEdit->setFixedHeight(22);
+    filterLineEdit->setMinimumWidth(180);
     connect(filterLineEdit, &QLineEdit::textChanged, [this]() { filterUpdateTimer->start(); });
 
-    // Magnifier icon overlay
-    auto searchWrapper = new QHBoxLayout();
-    searchWrapper->setContentsMargins(0,0,0,0);
-    auto* searchContainer = new QWidget(rightPanel);
-    searchContainer->setLayout(searchWrapper);
-    auto* searchIcon = new QLabel(searchContainer);
-    searchIcon->setPixmap(QIcon::fromTheme("edit-find").pixmap(14,14));
-    searchIcon->setStyleSheet("QLabel { padding-left:4px; color:#aaa; }");
-    searchWrapper->addWidget(searchIcon);
-    searchWrapper->addWidget(filterLineEdit,1);
+    searchLayout->addWidget(searchIcon, 0, Qt::AlignVCenter);
+    searchLayout->addWidget(filterLineEdit, 1);
+    searchContainer->setLayout(searchLayout);
 
-    topBarLayout->addWidget(addFilesBtn);
-    topBarLayout->addWidget(addFolderBtn);
-    topBarLayout->addWidget(refreshBtn);
-    topBarLayout->addWidget(clearBtn);
-    topBarLayout->addSpacing(4);
-    topBarLayout->addWidget(searchContainer,1);
-    topBarLayout->addWidget(sortComboBox); // hidden
+    auto* sortContainer = new QWidget(toolbar);
+    auto* sortLayout = new QHBoxLayout(sortContainer);
+    sortLayout->setContentsMargins(0, 0, 0, 0);
+    sortLayout->setSpacing(4);
+    auto* sortLabel = new QLabel(tr("Sort"), sortContainer);
+    sortLabel->setObjectName("filterCaption");
+    sortLayout->addWidget(sortLabel, 0, Qt::AlignVCenter);
+    sortLayout->addWidget(sortComboBox, 0, Qt::AlignVCenter);
+    sortContainer->setLayout(sortLayout);
+
+    auto* actionContainer = new QWidget(toolbar);
+    auto* actionLayout = new QHBoxLayout(actionContainer);
+    actionLayout->setContentsMargins(0, 0, 0, 0);
+    actionLayout->setSpacing(4);
+    auto* addFilesBtn = makeActionButton(actionAddFiles, tr("Import individual tracks"));
+    auto* addFolderBtn = makeActionButton(actionAddFolder, tr("Scan an entire folder"));
+    auto* refreshBtn = makeActionButton(actionRefresh, tr("Reload metadata and playlists"));
+    auto* clearBtn = makeActionButton(actionClearLibrary, tr("Remove everything from the library"));
+    auto* analyzeColumn = new QWidget(actionContainer);
+    auto* analyzeLayout = new QVBoxLayout(analyzeColumn);
+    analyzeLayout->setContentsMargins(0, 0, 0, 0);
+    analyzeLayout->setSpacing(2);
+    auto* analyzeBtn = makeActionButton(actionAnalyzeTrack, tr("Analyze BPM and beatgrid for selected tracks"));
+    auto* analyzeAdvBtn = makeActionButton(actionAnalyzeAdvanced, tr("Analyze with BPM range presets"));
+    analyzeAdvBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    analyzeLayout->addWidget(analyzeBtn);
+    analyzeLayout->addWidget(analyzeAdvBtn);
+    analyzeColumn->setLayout(analyzeLayout);
+
+    actionLayout->addWidget(addFilesBtn);
+    actionLayout->addWidget(addFolderBtn);
+    actionLayout->addWidget(analyzeColumn);
+    actionLayout->addWidget(refreshBtn);
+    actionLayout->addWidget(clearBtn);
+    actionContainer->setLayout(actionLayout);
+
+    toolbarLayout->addWidget(searchContainer, 1);
+    toolbarLayout->addWidget(sortContainer, 0);
+    toolbarLayout->addStretch(1);
+    toolbarLayout->addWidget(actionContainer, 0, Qt::AlignRight);
+
+    rightLayout->addWidget(toolbar);
     
     // Table view
     model = new LibraryTableModel(rightPanel);
@@ -987,14 +422,6 @@ void LibraryManager::setupUI()
     connect(tableView->selectionModel(), &QItemSelectionModel::selectionChanged, this, &LibraryManager::onSelectionChanged);
     
     // Status and progress for right panel
-    auto* statusLayout = new QHBoxLayout();
-    statusLabel = new QLabel("Ready", rightPanel);
-    progressBar = new QProgressBar(rightPanel);
-    progressBar->setVisible(false);
-    
-    statusLayout->addWidget(statusLabel, 1);
-    statusLayout->addWidget(progressBar);
-    
     analysisStatusLabel = new QLabel(tr("Analysis idle"), rightPanel);
     analysisStatusLabel->setStyleSheet("QLabel { color: #a0a0a0; }");
     analysisStatusLabel->setVisible(true);
@@ -1007,17 +434,23 @@ void LibraryManager::setupUI()
     analysisProgressBar->setVisible(true);
     analysisProgressBar->setFixedHeight(12);
 
-    auto* analysisLayout = new QHBoxLayout();
-    analysisLayout->setContentsMargins(0, 0, 0, 0);
-    analysisLayout->setSpacing(8);
-    analysisLayout->addWidget(analysisStatusLabel, 1);
-    analysisLayout->addWidget(analysisProgressBar, 0);
+    auto* footerBar = new QFrame(rightPanel);
+    footerBar->setObjectName("libraryFooterBar");
+    auto* footerLayout = new QHBoxLayout(footerBar);
+    footerLayout->setContentsMargins(8, 4, 8, 4);
+    footerLayout->setSpacing(6);
+    statusLabel = new QLabel("Ready", footerBar);
+    progressBar = new QProgressBar(footerBar);
+    progressBar->setVisible(false);
+    footerLayout->addWidget(statusLabel, 1);
+    footerLayout->addWidget(progressBar, 0);
+    footerLayout->addSpacing(6);
+    footerLayout->addWidget(analysisStatusLabel, 0);
+    footerLayout->addWidget(analysisProgressBar, 0);
 
     // Assemble right panel
-    rightLayout->addLayout(topBarLayout);
     rightLayout->addWidget(tableView, 1);
-    rightLayout->addLayout(statusLayout);
-    rightLayout->addLayout(analysisLayout);
+    rightLayout->addWidget(footerBar);
     
     // Add panels to splitter
     mainSplitter->addWidget(leftPanel);
@@ -1031,6 +464,14 @@ void LibraryManager::setupUI()
     // Add splitter to main layout
     mainLayout->addWidget(mainSplitter);
     
+    connect(navigationTabs, &QTabWidget::currentChanged, this, &LibraryManager::onNavigationTabChanged);
+    connect(collectionList, &QListWidget::currentRowChanged, this, &LibraryManager::onCollectionSelectionChanged);
+    connect(playlistList, &QListWidget::itemSelectionChanged, this, &LibraryManager::onPlaylistSelectionChanged);
+    connect(playlistList, &QWidget::customContextMenuRequested, this, &LibraryManager::onPlaylistContextMenu);
+    connect(playlistList, &QListWidget::itemDoubleClicked, this, &LibraryManager::onPlaylistItemDoubleClicked);
+    connect(addPlaylistButton, &QToolButton::clicked, this, &LibraryManager::onAddPlaylistClicked);
+
+    initializeNavigationState();
     updateStatusLabel();
 }
 
@@ -1069,6 +510,426 @@ void LibraryManager::setupFileSystemModel()
     // Enable drag from file system tree
     fileSystemTree->setDragEnabled(true);
     fileSystemTree->setDragDropMode(QAbstractItemView::DragOnly);
+}
+
+void LibraryManager::initializeNavigationState()
+{
+    if (navigationTabs)
+        navigationTabs->setCurrentIndex(0);
+
+    if (collectionList && collectionList->count() > 0)
+        collectionList->setCurrentRow(0);
+
+    currentViewMode = LibraryViewMode::Collection;
+}
+
+void LibraryManager::onNavigationTabChanged(int index)
+{
+    if (!model)
+        return;
+
+    switch (index)
+    {
+    case 0:
+        currentViewMode = LibraryViewMode::Collection;
+        clearPlaylistFilter();
+        updateStatusLabel();
+        break;
+    case 1:
+        currentViewMode = LibraryViewMode::Playlists;
+        ensurePlaylistSelection();
+        if (currentPlaylistId > 0)
+            applyPlaylistFilter(currentPlaylistId);
+        else
+            updateStatusLabel();
+        break;
+    case 2:
+    default:
+        currentViewMode = LibraryViewMode::Explorer;
+        clearPlaylistFilter();
+        updateStatusLabel();
+        break;
+    }
+}
+
+void LibraryManager::onCollectionSelectionChanged(int row)
+{
+    Q_UNUSED(row);
+    if (currentViewMode != LibraryViewMode::Collection)
+        return;
+
+    clearPlaylistFilter();
+    updateStatusLabel();
+}
+
+void LibraryManager::onPlaylistSelectionChanged()
+{
+    if (!playlistList)
+        return;
+
+    QListWidgetItem* item = playlistList->currentItem();
+    if (!item)
+    {
+        if (currentViewMode == LibraryViewMode::Playlists)
+        {
+            model->clearPlaylistFilter();
+            updateStatusLabel();
+        }
+        return;
+    }
+
+    const int playlistId = item->data(Qt::UserRole).toInt();
+    currentPlaylistId = playlistId;
+
+    if (currentViewMode == LibraryViewMode::Playlists)
+        applyPlaylistFilter(playlistId);
+}
+
+void LibraryManager::onPlaylistContextMenu(const QPoint& pos)
+{
+    if (!playlistList)
+        return;
+
+    QListWidgetItem* item = playlistList->itemAt(pos);
+    if (item && playlistList->currentItem() != item)
+        playlistList->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+
+    QMenu menu(this);
+    menu.addAction(tr("New Playlist"), this, &LibraryManager::onAddPlaylistClicked);
+
+    if (playlistList->currentItem())
+    {
+        menu.addAction(tr("Rename"), this, &LibraryManager::onRenamePlaylistRequested);
+        menu.addAction(tr("Delete"), this, &LibraryManager::onDeletePlaylistRequested);
+    }
+
+    menu.exec(playlistList->mapToGlobal(pos));
+}
+
+void LibraryManager::onAddPlaylistClicked()
+{
+    if (!libraryDatabase)
+        return;
+
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, tr("Create Playlist"), tr("Playlist name:"), QLineEdit::Normal, QString(), &ok).trimmed();
+    if (!ok || name.isEmpty())
+        return;
+
+    PlaylistRecord record;
+    if (!libraryDatabase->createPlaylist(name, &record))
+    {
+        QMessageBox::warning(this, tr("Playlist"), tr("Could not create playlist."));
+        return;
+    }
+
+    playlistRecords.append(record);
+    playlistItemCache.remove(record.id);
+    currentPlaylistId = record.id;
+    refreshPlaylistList();
+    ensurePlaylistSelection();
+
+    if (currentViewMode == LibraryViewMode::Playlists)
+        applyPlaylistFilter(record.id);
+}
+
+void LibraryManager::onRenamePlaylistRequested()
+{
+    if (!libraryDatabase || !playlistList)
+        return;
+
+    QListWidgetItem* item = playlistList->currentItem();
+    if (!item)
+        return;
+
+    const int playlistId = item->data(Qt::UserRole).toInt();
+    const QString currentName = playlistNameById(playlistId);
+
+    bool ok = false;
+    const QString newName = QInputDialog::getText(this, tr("Rename Playlist"), tr("New name:"), QLineEdit::Normal, currentName, &ok).trimmed();
+    if (!ok || newName.isEmpty() || newName == currentName)
+        return;
+
+    if (!libraryDatabase->renamePlaylist(playlistId, newName))
+    {
+        QMessageBox::warning(this, tr("Playlist"), tr("Could not rename playlist."));
+        return;
+    }
+
+    const int index = findPlaylistIndexById(playlistId);
+    if (index >= 0)
+        playlistRecords[index].name = newName;
+
+    refreshPlaylistList();
+    ensurePlaylistSelection();
+    updatePlaylistStatusUi();
+}
+
+void LibraryManager::onDeletePlaylistRequested()
+{
+    if (!libraryDatabase || !playlistList)
+        return;
+
+    QListWidgetItem* item = playlistList->currentItem();
+    if (!item)
+        return;
+
+    const int playlistId = item->data(Qt::UserRole).toInt();
+    const QString name = playlistNameById(playlistId);
+
+    const auto answer = QMessageBox::question(this,
+                                              tr("Delete Playlist"),
+                                              tr("Delete playlist \"%1\"?" ).arg(name));
+    if (answer != QMessageBox::Yes)
+        return;
+
+    if (!libraryDatabase->deletePlaylist(playlistId))
+    {
+        QMessageBox::warning(this, tr("Playlist"), tr("Could not delete playlist."));
+        return;
+    }
+
+    playlistItemCache.remove(playlistId);
+    const int index = findPlaylistIndexById(playlistId);
+    if (index >= 0)
+        playlistRecords.removeAt(index);
+
+    if (currentPlaylistId == playlistId)
+        model->clearPlaylistFilter();
+
+    currentPlaylistId = -1;
+    refreshPlaylistList();
+    ensurePlaylistSelection();
+    updateStatusLabel();
+}
+
+void LibraryManager::onPlaylistItemDoubleClicked(QListWidgetItem* item)
+{
+    if (!item)
+        return;
+
+    playlistList->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+    onRenamePlaylistRequested();
+}
+
+void LibraryManager::loadPlaylists()
+{
+    playlistRecords.clear();
+    playlistItemCache.clear();
+
+    if (!libraryDatabase)
+    {
+        refreshPlaylistList();
+        return;
+    }
+
+    playlistRecords = libraryDatabase->loadAllPlaylists();
+    refreshPlaylistList();
+    ensurePlaylistSelection();
+}
+
+void LibraryManager::refreshPlaylistList()
+{
+    if (!playlistList)
+        return;
+
+    const int previousId = currentPlaylistId;
+    QSignalBlocker blocker(playlistList);
+    playlistList->clear();
+
+    for (const auto& record : playlistRecords)
+    {
+        auto* item = new QListWidgetItem(QStringLiteral("%1 (%2)").arg(record.name).arg(record.trackCount), playlistList);
+        item->setData(Qt::UserRole, record.id);
+        item->setToolTip(tr("%1 tracks").arg(record.trackCount));
+    }
+
+    currentPlaylistId = previousId;
+}
+
+void LibraryManager::ensurePlaylistSelection()
+{
+    if (!playlistList)
+        return;
+
+    if (playlistRecords.isEmpty())
+    {
+        playlistList->clearSelection();
+        updateStatusLabel();
+        return;
+    }
+
+    int index = findPlaylistIndexById(currentPlaylistId);
+    if (index < 0)
+        index = 0;
+
+    if (index >= 0 && index < playlistList->count())
+        playlistList->setCurrentRow(index);
+
+    currentPlaylistId = playlistList->currentItem() ? playlistList->currentItem()->data(Qt::UserRole).toInt() : -1;
+
+    if (currentViewMode == LibraryViewMode::Playlists && currentPlaylistId > 0)
+        applyPlaylistFilter(currentPlaylistId);
+}
+
+void LibraryManager::applyPlaylistFilter(int playlistId)
+{
+    if (!model)
+        return;
+
+    if (playlistId <= 0)
+    {
+        model->clearPlaylistFilter();
+        updateStatusLabel();
+        return;
+    }
+
+    const QVector<PlaylistItemRecord> items = getPlaylistItems(playlistId);
+    QSet<QString> allowed;
+    allowed.reserve(items.size());
+    for (const auto& item : items)
+        allowed.insert(item.filePath);
+
+    model->setPlaylistFilter(allowed);
+    updatePlaylistStatusUi();
+}
+
+void LibraryManager::clearPlaylistFilter()
+{
+    if (model && model->isPlaylistFilterActive())
+        model->clearPlaylistFilter();
+}
+
+void LibraryManager::addTracksToPlaylist(int playlistId, const QStringList& filePaths)
+{
+    if (!libraryDatabase || playlistId <= 0 || filePaths.isEmpty())
+        return;
+
+    bool changed = false;
+    for (const QString& path : filePaths)
+    {
+        PlaylistItemRecord newItem;
+        if (libraryDatabase->addTrackToPlaylist(playlistId, path, -1, &newItem))
+            changed = true;
+    }
+
+    if (!changed)
+        return;
+
+    QVector<PlaylistItemRecord> refreshedItems;
+    if (libraryDatabase)
+        refreshedItems = libraryDatabase->loadPlaylistItems(playlistId);
+
+    playlistItemCache.insert(playlistId, refreshedItems);
+
+    const int index = findPlaylistIndexById(playlistId);
+    if (index >= 0)
+        playlistRecords[index].trackCount = refreshedItems.size();
+
+    refreshPlaylistList();
+    ensurePlaylistSelection();
+
+    if (currentViewMode == LibraryViewMode::Playlists && currentPlaylistId == playlistId)
+        applyPlaylistFilter(playlistId);
+    else
+        updateStatusLabel();
+}
+
+void LibraryManager::removeTracksFromCurrentPlaylist(const QStringList& filePaths)
+{
+    if (!libraryDatabase || currentPlaylistId <= 0 || filePaths.isEmpty())
+        return;
+
+    QVector<PlaylistItemRecord> items = getPlaylistItems(currentPlaylistId);
+    bool changed = false;
+
+    for (const QString& path : filePaths)
+    {
+        auto it = std::find_if(items.begin(), items.end(), [&path](const PlaylistItemRecord& record) {
+            return record.filePath.compare(path, Qt::CaseInsensitive) == 0;
+        });
+
+        if (it == items.end())
+            continue;
+
+        if (libraryDatabase->removePlaylistItem(it->id))
+        {
+            changed = true;
+            items.erase(it);
+        }
+    }
+
+    if (!changed)
+        return;
+
+    QVector<PlaylistItemRecord> refreshedItems;
+    if (libraryDatabase)
+        refreshedItems = libraryDatabase->loadPlaylistItems(currentPlaylistId);
+
+    playlistItemCache.insert(currentPlaylistId, refreshedItems);
+
+    const int index = findPlaylistIndexById(currentPlaylistId);
+    if (index >= 0)
+        playlistRecords[index].trackCount = refreshedItems.size();
+
+    refreshPlaylistList();
+    ensurePlaylistSelection();
+
+    if (currentViewMode == LibraryViewMode::Playlists)
+        applyPlaylistFilter(currentPlaylistId);
+    else
+        updateStatusLabel();
+}
+
+QVector<PlaylistItemRecord> LibraryManager::getPlaylistItems(int playlistId)
+{
+    if (playlistItemCache.contains(playlistId))
+        return playlistItemCache.value(playlistId);
+
+    QVector<PlaylistItemRecord> items;
+    if (libraryDatabase)
+        items = libraryDatabase->loadPlaylistItems(playlistId);
+
+    playlistItemCache.insert(playlistId, items);
+    return items;
+}
+
+int LibraryManager::findPlaylistIndexById(int playlistId) const
+{
+    for (int i = 0; i < playlistRecords.size(); ++i)
+    {
+        if (playlistRecords.at(i).id == playlistId)
+            return i;
+    }
+    return -1;
+}
+
+QString LibraryManager::playlistNameById(int playlistId) const
+{
+    const int index = findPlaylistIndexById(playlistId);
+    if (index >= 0)
+        return playlistRecords.at(index).name;
+    return QString();
+}
+
+void LibraryManager::updatePlaylistStatusUi()
+{
+    if (!statusLabel || !model || currentPlaylistId <= 0 || !model->isPlaylistFilterActive())
+        return;
+
+    const QString name = playlistNameById(currentPlaylistId);
+    int totalTracks = 0;
+    const int index = findPlaylistIndexById(currentPlaylistId);
+    if (index >= 0)
+        totalTracks = playlistRecords.at(index).trackCount;
+    else
+        totalTracks = getPlaylistItems(currentPlaylistId).size();
+
+    const int filtered = model->getFilteredCount();
+    if (filtered == totalTracks)
+        statusLabel->setText(tr("Playlist \"%1\" · %2 tracks").arg(name).arg(totalTracks));
+    else
+        statusLabel->setText(tr("Playlist \"%1\": %2 of %3 tracks matched").arg(name).arg(filtered).arg(totalTracks));
 }
 
 void LibraryManager::addFiles(const QStringList& files)
@@ -1357,11 +1218,23 @@ void LibraryManager::onSelectionChanged()
     if (!currentFile.isEmpty()) {
         // Could emit a preview signal here
     }
+
+    const bool hasSelection = !getSelectedFiles().isEmpty();
+    if (actionAnalyzeTrack)
+        actionAnalyzeTrack->setEnabled(hasSelection);
+    if (actionAnalyzeAdvanced)
+        actionAnalyzeAdvanced->setEnabled(hasSelection);
 }
 
 void LibraryManager::updateStatusLabel()
 {
-    if (isLoading) return;
+    if (isLoading || !model || !statusLabel) return;
+
+    if (model->isPlaylistFilterActive() && currentPlaylistId > 0)
+    {
+        updatePlaylistStatusUi();
+        return;
+    }
     
     int filtered = model->getFilteredCount();
     int total = model->getTotalCount();
@@ -1395,6 +1268,8 @@ void LibraryManager::onContextMenuRequested(const QPoint& pos)
         track = model->getTrack(index.row());
     }
 
+    const QStringList selectedFiles = getSelectedFiles();
+
     if (track) {
         QMenu* loadToMenu = menu.addMenu("Load To");
         actionLoadDeck1 = new QAction("Deck 1", loadToMenu);
@@ -1410,13 +1285,39 @@ void LibraryManager::onContextMenuRequested(const QPoint& pos)
             emit loadToDeck(2, filePath);
         });
 
+        if (!playlistRecords.isEmpty())
+        {
+            QMenu* addToMenu = menu.addMenu(tr("Add to Playlist"));
+            for (const auto& record : playlistRecords)
+            {
+                QAction* action = addToMenu->addAction(record.name);
+                connect(action, &QAction::triggered, this, [this, record, selectedFiles]() {
+                    addTracksToPlaylist(record.id, selectedFiles);
+                });
+            }
+        }
+
+        if (model->isPlaylistFilterActive() && currentPlaylistId > 0)
+        {
+            QAction* removeAction = menu.addAction(tr("Remove from \"%1\"").arg(playlistNameById(currentPlaylistId)));
+            connect(removeAction, &QAction::triggered, this, [this, selectedFiles]() {
+                removeTracksFromCurrentPlaylist(selectedFiles);
+            });
+        }
+
         actionAnalyzeTrack->setEnabled(true);
+        if (actionAnalyzeAdvanced)
+            actionAnalyzeAdvanced->setEnabled(true);
         menu.addAction(actionAnalyzeTrack);
+        if (actionAnalyzeAdvanced)
+            menu.addAction(actionAnalyzeAdvanced);
         menu.addSeparator();
     }
     else
     {
         actionAnalyzeTrack->setEnabled(false);
+        if (actionAnalyzeAdvanced)
+            actionAnalyzeAdvanced->setEnabled(false);
     }
 
     menu.addAction(actionRefresh);
@@ -1606,6 +1507,114 @@ void LibraryManager::notifyAnalysisFinished(const QString& filePath, bool succes
     }
 
     updateAnalysisUi();
+}
+
+std::optional<std::array<double, 8>> LibraryManager::getCuePointsForTrack(const QString& filePath) const
+{
+    if (filePath.isEmpty())
+        return std::nullopt;
+
+    if (model)
+    {
+        if (auto existing = model->findTrackByPath(filePath))
+        {
+            if (existing->hasCuePoints)
+                return existing->cuePoints;
+        }
+    }
+
+    if (libraryDatabase)
+    {
+        if (auto persisted = libraryDatabase->loadTrackByPath(filePath))
+        {
+            if (persisted->hasCuePoints)
+                return persisted->cuePoints;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void LibraryManager::saveCuePointsForTrack(const QString& filePath, const std::array<double, 8>& cuePoints)
+{
+    if (filePath.isEmpty())
+        return;
+
+    auto hasValidCuePoints = [](const std::array<double, 8>& cues) {
+        for (double c : cues)
+        {
+            if (c >= 0.0)
+                return true;
+        }
+        return false;
+    };
+
+    auto cuesEqual = [](const std::array<double, 8>& a, const std::array<double, 8>& b) {
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            if (std::abs(a[i] - b[i]) > 1e-6)
+                return false;
+        }
+        return true;
+    };
+
+    TrackInfo track(filePath);
+    bool hadExisting = false;
+
+    if (model)
+    {
+        if (auto existing = model->findTrackByPath(filePath))
+        {
+            track = *existing;
+            hadExisting = true;
+            if (existing->hasCuePoints && cuesEqual(existing->cuePoints, cuePoints))
+                return;
+        }
+    }
+
+    if (!hadExisting && libraryDatabase)
+    {
+        if (auto persisted = libraryDatabase->loadTrackByPath(filePath))
+        {
+            track = *persisted;
+            hadExisting = true;
+            if (persisted->hasCuePoints && cuesEqual(persisted->cuePoints, cuePoints))
+                return;
+        }
+    }
+
+    track.cuePoints = cuePoints;
+    track.hasCuePoints = hasValidCuePoints(cuePoints);
+
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (track.addedAt == 0)
+        track.addedAt = now;
+    track.updatedAt = now;
+
+    if (model)
+        model->addOrUpdateTrack(track);
+
+    persistTrack(track);
+}
+
+std::optional<TrackInfo> LibraryManager::getTrackInfo(const QString& filePath) const
+{
+    if (filePath.isEmpty())
+        return std::nullopt;
+
+    if (model)
+    {
+        if (auto existing = model->findTrackByPath(filePath))
+            return *existing;
+    }
+
+    if (libraryDatabase)
+    {
+        if (auto persisted = libraryDatabase->loadTrackByPath(filePath))
+            return persisted;
+    }
+
+    return std::nullopt;
 }
 
 void LibraryManager::updateAnalysisUi()

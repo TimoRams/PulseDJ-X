@@ -1280,6 +1280,31 @@ void DJAudioPlayer::enableScratch(bool enable) {
     // Never hard-mute here; scratching should remain audible if transport is running
 }
 
+bool DJAudioPlayer::isSoftPaused() const {
+    return softPaused.load();
+}
+
+bool DJAudioPlayer::isAudible() const {
+    return transportSource.isPlaying() && !softPaused.load() && !forceSilent.load();
+}
+
+void DJAudioPlayer::ensureScratchAudible() {
+    forceSilent.store(false);
+    if (softPaused.exchange(false)) {
+        pausedResetPending.store(false);
+        resumeCompensatePending = keylockEnabled;
+    }
+
+    if (!transportSource.isPlaying() && readerSource) {
+        transportSource.setLooping(true);
+        double len = transportSource.getLengthInSeconds();
+        if (pausedPosSec > 0.0 && pausedPosSec <= len) {
+            transportSource.setPosition(pausedPosSec);
+        }
+        transportSource.start();
+    }
+}
+
 void DJAudioPlayer::setKeylockEnabled(bool enabled) {
     // Defer to audio thread to avoid races with getNextAudioBlock
     keylockChangePending.store(enabled ? 1 : 0);

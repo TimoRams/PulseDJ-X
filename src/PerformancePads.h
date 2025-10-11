@@ -27,6 +27,8 @@ public:
     
     // NEW: Get current cue points for waveform display
     const std::array<double, 8>& getCuePoints() const { return cuePoints; }
+    void clearAllCuePoints(bool notify = true);
+    void applyCuePoints(const std::array<double, 8>& points, bool notify = true);
 
 signals:
     void modeChanged(Mode mode);

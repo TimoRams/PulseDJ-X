@@ -5,6 +5,7 @@ Die neue LibraryManager Komponente ersetzt die einfache Dateienkliste mit einem 
 ## Features
 
 ### ID3 Tag Support
+
 - **Titel**: Zeigt den Songtitel aus ID3 Tags an (oder Dateiname als Fallback)
 - **Interpret**: Anzeige des Künstlers aus ID3 Tags
 - **Album**: Album-Information
@@ -15,7 +16,9 @@ Die neue LibraryManager Komponente ersetzt die einfache Dateienkliste mit einem 
 - **Dateigröße**: Anzeige der Dateigröße
 
 ### Sortierungsmöglichkeiten
+
 Das Dropdown-Menü "Sort by" ermöglicht Sortierung nach:
+
 - **Title** (Titel)
 - **Artist** (Interpret)
 - **Album**
@@ -26,11 +29,13 @@ Das Dropdown-Menü "Sort by" ermöglicht Sortierung nach:
 - **File Size** (Dateigröße)
 
 ### Filter/Suche
+
 - Suchfeld filtert in Echtzeit durch alle Metadaten
 - Sucht in Titel, Interpret, Album und Genre
 - Zeigt Anzahl der gefilterten vs. Gesamttracks an
 
 ### Dateiverwaltung
+
 - **"Add Files..."**: Einzelne Audiodateien hinzufügen
 - **"Add Folder..."**: Komplette Ordner (mit Unterordnern) hinzufügen
 - **"Clear Library"**: Bibliothek komplett leeren
@@ -39,30 +44,42 @@ Das Dropdown-Menü "Sort by" ermöglicht Sortierung nach:
 ### Verwendung
 
 #### Tracks laden
+
 1. **Doppelklick** auf einen Track lädt ihn ins aktuell fokussierte Deck
 2. **Drag & Drop** von Tracks auf die Decks
 3. Auswahl mit Pfeiltasten und Enter
 
 #### Automatische Initialisierung
+
 - Beim Start werden automatisch Dateien aus dem "Music" Ordner geladen
 - ID3 Tags werden im Hintergrund analysiert (mit Fortschrittsanzeige)
 
 ## Technische Details
 
 ### Hintergrundverarbeitung
+
 - ID3 Tag-Extraktion läuft in separaten Threads
 - Keine UI-Blockierung während des Ladens
 - Fortschrittsanzeige für große Bibliotheken
 
 ### Speicheroptimierung
+
 - Lazy Loading der Audiodaten
 - Effiziente Tabellendarstellung
 - Minimaler Speicherverbrauch für Metadaten
 
 ### Drag & Drop Integration
+
 - Vollständige Integration mit den bestehenden Deck-Widgets
 - MIME-Type Unterstützung für Dateitransfer
 - Mehrfachauswahl möglich
+
+### Aktuelle Code-Struktur
+
+- `LibraryManager.cpp`: Qt-Widget-Logik, UI-Aufbau, Datenbank-Anbindung
+- `LibraryMetadata.cpp`: Hintergrund-Thread zur Metadatenextraktion und Helper
+- `LibraryTableModel.cpp`: Model-Logik für die Track-Tabelle und Filterung
+- `LibraryTableView.cpp`: Tabellenansicht mit Drag & Drop und Spaltenkonfiguration
 
 ## Shortcuts
 

@@ -314,19 +314,8 @@ void WaveformDisplay::paintGL()
     }
 
     // Draw active loop only when enabled
-    std::cout << "WaveformDisplay::paintGL loop check: loopEnabled=" << loopEnabled 
-              << ", loopStartSec=" << loopStartSec << ", loopEndSec=" << loopEndSec 
-              << ", audioLength=" << audioLength << std::endl;
     if (loopEnabled && loopEndSec > loopStartSec && audioLength > 0.0) {
-        std::cout << "WaveformDisplay::paintGL calling drawLoopRegion" << std::endl;
         drawLoopRegion(p, leftSecond, rightSecond, timeRange);
-    }
-    
-    // DEBUG: Always draw a red indicator if loop is enabled (for debugging)
-    if (loopEnabled) {
-        p.setPen(QPen(QColor(255, 0, 0), 3));
-        p.drawRect(10, 10, 100, 20);
-        p.drawText(15, 25, QString("LOOP ENABLED: %1-%2").arg(loopStartSec, 0, 'f', 1).arg(loopEndSec, 0, 'f', 1));
     }
     
     // Draw playhead
@@ -440,6 +429,22 @@ void WaveformDisplay::mousePressEvent(QMouseEvent* event)
         // Initialize timing for smooth velocity calculation
         // FIXED: Use instance variable instead of static to prevent deck interference
         scratchStartTime = std::chrono::steady_clock::now();
+        lastScratchTime = scratchStartTime;
+
+        // Capture absolute position in seconds at scratch start for stable offsets
+        double effectiveLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
+        if (playheadPos < 0.0 && prerollEnabled) {
+            scratchAnchorSeconds = playheadPos * prerollTimeSec;
+        } else if (effectiveLength > 0.0) {
+            scratchAnchorSeconds = std::clamp(playheadPos, 0.0, 1.0) * effectiveLength;
+        } else {
+            scratchAnchorSeconds = 0.0;
+        }
+        scratchLastSeconds = scratchAnchorSeconds;
+        scratchInitialAbsPos = scratchAnchorSeconds;
+
+    scratchVelocity = 0.0;
+    lastScratchVelocity = 0.0;
         
         // CRITICAL: Emit scratchStart FIRST before any other operations
         // This should immediately disable normal playback and timer updates
@@ -458,98 +463,76 @@ void WaveformDisplay::mousePressEvent(QMouseEvent* event)
 void WaveformDisplay::mouseMoveEvent(QMouseEvent* event)
 {
     if (scratching && trackLengthSec > 0.0) {
-        // Calculate mouse movement from LAST position for incremental movement
-        int currentX = event->position().x();
-        int deltaX = currentX - lastScratchX; // Use lastScratchX for smooth incremental movement
-        
-        // DIRECTION FIX: Invert deltaX so left mouse = backward waveform movement
-        deltaX = -deltaX;
-        
-        // STABILITY: Skip tiny movements and prevent jitter
-        if (std::abs(deltaX) < 3) { // Increased threshold from 2 to 3 for more stability
+        double currentX = event->position().x();
+
+        double totalLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
+        if (totalLength <= 0.0 && !prerollEnabled) {
+            lastScratchX = currentX;
             return;
         }
-        
-        // STABILITY: Limit maximum movement per frame to prevent jumps
-        if (std::abs(deltaX) > 50) { // Clamp extreme movements
-            deltaX = (deltaX > 0) ? 50 : -50;
-        }
 
-        // ADVANCED CONSISTENCY: Calculate sensitivity based on visible time range
-        // Use the same seconds-per-pixel as rendering. Honor fixed vs variable PPS.
         double zoomFactor = getBeatGridZoomFactor();
-        double basePps = useFixedPixelsPerSecond ? 100.0 : ((double)width() / std::max(1.0, audioLength));
-        double pixelsPerSecond = basePps * zoomFactor;
-
-        // Calculate time-based sensitivity: seconds per pixel
-        double secondsPerPixel = 1.0 / std::max(1e-6, pixelsPerSecond);
-
-        // STABILITY: Apply smoothing factor to reduce sudden jumps
-        double smoothingFactor = 0.8; // Smooth out 20% of the movement
-        double dxSmoothed = (double)deltaX * smoothingFactor;
-
-        // Convert deltaX (pixels) to deltaSec (seconds)
-        double deltaSec = dxSmoothed * secondsPerPixel;
-
-        // Map current playhead to absolute seconds - each deck handles independently
-        double currentSec;
-        if (playheadPos < 0.0 && prerollEnabled) {
-            // This deck is in preroll - calculate independently
-            currentSec = playheadPos * prerollTimeSec;
-        } else {
-            // This deck is in normal range
-            currentSec = std::clamp(playheadPos, 0.0, 1.0) * audioLength;
+        double basePps = 0.0;
+        if (useFixedPixelsPerSecond) {
+            basePps = std::max(10.0, localPixelsPerSecond);
+        } else if (totalLength > 0.0) {
+            basePps = (double)width() / std::max(totalLength, 1e-3);
+        }
+        if (basePps <= 0.0) {
+            basePps = std::max(10.0, localPixelsPerSecond);
         }
 
-        // STABILITY: Independent preroll limits per deck to prevent interference
-        // Each deck uses its own prerollTimeSec for consistent behavior
-        double referencePrerollSec = std::max(0.001, prerollTimeSec);
-        double maxDeltaSec = 0.01 * referencePrerollSec;
-        deltaSec = std::clamp(deltaSec, -maxDeltaSec, maxDeltaSec);
+        double pixelsPerSecond = std::max(1.0, basePps * zoomFactor);
+        double secondsPerPixel = 1.0 / pixelsPerSecond;
+        secondsPerPixel = std::min(secondsPerPixel, 0.05); // cap sensitivity to avoid large jumps
 
-        // Calculate new position - completely independent per deck
-        double newSec = currentSec + deltaSec;
+        double prevSeconds = scratchLastSeconds;
+        double deltaPixels = currentX - lastScratchX;
+        double targetSeconds = prevSeconds - deltaPixels * secondsPerPixel;
+
+        double minSeconds = prerollEnabled ? -prerollTimeSec : 0.0;
+        double maxSeconds = (totalLength > 0.0) ? totalLength : 0.0;
+        targetSeconds = std::clamp(targetSeconds, minSeconds, maxSeconds);
+
         double newPos;
-        if (newSec < 0.0 && prerollEnabled) {
-            // This deck entering/staying in preroll
-            newPos = newSec / referencePrerollSec;
+        if (targetSeconds < 0.0 && prerollEnabled) {
+            double denom = std::max(0.001, prerollTimeSec);
+            newPos = targetSeconds / denom;
+        } else if (totalLength > 0.0) {
+            newPos = targetSeconds / totalLength;
         } else {
-            // This deck in normal range
-            newPos = (audioLength > 0.0) ? (newSec / audioLength) : playheadPos;
+            newPos = playheadPos;
         }
 
-        // PREROLL: Independent unlimited negative space per deck
-        double minPos = prerollEnabled ? -999.0 : 0.0; // Each deck has its own limit
-        double maxPos = 1.0;
+        if (prerollEnabled) {
+            newPos = std::clamp(newPos, -1.0, 1.0);
+        } else {
+            newPos = std::clamp(newPos, 0.0, 1.0);
+        }
 
-        // Clamp to valid range
-        newPos = std::clamp(newPos, minPos, maxPos);
+        if (std::abs(newPos - playheadPos) > 0.00005) {
+            auto now = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(now - lastScratchTime).count();
+            if (dt > 0.0) {
+                scratchVelocity = (targetSeconds - prevSeconds) / dt;
+                emit scratchVelocityChanged(scratchVelocity);
+            }
+            lastScratchTime = now;
+            scratchLastSeconds = targetSeconds;
+            lastScratchVelocity = scratchVelocity;
 
-        // ANTI-JITTER: Only update if change is significant enough
-        if (std::abs(newPos - playheadPos) > 0.0001) {
-
-            // Debug (reduced frequency to avoid spam)
-            // FIXED: Use instance variable instead of static to prevent deck interference
-            if (++scratchDebugCounter % 10 == 0) { // Only every 10th movement
-                std::cout << "SCRATCH: deltaX=" << deltaX
-                          << " deltaSec=" << deltaSec
-                          << " oldPos=" << playheadPos
+            if (++scratchDebugCounter % 10 == 0) {
+                std::cout << "SCRATCH: deltaPx=" << deltaPixels
+                          << " targetSec=" << targetSeconds
                           << " newPos=" << newPos
-                          << " (preroll=" << (newPos < 0.0 ? "YES" : "NO") << ")" << std::endl;
+                          << " (preroll=" << (targetSeconds < 0.0 ? "YES" : "NO") << ")" << std::endl;
             }
 
-            // Update position
             playheadPos = newPos;
-
-            // CRITICAL: Emit scratchMove to update audio position
-            // This should NOT trigger play - the audio player handles scratch mode separately
             emit scratchMove(newPos);
-
-            // Update display
             update();
         }
-        
-        // Update reference for next move (incremental)
+
         lastScratchX = currentX;
     }
 }
@@ -563,6 +546,9 @@ void WaveformDisplay::mouseReleaseEvent(QMouseEvent* event)
         // IMPORTANT: Emit scratchEnd to restore normal playback behavior
         // The audio player will handle whether to resume playing or stay paused
         emit scratchEnd();
+
+    scratchVelocity = 0.0;
+    emit scratchVelocityChanged(0.0);
         
         // Reset cursor
         setCursor(Qt::ArrowCursor);
@@ -646,13 +632,9 @@ void WaveformDisplay::clearCuePoints() {
 
 // NEW: Loop region support
 void WaveformDisplay::setLoopRegion(bool enabled, double startSec, double endSec) {
-    std::cout << "WaveformDisplay::setLoopRegion called - enabled: " << enabled 
-              << ", startSec: " << startSec << ", endSec: " << endSec << std::endl;
     loopEnabled = enabled;
     loopStartSec = startSec;
     loopEndSec = endSec;
-    std::cout << "WaveformDisplay loop state updated: loopEnabled=" << loopEnabled 
-              << ", loopStartSec=" << loopStartSec << ", loopEndSec=" << loopEndSec << std::endl;
     throttledUpdate();
 }
 

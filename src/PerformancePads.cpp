@@ -105,6 +105,24 @@ void PerformancePads::setBeatIndicator(BeatIndicator* indicator) {
     beatIndicator = indicator;
 }
 
+void PerformancePads::clearAllCuePoints(bool notify) {
+    for (auto& c : cuePoints) {
+        c = -1.0;
+    }
+    updatePadLabels();
+    if (notify) {
+        emit cuePointsChanged(cuePoints);
+    }
+}
+
+void PerformancePads::applyCuePoints(const std::array<double, 8>& points, bool notify) {
+    cuePoints = points;
+    updatePadLabels();
+    if (notify) {
+        emit cuePointsChanged(cuePoints);
+    }
+}
+
 void PerformancePads::setModeCue() {
     currentMode = Mode::Cue;
     cueModeBtn->setChecked(true); loopModeBtn->setChecked(false); jumpModeBtn->setChecked(false);

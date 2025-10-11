@@ -13,6 +13,11 @@
 #include <QComboBox>
 #include <QLineEdit>
 #include <QLabel>
+#include <QTabWidget>
+#include <QListWidget>
+#include <QInputDialog>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFileInfo>
 #include <QDir>
 #include <QTimer>
@@ -26,7 +31,9 @@
 #include <QTreeView>
 #include <QFileSystemModel>
 #include <QVector>
+#include <QSet>
 #include <vector>
+#include <array>
 #include <memory>
 #include <optional>
 
@@ -36,7 +43,11 @@ namespace juce {
     class File;
 }
 
+class QMouseEvent;
+
 class LibraryDatabase;
+struct PlaylistRecord;
+struct PlaylistItemRecord;
 
 // Structure to hold track metadata
 struct TrackInfo {
@@ -60,9 +71,11 @@ struct TrackInfo {
     double trackLengthSeconds = 0.0;
     QVector<double> beatPositions;
     bool analysisFailed = false;
+    std::array<double, 8> cuePoints;
+    bool hasCuePoints = false;
     
-    TrackInfo() = default;
-    TrackInfo(const QString& path) : filePath(path) {}
+    TrackInfo() { cuePoints.fill(-1.0); }
+    TrackInfo(const QString& path) : filePath(path) { cuePoints.fill(-1.0); }
     
     // Get display name (title if available, otherwise filename)
     QString getDisplayTitle() const {
@@ -182,6 +195,10 @@ public:
     const TrackInfo* getTrack(int row) const;
     void setSortMode(SortMode mode, Qt::SortOrder order = Qt::AscendingOrder);
     void setFilterText(const QString& filter);
+    void setPlaylistFilter(const QSet<QString>& allowedFiles);
+    void clearPlaylistFilter();
+    bool isPlaylistFilterActive() const { return playlistFilterActive; }
+    int getPlaylistScopeCount() const { return playlistScopeCount; }
     std::optional<TrackInfo> findTrackByPath(const QString& filePath) const;
     
     // Get filtered tracks count
@@ -194,6 +211,9 @@ private:
     SortMode currentSortMode = SortByTitle;
     Qt::SortOrder currentSortOrder = Qt::AscendingOrder;
     QString filterText;
+    QSet<QString> playlistFilter;
+    bool playlistFilterActive = false;
+    int playlistScopeCount = 0;
     
     void updateFilteredTracks();
     void sortFilteredTracks();
@@ -248,12 +268,16 @@ public:
     void notifyAnalysisStarted(const QString& filePath);
     void notifyAnalysisProgress(const QString& filePath, double progress);
     void notifyAnalysisFinished(const QString& filePath, bool success);
+    std::optional<std::array<double, 8>> getCuePointsForTrack(const QString& filePath) const;
+    void saveCuePointsForTrack(const QString& filePath, const std::array<double, 8>& cuePoints);
+    std::optional<TrackInfo> getTrackInfo(const QString& filePath) const;
     
 signals:
     void fileSelected(const QString& filePath);
     void filesDropped(const QStringList& files);
     void loadToDeck(int deckIndex, const QString& filePath); // New signal for explicit deck loading
     void analyzeTracksRequested(const QStringList& filePaths);
+    void analyzeTracksAdvancedRequested(const QStringList& filePaths, double minBpm, double maxBpm);
     
 private slots:
     void onTrackLoaded(const TrackInfo& track);
@@ -269,10 +293,21 @@ private slots:
     void onTableDoubleClicked(const QModelIndex& index);
     void onSelectionChanged();
     void onFileSystemSelectionChanged();
+    void onNavigationTabChanged(int index);
+    void onCollectionSelectionChanged(int row);
+    void onPlaylistSelectionChanged();
+    void onPlaylistContextMenu(const QPoint& pos);
+    void onAddPlaylistClicked();
+    void onRenamePlaylistRequested();
+    void onDeletePlaylistRequested();
+    void onPlaylistItemDoubleClicked(QListWidgetItem* item);
     
 private:
     // UI components
     QSplitter* mainSplitter;
+    QTabWidget* navigationTabs;
+    QListWidget* collectionList;
+    QListWidget* playlistList;
     QTreeView* fileSystemTree;
     QFileSystemModel* fileSystemModel;
     LibraryTableView* tableView;
@@ -285,7 +320,8 @@ private:
         QAction* actionClearLibrary; // Replaced QPushButton with QAction
         QAction* actionLoadDeck1 = nullptr; // Context-menu created; keep pointers if we later need enable/disable
         QAction* actionLoadDeck2 = nullptr;
-        QAction* actionAnalyzeTrack = nullptr;
+    QAction* actionAnalyzeTrack = nullptr;
+    QAction* actionAnalyzeAdvanced = nullptr;
     QLabel* statusLabel;
     QProgressBar* progressBar;
     QLabel* analysisStatusLabel = nullptr;
@@ -299,16 +335,34 @@ private:
     bool isLoading = false;
     QTimer* filterUpdateTimer;
     bool columnsSizedOnce = false; // run auto-size only after first load
+
+    enum class LibraryViewMode { Collection, Playlists, Explorer };
+    LibraryViewMode currentViewMode = LibraryViewMode::Collection;
+    QVector<PlaylistRecord> playlistRecords;
+    QHash<int, QVector<PlaylistItemRecord>> playlistItemCache;
+    int currentPlaylistId = -1;
     
     void initializeStoragePaths();
     void setupUI();
     void setupFileSystemModel();
+    void initializeNavigationState();
     void updateStatusLabel();
     QStringList getSupportedAudioFiles(const QString& directory, bool recursive = true);
     void autoSizeColumnsInitial();
     void restoreColumnState();
     void saveColumnState();
     void loadExistingTracks();
+    void loadPlaylists();
+    void refreshPlaylistList();
+    void ensurePlaylistSelection();
+    void applyPlaylistFilter(int playlistId);
+    void clearPlaylistFilter();
+    void addTracksToPlaylist(int playlistId, const QStringList& filePaths);
+    void removeTracksFromCurrentPlaylist(const QStringList& filePaths);
+    QVector<PlaylistItemRecord> getPlaylistItems(int playlistId);
+    int findPlaylistIndexById(int playlistId) const;
+    QString playlistNameById(int playlistId) const;
+    void updatePlaylistStatusUi();
     void persistTrack(const TrackInfo& track);
     void updateAnalysisUi();
 

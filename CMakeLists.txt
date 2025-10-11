@@ -120,6 +120,9 @@ target_sources(David
     src/AudioFormatGuard.h
     src/LibraryManager.cpp
     src/LibraryManager.h
+    src/LibraryMetadata.cpp
+    src/LibraryTableModel.cpp
+    src/LibraryTableView.cpp
     src/LibraryDatabase.cpp
     src/LibraryDatabase.h
     src/MasterLevelMonitor.cpp

@@ -80,6 +80,7 @@ public:
     // NEW: Enable preroll functionality for DJ-style cueing
     void setPrerollEnabled(bool enabled) { prerollEnabled = enabled; update(); }
     void setPrerollTime(double seconds) { prerollTimeSec = seconds; update(); }
+    bool isPrerollEnabled() const { return prerollEnabled; }
 
     // Set tempo factor to adjust beat grid timing (deck-specific)
     void setTempoFactor(double factor) { 
@@ -125,6 +126,9 @@ public:
     
     // PREROLL SUPPORT: Check if currently scratching to prevent timer interference
     bool isScratching() const { return scratching; }
+    double getLastScratchVelocity() const { return lastScratchVelocity; }
+    double getPlayheadRelative() const { return playheadPos; }
+    double getPrerollTimeSeconds() const { return prerollTimeSec; }
     
     // DECK ISOLATION FIX: Fixed pixels-per-second system (local per-deck implementation)
     void setUseFixedPixelsPerSecond(bool use) { useFixedPixelsPerSecond = use; update(); }
@@ -285,6 +289,10 @@ private:
     // DECK ISOLATION FIX: Replace static variables with instance variables
     int scratchDebugCounter{0};         // Debug counter for scratch events (was static)
     std::chrono::steady_clock::time_point scratchStartTime; // Scratch timing (was static)
+    std::chrono::steady_clock::time_point lastScratchTime;  // Last movement timestamp for velocity
+    double scratchAnchorSeconds{0.0};    // Absolute seconds position when scratch began
+    double scratchLastSeconds{0.0};      // Previous absolute seconds for velocity
+    double lastScratchVelocity{0.0};     // Persist latest measured scratch velocity
     
     // DECK ISOLATION FIX: Local pixels-per-second storage (was GlobalBeatGrid)
     double localPixelsPerSecond{100.0}; // Local pixels per second instead of global

@@ -53,6 +53,9 @@ public:
     void setScratchVelocity(double velocity);
     void enableScratch(bool enable);
     bool isScratchMode() const { return scratchMode; }
+    bool isSoftPaused() const;
+    bool isAudible() const;
+    void ensureScratchAudible();
 
     // Simple loop control (seconds)
     void enableLoop(double startSec, double lengthSec);
