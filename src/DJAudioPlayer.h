@@ -52,7 +52,8 @@ public:
     // Scratch control - sets playback speed based on scratch velocity
     void setScratchVelocity(double velocity);
     void enableScratch(bool enable);
-    bool isScratchMode() const { return scratchMode; }
+    void setScratchPlaybackContext(bool wasPlaying);
+    bool isScratchMode() const { return scratchMode.load(); }
     bool isSoftPaused() const;
     bool isAudible() const;
     void ensureScratchAudible();
@@ -98,6 +99,9 @@ public:
 
 private:
     void setPosition(double posInSecs);
+    void renderScratchAudio(const AudioSourceChannelInfo &bufferToFill);
+    float fetchScratchSample(AudioFormatReader* reader, double samplePos, int channel);
+    void ensureScratchCache(AudioFormatReader* reader, int64 sampleIndex);
     
 #if defined(RUBBERBAND_FOUND)
     // Recreate/configure Rubber Band according to the selected quality profile
@@ -199,8 +203,25 @@ private:
     double loopEndSec{0.0};
     
     // Scratch state
-    bool scratchMode{false};
-    double scratchVelocity{0.0};
+    std::atomic<bool> scratchMode{false};
+    std::atomic<double> scratchVelocity{0.0};
+    std::atomic<double> scratchTargetSeconds{0.0};
+    std::atomic<bool> scratchJumpPending{false};
+    std::atomic<double> scratchAudioSeconds{0.0};
+    std::atomic<bool> scratchContextWasPlaying{false};
+    double scratchCurrentSeconds{0.0};
+    double scratchSmoothedVelocity{0.0};
+    int scratchFadeSamplesRemaining{0};
+    int scratchFadeSamplesTotal{0};
+    float scratchFadeStartL{0.0f};
+    float scratchFadeStartR{0.0f};
+    float scratchPrevSampleL{0.0f};
+    float scratchPrevSampleR{0.0f};
+    juce::AudioBuffer<float> scratchCacheBuffer;
+    int64 scratchCacheStartSample{0};
+    int scratchCacheValidSamples{0};
+    bool scratchCacheValid{false};
+    static constexpr int SCRATCH_CACHE_SAMPLES = 8192;
     
     // Keylock state
     bool keylockEnabled{false};

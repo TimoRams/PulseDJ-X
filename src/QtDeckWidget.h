@@ -6,6 +6,7 @@
 #include <QLabel>
 #include <QDoubleSpinBox>
 #include <QMenu>
+#include <QString>
 #include <memory>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -45,6 +46,9 @@ public:
     double getMaxTempoFactor() const { return maxTempoFactor; } // Get current maximum tempo range
     // Turntable control
     void setPlatterSeconds(double seconds) { if (turntable) turntable->setPositionSeconds(seconds); }
+
+    void setTrackNameDisplay(const QString& text, const QString& tooltip = QString());
+    void setTrackInfoDisplay(const QString& text, const QString& style = QString(), const QString& tooltip = QString());
     
     // Getter for Rekordbox-style layout (waveform now integrated into controls)
     QWidget* getControlsWidget() const { return controlsWidget; }
@@ -92,6 +96,7 @@ private:
     QWidget* controlsWidget;  // Separate widget for controls
     QLabel* deckTitleLabel;
     QLabel* songNameLabel;
+    QLabel* trackInfoLabel;
     QPushButton* playPauseBtn;
     QPushButton* loadBtn;
     QPushButton* unloadBtn;

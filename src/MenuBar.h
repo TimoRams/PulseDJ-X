@@ -13,6 +13,9 @@
 #include <QTimer>
 #include <QFile>
 #include <QTextStream>
+#include <QMouseEvent>
+#include <QPoint>
+#include <QEvent>
 
 class QtMainWindow;
 class PreferencesDialog;
@@ -50,6 +53,16 @@ private:
     void setupLogoWidget();
     void setupSystemMonitoring();
     void createMenuActions();
+
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void registerDragRegion(QWidget* widget);
+    void beginWindowDrag(const QPoint& globalPos);
+    void continueWindowDrag(const QPoint& globalPos);
+    void endWindowDrag();
+    void cancelPendingDrag();
 
     // Parent window reference
     QtMainWindow* mainWindow;
@@ -92,4 +105,11 @@ private:
 
     // Preferences dialog
     PreferencesDialog* preferencesDialog;
+
+    // Window dragging state
+    bool draggingWindow = false;
+    bool dragPending = false;
+    QPoint dragStartGlobal;
+    QAction* pressedAction = nullptr;
+    QWidget* windowControlsWidget = nullptr;
 };

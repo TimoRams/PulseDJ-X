@@ -16,6 +16,8 @@
 #include <QUrl>
 #include <QFile>
 #include <QTextStream>
+#include <QtGlobal>
+#include <juce_core/juce_core.h>
 
 MenuBar::MenuBar(QtMainWindow* parent) 
     : QMenuBar(parent), mainWindow(parent), preferencesDialog(nullptr) {
@@ -86,6 +88,7 @@ void MenuBar::setupLogoWidget() {
     logoLayout->addWidget(versionText);
     
     setCornerWidget(logoWidget, Qt::TopLeftCorner);
+    registerDragRegion(logoWidget);
 }
 
 void MenuBar::createMenuActions() {
@@ -293,7 +296,7 @@ void MenuBar::setupSystemMonitoring() {
     systemLayout->addSpacing(15);
     
     // Window control buttons (minimize, maximize, close)
-    auto windowControlsWidget = new QWidget();
+    windowControlsWidget = new QWidget();
     auto windowControlsLayout = new QHBoxLayout(windowControlsWidget);
     windowControlsLayout->setContentsMargins(0, 0, 0, 0);
     windowControlsLayout->setSpacing(2);
@@ -345,6 +348,7 @@ void MenuBar::setupSystemMonitoring() {
     systemLayout->addWidget(windowControlsWidget);
     
     setCornerWidget(systemWidget, Qt::TopRightCorner);
+    registerDragRegion(systemWidget);
     
     // Setup system monitoring timer
     systemTimer = new QTimer(this);
@@ -596,12 +600,18 @@ void MenuBar::showAbout() {
     QMessageBox about(this);
     about.setWindowTitle("About BetaPulseX");
     about.setTextFormat(Qt::RichText);
-    about.setText(
+    const QString qtVersion = QString::fromLatin1(qVersion());
+    const QString juceVersion = QString::fromStdString(juce::SystemStats::getJUCEVersion().toStdString());
+    const QString aboutText = QStringLiteral(
         "<h3>BetaPulseX v1.0-beta</h3>"
         "<p>Professional DJ Software Suite</p>"
-        "<p>Built with Qt6 and JUCE Framework</p>"
+        "<p><b>Framework Versions</b></p>"
+        "<ul>"
+        "<li>Qt %1</li>"
+        "<li>JUCE %2</li>"
+        "</ul>"
         "<br>"
-        "<p><b>Features:</b></p>"
+        "<p><b>Highlights:</b></p>"
         "<ul>"
         "<li>High-quality audio engine with RubberBand keylock</li>"
         "<li>Advanced waveform analysis and visualization</li>"
@@ -610,7 +620,8 @@ void MenuBar::showAbout() {
         "</ul>"
         "<br>"
         "<p>Copyright © 2025 BetaPulseX Development Team</p>"
-    );
+    ).arg(qtVersion, juceVersion);
+    about.setText(aboutText);
     about.setStandardButtons(QMessageBox::Ok);
     about.exec();
 }
@@ -688,4 +699,162 @@ void MenuBar::updateBatteryLevel(int percentage, bool isCharging) {
 void MenuBar::updateMasterLevels(double leftLevel, double rightLevel) {
     masterLeftBar->setValue(static_cast<int>(leftLevel * 100));
     masterRightBar->setValue(static_cast<int>(rightLevel * 100));
+}
+
+void MenuBar::mousePressEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton && mainWindow) {
+        pressedAction = actionAt(event->pos());
+        dragPending = true;
+    dragStartGlobal = event->globalPosition().toPoint();
+
+        if (!pressedAction) {
+            const QPoint globalPoint = event->globalPosition().toPoint();
+            beginWindowDrag(globalPoint);
+            continueWindowDrag(globalPoint);
+            event->accept();
+            return;
+        }
+    } else {
+        cancelPendingDrag();
+    }
+
+    QMenuBar::mousePressEvent(event);
+}
+
+void MenuBar::mouseMoveEvent(QMouseEvent* event) {
+    if ((event->buttons() & Qt::LeftButton) && mainWindow) {
+        if (draggingWindow) {
+            continueWindowDrag(event->globalPosition().toPoint());
+            event->accept();
+            return;
+        }
+
+        if (dragPending) {
+            const int distance = (event->globalPosition().toPoint() - dragStartGlobal).manhattanLength();
+            if (distance >= QApplication::startDragDistance()) {
+                if (pressedAction) {
+                    setActiveAction(nullptr);
+                }
+                const QPoint globalPoint = event->globalPosition().toPoint();
+                beginWindowDrag(globalPoint);
+                continueWindowDrag(globalPoint);
+                event->accept();
+                return;
+            }
+        }
+    }
+
+    QMenuBar::mouseMoveEvent(event);
+}
+
+void MenuBar::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) {
+        if (draggingWindow) {
+            endWindowDrag();
+            event->accept();
+            return;
+        }
+    }
+
+    QMenuBar::mouseReleaseEvent(event);
+
+    if (event->button() == Qt::LeftButton) {
+        cancelPendingDrag();
+    }
+}
+
+bool MenuBar::eventFilter(QObject* watched, QEvent* event) {
+    if (!mainWindow) {
+        return QMenuBar::eventFilter(watched, event);
+    }
+
+    auto watchedWidget = qobject_cast<QWidget*>(watched);
+    if (windowControlsWidget) {
+        if (watchedWidget == windowControlsWidget ||
+            (windowControlsWidget && windowControlsWidget->isAncestorOf(watchedWidget))) {
+            return QMenuBar::eventFilter(watched, event);
+        }
+    }
+
+    switch (event->type()) {
+        case QEvent::MouseButtonPress: {
+            auto mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton) {
+                cancelPendingDrag();
+                beginWindowDrag(mouseEvent->globalPosition().toPoint());
+                event->accept();
+                return true;
+            }
+            break;
+        }
+        case QEvent::MouseMove: {
+            auto mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->buttons() & Qt::LeftButton) {
+                continueWindowDrag(mouseEvent->globalPosition().toPoint());
+                if (draggingWindow) {
+                    event->accept();
+                    return true;
+                }
+            }
+            break;
+        }
+        case QEvent::MouseButtonRelease: {
+            auto mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton && draggingWindow) {
+                endWindowDrag();
+                cancelPendingDrag();
+                event->accept();
+                return true;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return QMenuBar::eventFilter(watched, event);
+}
+
+void MenuBar::registerDragRegion(QWidget* widget) {
+    if (!widget || widget == windowControlsWidget || qobject_cast<QPushButton*>(widget)) {
+        return;
+    }
+
+    widget->installEventFilter(this);
+
+    const auto children = widget->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly);
+    for (QWidget* child : children) {
+        registerDragRegion(child);
+    }
+}
+
+void MenuBar::beginWindowDrag(const QPoint& globalPos) {
+    if (!mainWindow) {
+        draggingWindow = false;
+        return;
+    }
+
+    mainWindow->beginExternalWindowDrag(globalPos);
+    draggingWindow = true;
+    cancelPendingDrag();
+}
+
+void MenuBar::continueWindowDrag(const QPoint& globalPos) {
+    if (!draggingWindow || !mainWindow) {
+        return;
+    }
+
+    mainWindow->updateExternalWindowDrag(globalPos);
+}
+
+void MenuBar::endWindowDrag() {
+    if (draggingWindow && mainWindow) {
+        mainWindow->endExternalWindowDrag();
+    }
+    draggingWindow = false;
+}
+
+void MenuBar::cancelPendingDrag() {
+    dragPending = false;
+    pressedAction = nullptr;
 }

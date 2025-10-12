@@ -43,13 +43,18 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     deckTitleLabel->setStyleSheet("font-weight: bold; font-size: 18px; color: #fff; padding: 10px;");
     
     songNameLabel = new QLabel("No Track Loaded", controlsWidget);
-    songNameLabel->setAlignment(Qt::AlignCenter);
-    songNameLabel->setStyleSheet("font-size: 12px; color: #ccc; padding: 5px;");
-    // Prevent songNameLabel from expanding and changing layout when file names vary in length
-    songNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    songNameLabel->setFixedHeight(18);
-    deckTitleLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    deckTitleLabel->setFixedHeight(32);
+    songNameLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    songNameLabel->setStyleSheet("font-size: 12px; color: #f6f8fb; padding: 0px;");
+    songNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+
+    deckTitleLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    deckTitleLabel->setStyleSheet("color: #4fb0ff; font-weight: bold; font-size: 10px; padding: 0px 6px 0px 0px;");
+    deckTitleLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+
+    trackInfoLabel = new QLabel("No track loaded", controlsWidget);
+    trackInfoLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    trackInfoLabel->setStyleSheet("font-size: 11px; color: #b8bfd0; padding: 0px;");
+    trackInfoLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 
     turntable = new QtTurntableWidget(controlsWidget);
     playPauseBtn = new QPushButton("Play", controlsWidget);
@@ -155,13 +160,15 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     controlsLayout->setContentsMargins(4, 4, 4, 4);  // Reduced from 6
     
     // Header section: Title and track name
-    auto headerLayout = new QVBoxLayout;
-    headerLayout->setSpacing(1);
-    deckTitleLabel->setFixedHeight(20);
-    songNameLabel->setFixedHeight(20); // Increased from 14 to 20 for better readability
-    headerLayout->addWidget(deckTitleLabel);
-    headerLayout->addWidget(songNameLabel);
-    controlsLayout->addLayout(headerLayout);
+    auto headerRow = new QWidget(controlsWidget);
+    headerRow->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    auto headerRowLayout = new QHBoxLayout(headerRow);
+    headerRowLayout->setContentsMargins(4, 4, 4, 4);
+    headerRowLayout->setSpacing(8);
+    headerRowLayout->addWidget(deckTitleLabel);
+    headerRowLayout->addWidget(songNameLabel, 1);
+    headerRowLayout->addWidget(trackInfoLabel, 0);
+    controlsLayout->addWidget(headerRow);
     
     // Waveform overview (more compact)
     waveform->setFixedHeight(25);
@@ -371,7 +378,11 @@ void QtDeckWidget::loadFile(const QString &path) {
         QThreadPool::globalInstance()->start(new SmallOverviewTask(waveform, path));
     }
     QFileInfo fi(path);
-    songNameLabel->setText(fi.fileName());
+    QString baseName = fi.completeBaseName();
+    if (baseName.isEmpty())
+        baseName = fi.fileName();
+    setTrackNameDisplay(baseName, fi.fileName());
+    setTrackInfoDisplay("Loading…", "font-size: 11px; color: #4fb0ff; padding: 2px;", QStringLiteral("Preparing analysis"));
     if (player) {
         // NEW: Start threaded loading instead of blocking synchronous load
         emit fileLoadingStarted(path);  // Signal to start background loading
@@ -401,6 +412,25 @@ void QtDeckWidget::loadFile(const QString &path) {
         }
     }
     // do NOT start turntable here
+}
+
+void QtDeckWidget::setTrackNameDisplay(const QString& text, const QString& tooltip) {
+    if (!songNameLabel)
+        return;
+
+    const QString tip = tooltip.isEmpty() ? text : tooltip;
+    songNameLabel->setText(text);
+    songNameLabel->setToolTip(tip);
+}
+
+void QtDeckWidget::setTrackInfoDisplay(const QString& text, const QString& style, const QString& tooltip) {
+    if (!trackInfoLabel)
+        return;
+
+    static const QString defaultStyle = QStringLiteral("font-size: 11px; color: #b8bfd0; padding: 0px;");
+    trackInfoLabel->setText(text);
+    trackInfoLabel->setToolTip(tooltip.isEmpty() ? text : tooltip);
+    trackInfoLabel->setStyleSheet(style.isEmpty() ? defaultStyle : style);
 }
 
 // NEW: Handle completion of threaded file loading
@@ -535,7 +565,8 @@ void QtDeckWidget::onLoad() {
 void QtDeckWidget::onUnload() {
     // Unload current file
     currentFilePath.clear();
-    songNameLabel->setText("No Track Loaded");
+    setTrackNameDisplay("No Track Loaded");
+    setTrackInfoDisplay("No track loaded", "font-size: 11px; color: #b8bfd0; padding: 2px;");
     loadBtn->setText("Load");
     if (unloadBtn) unloadBtn->setEnabled(false);
     playPauseBtn->setText("Play");

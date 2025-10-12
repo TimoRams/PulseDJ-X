@@ -148,6 +148,11 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         return;
     }
 
+    if (scratchMode.load()) {
+        renderScratchAudio(bufferToFill);
+        return;
+    }
+
     // PREROLL AUDIO HANDLING: If in preroll mode and playing, count toward track start
     if (inPrerollMode && transportSource.isPlaying()) {
         // Calculate how much time to advance based on sample rate and buffer size
@@ -770,6 +775,259 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     }
 }
 
+void DJAudioPlayer::renderScratchAudio(const AudioSourceChannelInfo &bufferToFill) {
+    if (bufferToFill.buffer == nullptr || bufferToFill.numSamples <= 0) {
+        return;
+    }
+
+    auto* outputBuffer = bufferToFill.buffer;
+    const int destChannels = outputBuffer->getNumChannels();
+    outputBuffer->clear(bufferToFill.startSample, bufferToFill.numSamples);
+
+    AudioFormatReader* reader = readerSource ? readerSource->getAudioFormatReader() : nullptr;
+    if (reader == nullptr || reader->sampleRate <= 0.0) {
+        scratchAudioSeconds.store(0.0);
+        scratchPrevSampleL = 0.0f;
+        scratchPrevSampleR = 0.0f;
+        scratchFadeSamplesRemaining = 0;
+        scratchFadeSamplesTotal = 0;
+        return;
+    }
+
+    const double readerSampleRate = reader->sampleRate;
+    double outputRate = currentSampleRate > 0.0 ? currentSampleRate : readerSampleRate;
+    if (outputRate <= 0.0) {
+        outputRate = readerSampleRate;
+    }
+    const double invOutputRate = 1.0 / outputRate;
+
+    const bool contextWasPlaying = scratchContextWasPlaying.load();
+    const bool keylockActive = keylockEnabled;
+
+    auto sanitizeVelocity = [&](double raw) {
+        if (!std::isfinite(raw)) {
+            return 0.0;
+        }
+        const double baseLimit = contextWasPlaying ? 3.3 : 2.4;
+        const double limit = std::max(0.6, keylockActive ? baseLimit * 0.85 : baseLimit);
+        if (limit <= 0.0) {
+            return 0.0;
+        }
+        const double normalised = raw / limit;
+        if (std::abs(normalised) < 1e-5) {
+            return raw;
+        }
+        return limit * std::tanh(normalised);
+    };
+
+    double velocityTarget = sanitizeVelocity(scratchVelocity.load());
+
+    if (scratchJumpPending.exchange(false)) {
+        double jumpSeconds = scratchTargetSeconds.load();
+        scratchCurrentSeconds = jumpSeconds;
+        scratchAudioSeconds.store(jumpSeconds);
+        scratchSmoothedVelocity = sanitizeVelocity(scratchVelocity.load());
+        scratchFadeSamplesRemaining = std::min(bufferToFill.numSamples,
+                                               (int) std::round(outputRate * 0.004)); // ~4ms fade
+        scratchFadeSamplesTotal = scratchFadeSamplesRemaining;
+        scratchFadeStartL = scratchPrevSampleL;
+        scratchFadeStartR = scratchPrevSampleR;
+    }
+
+    const double blockSeconds = std::max(invOutputRate, bufferToFill.numSamples * invOutputRate);
+    const double maxAccelPerSec = (contextWasPlaying ? 28.0 : 21.0) * (keylockActive ? 0.85 : 1.0);
+    const double maxDelta = std::max(0.0, maxAccelPerSec) * blockSeconds;
+    if (maxDelta > 0.0) {
+        velocityTarget = juce::jlimit(scratchSmoothedVelocity - maxDelta,
+                                      scratchSmoothedVelocity + maxDelta,
+                                      velocityTarget);
+    }
+
+    const double smoothingTime = (contextWasPlaying ? 0.012 : 0.018) * (keylockActive ? 1.15 : 1.0);
+    double alpha = 0.0;
+    if (smoothingTime > 0.0) {
+        alpha = std::exp(-blockSeconds / smoothingTime);
+    }
+    alpha = juce::jlimit(0.0, 0.999, alpha);
+    scratchSmoothedVelocity = scratchSmoothedVelocity * alpha + velocityTarget * (1.0 - alpha);
+    if (std::abs(scratchSmoothedVelocity) < 1e-5) {
+        scratchSmoothedVelocity = 0.0;
+    }
+
+    double minSeconds = -prerollTimeSec;
+    double maxSeconds = transportSource.getLengthInSeconds();
+    if (maxSeconds <= 0.0 && trackLengthSec > 0.0) {
+        maxSeconds = trackLengthSec;
+    }
+    if (maxSeconds <= 0.0 && reader->lengthInSamples > 0) {
+        maxSeconds = (reader->lengthInSamples - 1) / readerSampleRate;
+    }
+    if (maxSeconds < 0.0) {
+        maxSeconds = 0.0;
+    }
+
+    double leftSumSq = 0.0;
+    double rightSumSq = 0.0;
+
+    for (int i = 0; i < bufferToFill.numSamples; ++i) {
+        const double positionSeconds = scratchCurrentSeconds;
+        float sampleL = 0.0f;
+        float sampleR = 0.0f;
+
+        if (positionSeconds >= 0.0 && positionSeconds <= maxSeconds + invOutputRate) {
+            double exactSample = positionSeconds * readerSampleRate;
+            sampleL = fetchScratchSample(reader, exactSample, 0);
+            if (reader->numChannels > 1) {
+                sampleR = fetchScratchSample(reader, exactSample, 1);
+            } else {
+                sampleR = sampleL;
+            }
+        }
+
+        if (scratchFadeSamplesRemaining > 0 && scratchFadeSamplesTotal > 0) {
+            double fadeProgress = 1.0 - (double) scratchFadeSamplesRemaining / (double) scratchFadeSamplesTotal;
+            sampleL = scratchFadeStartL * (1.0 - fadeProgress) + sampleL * fadeProgress;
+            sampleR = scratchFadeStartR * (1.0 - fadeProgress) + sampleR * fadeProgress;
+            --scratchFadeSamplesRemaining;
+        }
+
+        const int destIndex = bufferToFill.startSample + i;
+        if (destChannels >= 1) {
+            outputBuffer->setSample(0, destIndex, sampleL);
+        }
+        if (destChannels >= 2) {
+            outputBuffer->setSample(1, destIndex, sampleR);
+        }
+        for (int ch = 2; ch < destChannels; ++ch) {
+            outputBuffer->setSample(ch, destIndex, sampleL);
+        }
+
+        leftSumSq += static_cast<double>(sampleL) * static_cast<double>(sampleL);
+        rightSumSq += static_cast<double>(sampleR) * static_cast<double>(sampleR);
+
+        scratchCurrentSeconds += scratchSmoothedVelocity * invOutputRate;
+
+        if (scratchCurrentSeconds < minSeconds) {
+            scratchCurrentSeconds = minSeconds;
+        }
+        if (scratchCurrentSeconds > maxSeconds) {
+            scratchCurrentSeconds = maxSeconds;
+        }
+    }
+
+    if (bufferToFill.numSamples > 0) {
+        scratchPrevSampleL = outputBuffer->getSample(0, bufferToFill.startSample + bufferToFill.numSamples - 1);
+        if (destChannels >= 2) {
+            scratchPrevSampleR = outputBuffer->getSample(1, bufferToFill.startSample + bufferToFill.numSamples - 1);
+        } else {
+            scratchPrevSampleR = scratchPrevSampleL;
+        }
+    }
+
+    scratchAudioSeconds.store(scratchCurrentSeconds);
+
+    if (bufferToFill.numSamples > 0) {
+        float leftRMS = std::sqrt((float) (leftSumSq / bufferToFill.numSamples));
+        float rightRMS = std::sqrt((float) (rightSumSq / bufferToFill.numSamples));
+
+        const float dbMin = -60.0f;
+        const float dbMax = 0.0f;
+        float leftDb = leftRMS > 0.0f ? 20.0f * std::log10(leftRMS) : dbMin;
+        float rightDb = rightRMS > 0.0f ? 20.0f * std::log10(rightRMS) : dbMin;
+        float leftPercent = juce::jlimit(0.0f, 100.0f, ((leftDb - dbMin) / (dbMax - dbMin)) * 100.0f);
+        float rightPercent = juce::jlimit(0.0f, 100.0f, ((rightDb - dbMin) / (dbMax - dbMin)) * 100.0f);
+
+        const float smoothing = 0.3f;
+        float currentLeft = leftChannelLevel.load();
+        float currentRight = rightChannelLevel.load();
+        leftChannelLevel.store(currentLeft * (1.0f - smoothing) + leftPercent * smoothing);
+        rightChannelLevel.store(currentRight * (1.0f - smoothing) + rightPercent * smoothing);
+    }
+}
+
+void DJAudioPlayer::ensureScratchCache(AudioFormatReader* reader, int64 sampleIndex) {
+    if (reader == nullptr) {
+        scratchCacheValid = false;
+        scratchCacheValidSamples = 0;
+        scratchCacheStartSample = 0;
+        return;
+    }
+
+    const int requiredChannels = std::max(1, (int) reader->numChannels);
+    const int chunkSize = std::max(SCRATCH_CACHE_SAMPLES, lastBlockSizeHint * 4);
+
+    if (!scratchCacheValid || sampleIndex < scratchCacheStartSample ||
+        sampleIndex + 2 >= scratchCacheStartSample + scratchCacheValidSamples) {
+
+        if (scratchCacheBuffer.getNumChannels() < requiredChannels ||
+            scratchCacheBuffer.getNumSamples() < chunkSize) {
+            scratchCacheBuffer.setSize(requiredChannels, chunkSize, false, false, true);
+        }
+
+        scratchCacheBuffer.clear();
+
+        const int64 totalSamples = reader->lengthInSamples;
+        if (totalSamples <= 0) {
+            scratchCacheValid = false;
+            scratchCacheValidSamples = 0;
+            scratchCacheStartSample = 0;
+            return;
+        }
+
+        int64 start = sampleIndex - chunkSize / 2;
+        if (start < 0) {
+            start = 0;
+        }
+        if (start > totalSamples - 1) {
+            start = totalSamples - 1;
+        }
+
+        int samplesToRead = (int) std::min<int64>(chunkSize, totalSamples - start);
+        if (samplesToRead <= 0) {
+            scratchCacheValid = false;
+            scratchCacheValidSamples = 0;
+            scratchCacheStartSample = start;
+            return;
+        }
+
+        reader->read(&scratchCacheBuffer, 0, samplesToRead, start, true, requiredChannels > 1);
+        scratchCacheStartSample = start;
+        scratchCacheValidSamples = samplesToRead;
+        scratchCacheValid = true;
+    }
+}
+
+float DJAudioPlayer::fetchScratchSample(AudioFormatReader* reader, double samplePos, int channel) {
+    if (reader == nullptr || samplePos < 0.0) {
+        return 0.0f;
+    }
+
+    int64 index = (int64) std::floor(samplePos);
+    if (index < 0 || index >= reader->lengthInSamples) {
+        return 0.0f;
+    }
+
+    ensureScratchCache(reader, index);
+
+    if (!scratchCacheValid || scratchCacheValidSamples <= 0) {
+        return 0.0f;
+    }
+
+    int localIndex = (int) (index - scratchCacheStartSample);
+    if (localIndex < 0) {
+        localIndex = 0;
+    } else if (localIndex >= scratchCacheValidSamples) {
+        localIndex = scratchCacheValidSamples - 1;
+    }
+    int nextIndex = std::min(localIndex + 1, scratchCacheValidSamples - 1);
+
+    int bufferChannel = juce::jlimit(0, scratchCacheBuffer.getNumChannels() - 1, channel);
+    float sample1 = scratchCacheBuffer.getSample(bufferChannel, localIndex);
+    float sample2 = scratchCacheBuffer.getSample(bufferChannel, nextIndex);
+    float frac = static_cast<float>(samplePos - (double) index);
+    return sample1 + (sample2 - sample1) * frac;
+}
+
 void DJAudioPlayer::releaseResources() {
     // Safe resource release with proper error handling
     try {
@@ -942,6 +1200,43 @@ void DJAudioPlayer::setPositionRelative(double pos) {
     if (pos < minRelativePos || pos > 1.0) {
         std::cout << "DJAudioPlayer::setPositionRelative should be between " << minRelativePos << " and 1.0 (unlimited preroll)\n";
     } else {
+    if (scratchMode.load()) {
+            double targetSeconds = 0.0;
+            if (pos < 0.0) {
+                targetSeconds = pos * prerollTimeSec;
+            } else {
+                double trackLen = transportSource.getLengthInSeconds();
+                if (trackLen <= 0.0 && trackLengthSec > 0.0) {
+                    trackLen = trackLengthSec;
+                }
+                if (trackLen <= 0.0 && readerSource) {
+                    if (auto* reader = readerSource->getAudioFormatReader()) {
+                        if (reader->sampleRate > 0.0) {
+                            trackLen = (double) reader->lengthInSamples / reader->sampleRate;
+                        }
+                    }
+                }
+                if (trackLen > 0.0) {
+                    targetSeconds = pos * trackLen;
+                } else {
+                    targetSeconds = 0.0;
+                }
+            }
+
+            scratchTargetSeconds.store(targetSeconds);
+            scratchAudioSeconds.store(targetSeconds);
+            scratchJumpPending.store(true);
+            if (targetSeconds < 0.0) {
+                inPrerollMode = true;
+                double denom = std::max(0.001, prerollTimeSec);
+                prerollPosition = juce::jlimit(-1.0, 0.0, targetSeconds / denom);
+            } else {
+                inPrerollMode = false;
+                prerollPosition = 0.0;
+            }
+            return;
+        }
+
         if (pos < 0.0) {
             // In preroll area - set transport to position 0 but remember the preroll offset
             transportSource.setPosition(0.0);
@@ -966,6 +1261,31 @@ void DJAudioPlayer::setPositionRelative(double pos) {
 }
 
 double DJAudioPlayer::getPositionRelative() {
+    if (scratchMode.load()) {
+        double seconds = scratchAudioSeconds.load();
+        if (seconds < 0.0) {
+            double denom = std::max(0.001, prerollTimeSec);
+            return juce::jlimit(-1.0, 0.0, seconds / denom);
+        }
+
+        double lengthInSecs = transportSource.getLengthInSeconds();
+        if (lengthInSecs <= 0.0 && trackLengthSec > 0.0) {
+            lengthInSecs = trackLengthSec;
+        }
+        if (lengthInSecs <= 0.0 && readerSource) {
+            if (auto* reader = readerSource->getAudioFormatReader()) {
+                if (reader->sampleRate > 0.0) {
+                    lengthInSecs = (double) reader->lengthInSamples / reader->sampleRate;
+                }
+            }
+        }
+
+        if (lengthInSecs > 0.0) {
+            return juce::jlimit(0.0, 1.0, seconds / lengthInSecs);
+        }
+        return 0.0;
+    }
+
     // PREROLL SUPPORT: Return preroll position when in preroll mode
     if (inPrerollMode) {
         return prerollPosition;  // Return the negative position
@@ -982,6 +1302,9 @@ double DJAudioPlayer::getPositionRelative() {
 }
 
 double DJAudioPlayer::getCurrentPositionSeconds() const {
+    if (scratchMode.load()) {
+        return scratchAudioSeconds.load();
+    }
     // PREROLL SUPPORT: Report negative time while in preroll to keep UI stable
     if (inPrerollMode) {
         return prerollPosition * prerollTimeSec;
@@ -1267,17 +1590,98 @@ void DJAudioPlayer::disableLoop() {
 }
 
 void DJAudioPlayer::setScratchVelocity(double velocity) {
-    // Store velocity for potential future use (e.g., inertia, vinyl emu)
-    // Actual scratch audio is driven by setPositionRelative() from the UI.
-    scratchVelocity = velocity;
+    if (!std::isfinite(velocity)) {
+        velocity = 0.0;
+    }
+    const double maxSpeed = 8.0; // +/-8x playback speed for ultra-fast spins
+    velocity = juce::jlimit(-maxSpeed, maxSpeed, velocity);
+    scratchVelocity.store(velocity);
+}
+
+void DJAudioPlayer::setScratchPlaybackContext(bool wasPlaying) {
+    scratchContextWasPlaying.store(wasPlaying);
 }
 
 void DJAudioPlayer::enableScratch(bool enable) {
-    // Toggle scratch mode. During scratching, UI drives position updates and we keep audio flowing.
-    scratchMode = enable;
-    // Ensure we don't emit stale buffered audio right after toggling
-    pausedResetPending.store(true);
-    // Never hard-mute here; scratching should remain audible if transport is running
+    bool current = scratchMode.load();
+    if (enable == current) {
+        if (!enable) {
+            scratchVelocity.store(0.0);
+        }
+        return;
+    }
+
+    if (enable) {
+        scratchMode.store(true);
+        scratchVelocity.store(0.0);
+        scratchSmoothedVelocity = 0.0;
+        scratchCacheValid = false;
+        scratchFadeSamplesRemaining = 0;
+        scratchFadeSamplesTotal = 0;
+        scratchPrevSampleL = 0.0f;
+        scratchPrevSampleR = 0.0f;
+        scratchFadeStartL = 0.0f;
+        scratchFadeStartR = 0.0f;
+
+        double currentSec = getCurrentPositionSeconds();
+        scratchCurrentSeconds = currentSec;
+        scratchTargetSeconds.store(currentSec);
+        scratchAudioSeconds.store(currentSec);
+        scratchJumpPending.store(true);
+        if (!scratchContextWasPlaying.load()) {
+            scratchContextWasPlaying.store(false);
+        }
+
+        // Make sure preroll state mirrors the scratch position for UI queries
+        if (currentSec < 0.0) {
+            inPrerollMode = true;
+            prerollPosition = currentSec / std::max(0.001, prerollTimeSec);
+        } else {
+            inPrerollMode = false;
+            prerollPosition = 0.0;
+        }
+
+        pausedResetPending.store(true);
+    } else {
+        scratchMode.store(false);
+        scratchJumpPending.store(false);
+        scratchCacheValid = false;
+        scratchFadeSamplesRemaining = 0;
+        scratchFadeSamplesTotal = 0;
+
+        double finalSec = scratchAudioSeconds.load();
+        scratchVelocity.store(0.0);
+        scratchSmoothedVelocity = 0.0;
+
+        if (finalSec < 0.0) {
+            inPrerollMode = true;
+            double denom = std::max(0.001, prerollTimeSec);
+            prerollPosition = juce::jlimit(-1.0, 0.0, finalSec / denom);
+            transportSource.setPosition(0.0);
+            pausedPosSec = 0.0;
+        } else {
+            inPrerollMode = false;
+            prerollPosition = 0.0;
+            double trackLen = transportSource.getLengthInSeconds();
+            if (trackLen <= 0.0 && trackLengthSec > 0.0) {
+                trackLen = trackLengthSec;
+            }
+            if (trackLen > 0.0) {
+                double clamped = juce::jlimit(0.0, trackLen, finalSec);
+                transportSource.setPosition(clamped);
+                pausedPosSec = clamped;
+            } else {
+                transportSource.setPosition(std::max(0.0, finalSec));
+                pausedPosSec = std::max(0.0, finalSec);
+            }
+        }
+
+        pausedResetPending.store(true);
+        scratchContextWasPlaying.store(false);
+        if (keylockEnabled) {
+            resumeCompensatePending = true;
+        }
+    }
 }
 
 bool DJAudioPlayer::isSoftPaused() const {

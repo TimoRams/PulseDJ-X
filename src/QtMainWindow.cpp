@@ -19,9 +19,14 @@
 #include <QRegularExpression>
 #include <QVector>
 #include <QProgressDialog>
+#include <QMenu>
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <QCursor>
+#include <limits>
+#include <QHoverEvent>
+#include <QWindow>
 
 // StereoAudioCallback - Main JUCE audio callback method
 void StereoAudioCallback::audioDeviceIOCallback(const float* const* inputChannelData, int numInputChannels,
@@ -901,9 +906,15 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 {
     std::cout << "=== QtMainWindow CONSTRUCTOR STARTING ===" << std::endl;
     setWindowTitle("BetaPulseX - Professional DJ Software");
+    setMouseTracking(true);
+    setAttribute(Qt::WA_Hover, true);
+    setAttribute(Qt::WA_StyledBackground, true);
+    if (qApp)
+        qApp->installEventFilter(this);
     
     // Remove window decorations and make frameless
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+    setStyleSheet("QtMainWindow { background-color: #141a1f; border: none; }");
     
     // BetaPulseX: Setup Menu System
     menuBar = new MenuBar(this);
@@ -1006,8 +1017,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             stopScratchInertia(true, scratchInertiaResumeA);
         }
         const bool wasAudible = playerA->isAudible();
-        scratchWasPlayingA = wasAudible;
-        playerA->enableScratch(true);
+    scratchWasPlayingA = wasAudible;
+    playerA->setScratchPlaybackContext(wasAudible);
+    playerA->enableScratch(true);
         if (!wasAudible) {
             playerA->ensureScratchAudible();
         }
@@ -1045,8 +1057,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             stopScratchInertia(false, scratchInertiaResumeB);
         }
         const bool wasAudible = playerB->isAudible();
-        scratchWasPlayingB = wasAudible;
-        playerB->enableScratch(true);
+    scratchWasPlayingB = wasAudible;
+    playerB->setScratchPlaybackContext(wasAudible);
+    playerB->enableScratch(true);
         if (!wasAudible) {
             playerB->ensureScratchAudible();
         }
@@ -1502,23 +1515,14 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     overviewTopB->setFixedHeight(70);
     overviewTopA->setStyleSheet("border: 1px solid #333; background-color: #0a0a0a;");
     overviewTopB->setStyleSheet("border: 1px solid #333; background-color: #0a0a0a;");
-    
-    // Add labels for the overviews (smaller)
-    deckALabel = new QLabel("DECK A - OVERVIEW", this);
-    deckBLabel = new QLabel("DECK B - OVERVIEW", this);
-    deckALabel->setStyleSheet("color: #0088ff; font-weight: bold; font-size: 9px; padding: 1px;");
-    deckBLabel->setStyleSheet("color: #ff8800; font-weight: bold; font-size: 9px; padding: 1px;");
-    // Keep overview labels from changing the main window size when their text changes
-    deckALabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    deckBLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    deckALabel->setFixedHeight(16);
-    deckBLabel->setFixedHeight(16);
-    
-    overviewLayout->setSpacing(2);
-    overviewLayout->addWidget(deckALabel);
+
+    overviewLayout->setSpacing(0);
+    overviewLayout->setContentsMargins(0, 0, 0, 0);
     overviewLayout->addWidget(overviewTopA);
-    overviewLayout->addWidget(deckBLabel);
     overviewLayout->addWidget(overviewTopB);
+
+    updateOverviewLabel(true);
+    updateOverviewLabel(false);
     
     // Main deck controls side by side (more compact spacing)
     auto decksLayout = new QHBoxLayout;
@@ -1698,7 +1702,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     // Main layout: Vertical stack (Compact Serato style)
     auto mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(3);
-    mainLayout->setContentsMargins(5, 5, 5, 5);
+    mainLayout->setContentsMargins(0, 0, 0, 0);
     
     // Add menu bar to the top of the layout
     mainLayout->addWidget(menuBar);
@@ -1957,6 +1961,13 @@ void QtMainWindow::initializeAudio()
 QtMainWindow::~QtMainWindow()
 {
     std::cout << "QtMainWindow destructor called" << std::endl;
+    if (qApp)
+        qApp->removeEventFilter(this);
+    if (cursorOverridden) {
+        QApplication::restoreOverrideCursor();
+        cursorOverridden = false;
+        currentCursorShape = Qt::ArrowCursor;
+    }
     // Only clean up if closeEvent hasn't already done it
     if (!cleanupCompleted) {
         performCleanup();
@@ -2429,7 +2440,7 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
             }
         }
         if (beatIndicator) { beatIndicator->setBeatGridAvailableDeckA(bpm > 0.0); }
-        if (deckALabel) {
+        if (deckA && deckA->getWaveform()) {
             algorithmA = QString::fromStdString(algorithm);
             updateOverviewLabel(true);
         }
@@ -2462,7 +2473,7 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
             }
         }
         if (beatIndicator) { beatIndicator->setBeatGridAvailableDeckB(bpm > 0.0); }
-        if (deckBLabel) {
+        if (deckB && deckB->getWaveform()) {
             algorithmB = QString::fromStdString(algorithm);
             updateOverviewLabel(false);
         }
@@ -2487,39 +2498,172 @@ void QtMainWindow::handleBpmAnalysisResult(double bpm, const std::vector<double>
 
 void QtMainWindow::updateOverviewLabel(bool isDeckA)
 {
-    QLabel* lbl = isDeckA ? deckALabel : deckBLabel;
-    if (!lbl) return;
-    bool active = isDeckA ? analysisActiveA : analysisActiveB;
-    bool failed = isDeckA ? analysisFailedA : analysisFailedB;
-    double prog = isDeckA ? analysisProgressA : analysisProgressB;
-    double originalBpm = (isDeckA ? overviewTopA : overviewTopB) ? (isDeckA ? overviewTopA->originalBpm : overviewTopB->originalBpm) : 0.0;
-    QString algText = (isDeckA ? algorithmA : algorithmB).isEmpty() ? QString("") : QString(" - %1").arg(isDeckA ? algorithmA : algorithmB);
-    QString prefix = isDeckA ? "DECK A - OVERVIEW" : "DECK B - OVERVIEW";
-    QString suffix;
-    if (active) {
-        int percent = (int)std::round(prog * 100.0);
-        suffix = QString(" (Analyzing %1%)").arg(percent);
-    } else if (failed) {
-        suffix = QString(" (Analysis failed)");
+    QtDeckWidget* deck = isDeckA ? deckA : deckB;
+    DeckWaveformOverview* overview = deck ? deck->getWaveform() : nullptr;
+    if (overview)
+        overview->setOverlayStatus(QString(), QString(), false, 0.0, false);
+
+    if (!deck)
+        return;
+
+    const QString deckName = isDeckA ? QStringLiteral("Deck A") : QStringLiteral("Deck B");
+    QString trackName = QStringLiteral("No Track Loaded");
+    QString trackTooltip = trackName;
+    QString infoText = QStringLiteral("No track loaded");
+    QString infoTooltip = infoText;
+    QString infoStyle = QStringLiteral("font-size: 11px; color: #b8bfd0; padding: 2px;");
+
+    const QString filePath = deck->getCurrentFilePath();
+    if (!filePath.isEmpty()) {
+        QFileInfo fileInfo(filePath);
+        trackName = fileInfo.completeBaseName();
+        if (trackName.isEmpty())
+            trackName = fileInfo.fileName();
+        if (trackName.isEmpty())
+            trackName = deckName;
+
+        trackTooltip = fileInfo.fileName();
+        if (trackTooltip.isEmpty())
+            trackTooltip = filePath;
+
+        bool active = isDeckA ? analysisActiveA : analysisActiveB;
+        bool failed = isDeckA ? analysisFailedA : analysisFailedB;
+        double prog = isDeckA ? analysisProgressA : analysisProgressB;
+        double originalBpm = (isDeckA ? overviewTopA : overviewTopB)
+                                 ? (isDeckA ? overviewTopA->originalBpm : overviewTopB->originalBpm)
+                                 : 0.0;
+        const QString algorithm = isDeckA ? algorithmA : algorithmB;
+        const double trimMs = (isDeckA ? userVisualTrimA : userVisualTrimB) * 1000.0;
+
+        QStringList tooltipParts;
+        double clampedProgress = std::clamp(prog, 0.0, 1.0);
+
+        if (active) {
+            int percent = static_cast<int>(std::round(clampedProgress * 100.0));
+            const QString analyzingText = QStringLiteral("Analyzing %1%").arg(percent);
+            tooltipParts << analyzingText;
+            infoStyle = QStringLiteral("font-size: 11px; color: #4fb0ff; font-weight: bold; padding: 0px;");
+            infoText = analyzingText;
+        } else if (failed) {
+            const QString failureText = QStringLiteral("Analysis failed");
+            tooltipParts << failureText;
+            infoStyle = QStringLiteral("font-size: 11px; color: #ff6f6f; font-weight: bold; padding: 0px;");
+            infoText = failureText;
+        } else {
+            if (originalBpm > 0.0) {
+                const int roundedBpm = static_cast<int>(std::round(originalBpm));
+                infoText = QString::number(roundedBpm);
+                tooltipParts << QStringLiteral("Original BPM: %1")
+                                    .arg(QString::number(originalBpm, 'f', 2));
+            } else {
+                infoText = QStringLiteral("--");
+                tooltipParts << QStringLiteral("Original BPM: unknown");
+            }
+
+            if (!algorithm.trimmed().isEmpty()) {
+                const QString algoText = algorithm.trimmed();
+                tooltipParts << QStringLiteral("Algorithm: %1").arg(algoText);
+            }
+
+            if (std::abs(trimMs) > 0.0001) {
+                const QString trimText = QStringLiteral("trim %1 ms").arg(QString::number(trimMs, 'f', 1));
+                tooltipParts << QStringLiteral("Visual trim: %1 ms").arg(QString::number(trimMs, 'f', 1));
+            }
+
+            infoStyle = QStringLiteral("font-size: 11px; color: #9ad1ff; font-weight: bold; padding: 0px;");
+        }
+
+        if (tooltipParts.isEmpty())
+            tooltipParts << infoText;
+
+        const QString tooltipJoin = tooltipParts.join(QStringLiteral("\n"));
+        infoTooltip = tooltipJoin.isEmpty() ? infoText : tooltipJoin;
     } else {
-    const double trimMs = (isDeckA ? userVisualTrimA : userVisualTrimB) * 1000.0;
-    QString trimText = (std::abs(trimMs) > 0.0001) ? QString("  |  trim %1 ms").arg(QString::number(trimMs, 'f', 1)) : QString("");
-    suffix = QString(" (BPM: %1%2)%3")
-             .arg(originalBpm > 0.0 ? QString::number((int)std::round(originalBpm)) : QString("--"))
-             .arg(algText)
-             .arg(trimText);
+        trackName = QStringLiteral("No Track Loaded");
+        trackTooltip = trackName;
+        infoText = QStringLiteral("No track loaded");
+        infoTooltip = infoText;
+        infoStyle = QStringLiteral("font-size: 11px; color: #b8bfd0; padding: 0px;");
     }
-    lbl->setText(prefix + "  " + suffix);
+
+    deck->setTrackNameDisplay(trackName, trackTooltip);
+    deck->setTrackInfoDisplay(infoText, infoStyle, infoTooltip);
 }
 
 // Window drag functionality for frameless window
+void QtMainWindow::beginWindowDragInternal(const QPoint& globalPos, bool fromExternalSource)
+{
+    externalDragActive = fromExternalSource;
+    systemMoveActive = false;
+
+    if (QWindow* window = windowHandle()) {
+        if (window->startSystemMove()) {
+            systemMoveActive = true;
+            isDragging = false;
+            return;
+        }
+    }
+
+    isDragging = true;
+    dragStartPosition = globalPos - frameGeometry().topLeft();
+}
+
+void QtMainWindow::updateWindowDragInternal(const QPoint& globalPos)
+{
+    if (systemMoveActive) {
+        return;
+    }
+
+    if (isDragging) {
+        move(globalPos - dragStartPosition);
+    }
+}
+
+void QtMainWindow::endWindowDragInternal()
+{
+    if (!systemMoveActive) {
+        isDragging = false;
+    }
+
+    systemMoveActive = false;
+    externalDragActive = false;
+}
+
+void QtMainWindow::beginExternalWindowDrag(const QPoint& globalPos)
+{
+    beginWindowDragInternal(globalPos, true);
+}
+
+void QtMainWindow::updateExternalWindowDrag(const QPoint& globalPos)
+{
+    updateWindowDragInternal(globalPos);
+}
+
+void QtMainWindow::endExternalWindowDrag()
+{
+    endWindowDragInternal();
+}
+
 void QtMainWindow::mousePressEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton) {
+        const QPoint globalPos = event->globalPosition().toPoint();
+        const QPoint localPos = event->pos();
+        ResizeRegion region = detectResizeRegion(localPos);
+        if (region != ResizeRegion::None) {
+            currentResizeRegion = region;
+            isResizing = true;
+            isDragging = false;
+            resizeStartPosition = globalPos;
+            resizeStartGeometry = geometry();
+            updateCursorForRegion(region);
+            event->accept();
+            return;
+        }
+
         // Only allow dragging from the menubar area (top 30 pixels)
-        if (event->pos().y() <= 30) {
-            isDragging = true;
-            dragStartPosition = event->globalPosition().toPoint() - frameGeometry().topLeft();
+        if (localPos.y() <= titleDragHeight) {
+            beginWindowDragInternal(globalPos, false);
             event->accept();
             return;
         }
@@ -2529,22 +2673,209 @@ void QtMainWindow::mousePressEvent(QMouseEvent* event)
 
 void QtMainWindow::mouseMoveEvent(QMouseEvent* event)
 {
-    if (isDragging && (event->buttons() & Qt::LeftButton)) {
-    move(event->globalPosition().toPoint() - dragStartPosition);
+    const QPoint globalPos = event->globalPosition().toPoint();
+    const QPoint localPos = event->pos();
+
+    if (isResizing && (event->buttons() & Qt::LeftButton)) {
+        performResize(globalPos);
+        updateCursorForRegion(currentResizeRegion);
         event->accept();
         return;
     }
+
+    if (!(event->buttons() & Qt::LeftButton)) {
+        ResizeRegion region = detectResizeRegion(localPos);
+        currentResizeRegion = region;
+        updateCursorForRegion(region);
+    }
+
+    if ((isDragging || systemMoveActive) && (event->buttons() & Qt::LeftButton)) {
+        updateWindowDragInternal(globalPos);
+        event->accept();
+        return;
+    }
+
     QWidget::mouseMoveEvent(event);
 }
 
 void QtMainWindow::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton) {
-        isDragging = false;
-        event->accept();
-        return;
+        if (isResizing) {
+            isResizing = false;
+            ResizeRegion region = detectResizeRegion(mapFromGlobal(event->globalPosition().toPoint()));
+            currentResizeRegion = region;
+            updateCursorForRegion(region);
+            event->accept();
+            return;
+        }
+        if (isDragging || systemMoveActive || externalDragActive) {
+            endWindowDragInternal();
+            event->accept();
+            return;
+        }
     }
     QWidget::mouseReleaseEvent(event);
+}
+
+void QtMainWindow::leaveEvent(QEvent* event)
+{
+    if (!isResizing) {
+        currentResizeRegion = ResizeRegion::None;
+        updateCursorForRegion(ResizeRegion::None);
+    }
+    QWidget::leaveEvent(event);
+}
+
+QtMainWindow::ResizeRegion QtMainWindow::detectResizeRegion(const QPoint& pos) const
+{
+    const int w = width();
+    const int h = height();
+    if (w <= 0 || h <= 0)
+        return ResizeRegion::None;
+
+    if (pos.x() < 0 || pos.y() < 0 || pos.x() >= w || pos.y() >= h)
+        return ResizeRegion::None;
+
+    const int margin = std::max(1, std::min(resizeMargin, std::min(w, h) / 2));
+    const bool onLeft = pos.x() <= margin;
+    const bool onRight = pos.x() >= w - margin;
+    const bool onTop = pos.y() <= margin;
+    const bool onBottom = pos.y() >= h - margin;
+
+    if (onTop && onLeft)
+        return ResizeRegion::TopLeft;
+    if (onTop && onRight)
+        return ResizeRegion::TopRight;
+    if (onBottom && onLeft)
+        return ResizeRegion::BottomLeft;
+    if (onBottom && onRight)
+        return ResizeRegion::BottomRight;
+    if (onLeft)
+        return ResizeRegion::Left;
+    if (onRight)
+        return ResizeRegion::Right;
+    if (onTop)
+        return ResizeRegion::Top;
+    if (onBottom)
+        return ResizeRegion::Bottom;
+    return ResizeRegion::None;
+}
+
+void QtMainWindow::updateCursorForRegion(ResizeRegion region)
+{
+    if (region == ResizeRegion::None && !isResizing) {
+        if (cursorOverridden) {
+            QApplication::restoreOverrideCursor();
+            cursorOverridden = false;
+            currentCursorShape = Qt::ArrowCursor;
+        }
+        return;
+    }
+
+    Qt::CursorShape desiredShape = Qt::ArrowCursor;
+    switch (region) {
+        case ResizeRegion::TopLeft:
+        case ResizeRegion::BottomRight:
+            desiredShape = Qt::SizeFDiagCursor;
+            break;
+        case ResizeRegion::TopRight:
+        case ResizeRegion::BottomLeft:
+            desiredShape = Qt::SizeBDiagCursor;
+            break;
+        case ResizeRegion::Left:
+        case ResizeRegion::Right:
+            desiredShape = Qt::SizeHorCursor;
+            break;
+        case ResizeRegion::Top:
+        case ResizeRegion::Bottom:
+            desiredShape = Qt::SizeVerCursor;
+            break;
+        case ResizeRegion::None:
+            desiredShape = Qt::ArrowCursor;
+            break;
+    }
+
+    if (cursorOverridden) {
+        if (currentCursorShape != desiredShape) {
+            QApplication::restoreOverrideCursor();
+            cursorOverridden = false;
+        } else {
+            return;
+        }
+    }
+
+    QApplication::setOverrideCursor(QCursor(desiredShape));
+    cursorOverridden = true;
+    currentCursorShape = desiredShape;
+}
+
+void QtMainWindow::performResize(const QPoint& globalPos)
+{
+    if (!isResizing || currentResizeRegion == ResizeRegion::None)
+        return;
+
+    QPoint delta = globalPos - resizeStartPosition;
+    const int minW = minimumWidth();
+    const int minH = minimumHeight();
+    int maxW = maximumWidth();
+    int maxH = maximumHeight();
+
+    if (maxW <= 0 || maxW >= std::numeric_limits<int>::max())
+        maxW = std::numeric_limits<int>::max();
+    if (maxH <= 0 || maxH >= std::numeric_limits<int>::max())
+        maxH = std::numeric_limits<int>::max();
+
+    int newX = resizeStartGeometry.x();
+    int newY = resizeStartGeometry.y();
+    int newW = resizeStartGeometry.width();
+    int newH = resizeStartGeometry.height();
+
+    auto clampWidth = [&](int width) {
+        width = std::max(width, minW);
+        if (maxW != std::numeric_limits<int>::max())
+            width = std::min(width, maxW);
+        return width;
+    };
+
+    auto clampHeight = [&](int height) {
+        height = std::max(height, minH);
+        if (maxH != std::numeric_limits<int>::max())
+            height = std::min(height, maxH);
+        return height;
+    };
+
+    if (currentResizeRegion == ResizeRegion::Left ||
+        currentResizeRegion == ResizeRegion::TopLeft ||
+        currentResizeRegion == ResizeRegion::BottomLeft) {
+        int targetWidth = clampWidth(resizeStartGeometry.width() - delta.x());
+        newX = resizeStartGeometry.right() - targetWidth + 1;
+        newW = targetWidth;
+    }
+
+    if (currentResizeRegion == ResizeRegion::Right ||
+        currentResizeRegion == ResizeRegion::TopRight ||
+        currentResizeRegion == ResizeRegion::BottomRight) {
+        int targetWidth = clampWidth(resizeStartGeometry.width() + delta.x());
+        newW = targetWidth;
+    }
+
+    if (currentResizeRegion == ResizeRegion::Top ||
+        currentResizeRegion == ResizeRegion::TopLeft ||
+        currentResizeRegion == ResizeRegion::TopRight) {
+        int targetHeight = clampHeight(resizeStartGeometry.height() - delta.y());
+        newY = resizeStartGeometry.bottom() - targetHeight + 1;
+        newH = targetHeight;
+    }
+
+    if (currentResizeRegion == ResizeRegion::Bottom ||
+        currentResizeRegion == ResizeRegion::BottomLeft ||
+        currentResizeRegion == ResizeRegion::BottomRight) {
+        int targetHeight = clampHeight(resizeStartGeometry.height() + delta.y());
+        newH = targetHeight;
+    }
+
+    setGeometry(newX, newY, newW, newH);
 }
 
 // BetaPulseX: Wendet geladene Deck-Einstellungen auf die UI-Controls an
@@ -3180,8 +3511,161 @@ void QtMainWindow::handleScratchInertiaTick(bool isDeckA) {
     }
 }
 
-// Event filter for double-click reset functionality
+// Event filter for double-click reset functionality and frameless resizing/dragging
 bool QtMainWindow::eventFilter(QObject *obj, QEvent *event) {
+    bool handled = false;
+
+    if (auto widget = qobject_cast<QWidget*>(obj)) {
+        if (widget->window() == this) {
+            if (!widget->hasMouseTracking())
+                widget->setMouseTracking(true);
+            widget->setAttribute(Qt::WA_Hover, true);
+
+            const bool isButton = static_cast<bool>(qobject_cast<QAbstractButton*>(widget));
+            const bool isMenu = static_cast<bool>(qobject_cast<QMenu*>(widget));
+            const bool isMenuBarWidget = (widget == menuBar);
+            QWidget* topRightCorner = menuBar ? menuBar->cornerWidget(Qt::TopRightCorner) : nullptr;
+            const bool isWindowControl = topRightCorner && (widget == topRightCorner || topRightCorner->isAncestorOf(widget));
+
+            switch (event->type()) {
+                case QEvent::MouseButtonPress: {
+                    auto mouseEvent = static_cast<QMouseEvent*>(event);
+                    if (mouseEvent->button() == Qt::LeftButton) {
+                        const QPoint globalPos = mouseEvent->globalPosition().toPoint();
+                        const QPoint windowPos = mapFromGlobal(globalPos);
+                        const QPoint menuPos = isMenuBarWidget ? menuBar->mapFromGlobal(globalPos) : QPoint();
+
+                        ResizeRegion region = detectResizeRegion(windowPos);
+                        if (region != ResizeRegion::None && !isButton && !isMenu && !isWindowControl) {
+                            currentResizeRegion = region;
+                            isResizing = true;
+                            isDragging = false;
+                            resizeStartPosition = globalPos;
+                            resizeStartGeometry = geometry();
+                            updateCursorForRegion(region);
+                            menuDragPending = false;
+                            handled = true;
+                            event->accept();
+                        } else {
+                            bool wantDrag = false;
+                            if (!isButton && !isMenu && !isWindowControl) {
+                                if (isMenuBarWidget) {
+                                    QAction* action = menuBar ? menuBar->actionAt(menuPos) : nullptr;
+                                    if (!action) {
+                                        wantDrag = true;
+                                    } else {
+                                        menuDragPending = true;
+                                        menuDragStartGlobal = globalPos;
+                                    }
+                                } else if (windowPos.y() <= titleDragHeight) {
+                                    wantDrag = true;
+                                }
+                            } else {
+                                menuDragPending = false;
+                            }
+
+                            if (wantDrag) {
+                                beginWindowDragInternal(globalPos, true);
+                                menuDragPending = false;
+                                handled = true;
+                                event->accept();
+                            }
+                        }
+                    }
+                    break;
+                }
+                case QEvent::MouseMove: {
+                    auto mouseEvent = static_cast<QMouseEvent*>(event);
+                    const QPoint globalPos = mouseEvent->globalPosition().toPoint();
+                    if (menuDragPending && (mouseEvent->buttons() & Qt::LeftButton)) {
+                        if ((globalPos - menuDragStartGlobal).manhattanLength() > 6) {
+                            menuDragPending = false;
+                            beginWindowDragInternal(menuDragStartGlobal, true);
+                            if (menuBar) {
+                                if (QAction* active = menuBar->activeAction()) {
+                                    if (QMenu* openMenu = active->menu()) {
+                                        openMenu->hide();
+                                    }
+                                }
+                                menuBar->setActiveAction(nullptr);
+                                menuBar->clearFocus();
+                            }
+                        }
+                    }
+
+                    if (isResizing && (mouseEvent->buttons() & Qt::LeftButton)) {
+                        performResize(globalPos);
+                        updateCursorForRegion(currentResizeRegion);
+                        handled = true;
+                        event->accept();
+                    } else if ((isDragging || systemMoveActive) && (mouseEvent->buttons() & Qt::LeftButton)) {
+                        updateWindowDragInternal(globalPos);
+                        handled = true;
+                        event->accept();
+                    } else if (!(mouseEvent->buttons() & Qt::LeftButton)) {
+                        if (!isButton && !isMenu && !isWindowControl) {
+                            ResizeRegion region = detectResizeRegion(mapFromGlobal(globalPos));
+                            currentResizeRegion = region;
+                            if (!isResizing)
+                                updateCursorForRegion(region);
+                        } else if (!isResizing && !isDragging) {
+                            currentResizeRegion = ResizeRegion::None;
+                            updateCursorForRegion(ResizeRegion::None);
+                        }
+                    }
+                    break;
+                }
+                case QEvent::MouseButtonRelease: {
+                    auto mouseEvent = static_cast<QMouseEvent*>(event);
+                    if (mouseEvent->button() == Qt::LeftButton) {
+                        menuDragPending = false;
+                        if (isResizing) {
+                            isResizing = false;
+                            ResizeRegion region = detectResizeRegion(mapFromGlobal(mouseEvent->globalPosition().toPoint()));
+                            currentResizeRegion = region;
+                            updateCursorForRegion(region);
+                            handled = true;
+                            event->accept();
+                        } else if (isDragging || systemMoveActive || externalDragActive) {
+                            endWindowDragInternal();
+                            ResizeRegion region = detectResizeRegion(mapFromGlobal(mouseEvent->globalPosition().toPoint()));
+                            currentResizeRegion = region;
+                            updateCursorForRegion(region);
+                            handled = true;
+                            event->accept();
+                        }
+                    }
+                    break;
+                }
+                case QEvent::HoverMove: {
+                    auto hoverEvent = static_cast<QHoverEvent*>(event);
+                    const QPoint globalPos = widget->mapToGlobal(hoverEvent->position().toPoint());
+                    if (!isButton && !isMenu && !isWindowControl) {
+                        ResizeRegion region = detectResizeRegion(mapFromGlobal(globalPos));
+                        currentResizeRegion = region;
+                        if (!isResizing)
+                            updateCursorForRegion(region);
+                    } else if (!isResizing && !isDragging) {
+                        currentResizeRegion = ResizeRegion::None;
+                        updateCursorForRegion(ResizeRegion::None);
+                    }
+                    break;
+                }
+                case QEvent::Leave:
+                    if (widget == this && !isResizing && !isDragging) {
+                        currentResizeRegion = ResizeRegion::None;
+                        updateCursorForRegion(ResizeRegion::None);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    if (handled)
+        return true;
+
     if (event->type() == QEvent::MouseButtonDblClick) {
         QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
         if (mouseEvent->button() == Qt::LeftButton) {

@@ -8,6 +8,7 @@
 #include <QMimeData>
 #include <QLinearGradient>
 #include <algorithm>
+#include <cmath>
 
 DeckWaveformOverview::DeckWaveformOverview(QWidget* parent)
     : QOpenGLWidget(parent)
@@ -40,6 +41,12 @@ DeckWaveformOverview::DeckWaveformOverview(QWidget* parent)
         update();
     });
     smoothTimer->start();
+
+    overlayTitle.clear();
+    overlayDetail.clear();
+    overlayShowProgress = false;
+    overlayProgress = 0.0;
+    overlayFailed = false;
 }
 
 DeckWaveformOverview::~DeckWaveformOverview()
@@ -285,6 +292,100 @@ void DeckWaveformOverview::paintGL()
         lineProgram->release();
         lineVbo.release();
         lineVao.release();
+    }
+
+    if (!overlayTitle.isEmpty() || !overlayDetail.isEmpty() || overlayShowProgress) {
+        QPainter overlayPainter(this);
+        overlayPainter.setRenderHint(QPainter::Antialiasing, true);
+
+        const int padding = 8;
+        const int spacing = 4;
+        const int progressHeight = 6;
+
+        QFont titleFont("Lato", 9, QFont::Bold);
+        QFont detailFont("Lato", 8, QFont::Normal);
+
+        QString titleText = overlayTitle;
+        QString detailText = overlayDetail;
+
+        const int maxTextWidth = std::max(40, width() - padding * 4);
+
+        overlayPainter.setFont(titleFont);
+        if (!titleText.isEmpty()) {
+            titleText = overlayPainter.fontMetrics().elidedText(titleText, Qt::ElideRight, maxTextWidth);
+        }
+        QRect titleRect = titleText.isEmpty()
+            ? QRect(0, 0, 0, overlayPainter.fontMetrics().height())
+            : overlayPainter.fontMetrics().boundingRect(titleText);
+
+        overlayPainter.setFont(detailFont);
+        if (!detailText.isEmpty()) {
+            detailText = overlayPainter.fontMetrics().elidedText(detailText, Qt::ElideRight, maxTextWidth);
+        }
+        QRect detailRect = detailText.isEmpty()
+            ? QRect(0, 0, 0, overlayPainter.fontMetrics().height())
+            : overlayPainter.fontMetrics().boundingRect(detailText);
+
+        int contentWidth = std::max(titleRect.width(), detailRect.width());
+        int contentHeight = 0;
+
+        if (!titleText.isEmpty()) {
+            contentHeight += titleRect.height();
+        }
+        if (!detailText.isEmpty()) {
+            if (contentHeight > 0) contentHeight += spacing;
+            contentHeight += detailRect.height();
+        }
+        if (overlayShowProgress) {
+            if (contentHeight > 0) contentHeight += spacing;
+            contentHeight += progressHeight;
+            contentWidth = std::max(contentWidth, width() / 5);
+        }
+
+        QRect infoRect(padding,
+                       padding,
+                       contentWidth + padding * 2,
+                       contentHeight + padding * 2);
+
+        overlayPainter.setPen(Qt::NoPen);
+        overlayPainter.setBrush(QColor(12, 16, 30, 180));
+        overlayPainter.drawRoundedRect(infoRect, 7, 7);
+
+        int cursorY = infoRect.top() + padding;
+        int textX = infoRect.left() + padding;
+
+        if (!titleText.isEmpty()) {
+            overlayPainter.setPen(QColor(215, 225, 255));
+            overlayPainter.setFont(titleFont);
+            cursorY += titleRect.height();
+            overlayPainter.drawText(textX, cursorY, titleText);
+        }
+
+        if (!detailText.isEmpty()) {
+            if (!titleText.isEmpty()) cursorY += spacing;
+            overlayPainter.setPen(overlayFailed ? QColor(255, 140, 140)
+                                                : QColor(180, 190, 210));
+            overlayPainter.setFont(detailFont);
+            cursorY += detailRect.height();
+            overlayPainter.drawText(textX, cursorY, detailText);
+        }
+
+        if (overlayShowProgress) {
+            if (!titleText.isEmpty() || !detailText.isEmpty()) cursorY += spacing;
+            int barWidth = infoRect.width() - padding * 2;
+            QRect progressRect(textX, cursorY, barWidth, progressHeight);
+
+            overlayPainter.setPen(Qt::NoPen);
+            overlayPainter.setBrush(QColor(35, 45, 70));
+            overlayPainter.drawRoundedRect(progressRect, 3, 3);
+
+            int filledWidth = (int)std::round(std::clamp(overlayProgress, 0.0, 1.0) * barWidth);
+            if (filledWidth > 0) {
+                QRect filledRect(progressRect.left(), progressRect.top(), filledWidth, progressRect.height());
+                overlayPainter.setBrush(QColor(0, 190, 255));
+                overlayPainter.drawRoundedRect(filledRect, 3, 3);
+            }
+        }
     }
 }
 
@@ -690,4 +791,15 @@ void DeckWaveformOverview::drawGhostLoopRegion() {
     // Draw label text with lighter color
     p.setPen(QPen(QColor(100, 255, 100, 100), 1)); // More transparent text
     p.drawText(labelX, labelY - 1, ghostLabel);
+}
+
+void DeckWaveformOverview::setOverlayStatus(const QString& title, const QString& detail,
+                                            bool showProgress, double progress, bool failed)
+{
+    overlayTitle = title;
+    overlayDetail = detail;
+    overlayShowProgress = showProgress;
+    overlayProgress = std::clamp(progress, 0.0, 1.0);
+    overlayFailed = failed;
+    update();
 }

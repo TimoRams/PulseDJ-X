@@ -9,6 +9,9 @@
 #include <QMouseEvent>
 #include <QThreadPool>
 #include <QProgressBar>
+#include <QRect>
+#include <QCursor>
+#include <QAbstractButton>
 #include <ctime>
 #include <chrono>
 #include "QtDeckWidget.h"
@@ -69,6 +72,11 @@ class QtMainWindow : public QWidget {
 public:
     explicit QtMainWindow(QWidget* parent = nullptr);
     ~QtMainWindow();
+
+    // Expose window drag helpers for child widgets (e.g., custom menu bar)
+    void beginExternalWindowDrag(const QPoint& globalPos);
+    void updateExternalWindowDrag(const QPoint& globalPos);
+    void endExternalWindowDrag();
 
 protected:
     // Event filter for double-click reset functionality
@@ -132,12 +140,10 @@ private:
     bool analysisFailedB{false};
 
     BeatIndicator* beatIndicator;
-    QLabel* deckALabel;
-    QLabel* deckBLabel;
     QSlider* crossfader;
     
     // BetaPulseX Menu System
-    MenuBar* menuBar;
+    MenuBar* menuBar{nullptr};
     
     // Store algorithm names for BPM display
     QString algorithmA;
@@ -204,6 +210,29 @@ private:
     // Window drag functionality for frameless window
     bool isDragging{false};
     QPoint dragStartPosition;
+    bool menuDragPending{false};
+    QPoint menuDragStartGlobal;
+    bool systemMoveActive{false};
+    bool externalDragActive{false};
+    enum class ResizeRegion {
+        None,
+        Left,
+        Right,
+        Top,
+        Bottom,
+        TopLeft,
+        TopRight,
+        BottomLeft,
+        BottomRight
+    };
+    static constexpr int resizeMargin = 8;
+    static constexpr int titleDragHeight = 36;
+    ResizeRegion currentResizeRegion{ResizeRegion::None};
+    bool isResizing{false};
+    QPoint resizeStartPosition;
+    QRect resizeStartGeometry;
+    bool cursorOverridden{false};
+    Qt::CursorShape currentCursorShape{Qt::ArrowCursor};
 
     bool shouldAnalyzeTrackOnLoad(const QString& filePath) const;
     void startDeckAnalysisIfNeeded(const QString& filePath, bool isDeckA);
@@ -215,6 +244,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
 private:
     void updateOverviewLabel(bool isDeckA);
@@ -238,4 +268,10 @@ private:
     void startScratchInertia(bool isDeckA, double initialVelocity, bool resumePlayback);
     void stopScratchInertia(bool isDeckA, bool resumePlayback);
     void handleScratchInertiaTick(bool isDeckA);
+    ResizeRegion detectResizeRegion(const QPoint& pos) const;
+    void updateCursorForRegion(ResizeRegion region);
+    void performResize(const QPoint& globalPos);
+    void beginWindowDragInternal(const QPoint& globalPos, bool fromExternalSource);
+    void updateWindowDragInternal(const QPoint& globalPos);
+    void endWindowDragInternal();
 };

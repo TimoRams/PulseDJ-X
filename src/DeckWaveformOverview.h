@@ -38,6 +38,9 @@ public:
     
     // NEW: Ghost loop visualization support
     void setGhostLoopRegion(bool enabled, double startSec = 0.0, double endSec = 0.0);
+    // NEW: Overlay header/status text for embedding deck info within waveform region
+    void setOverlayStatus(const QString& title, const QString& detail,
+                          bool showProgress = false, double progress = 0.0, bool failed = false);
     // Visual latency compensation in seconds (UI leads audio by this amount)
     void setVisualLatencyComp(double seconds) { visualLatencyComp = std::clamp(seconds, -0.25, 0.25); }
     // New: set precomputed waveform data from a background thread result (called on UI thread)
@@ -59,6 +62,11 @@ public:
         clearLoop();
         totalLength = 0.0;
         audioStartOffset = 0.0;
+        overlayTitle.clear();
+        overlayDetail.clear();
+        overlayShowProgress = false;
+        overlayProgress = 0.0;
+        overlayFailed = false;
         update();
     }
 
@@ -122,6 +130,13 @@ private:
     bool ghostLoopEnabled{false};
     double ghostLoopStartSec{0.0};
     double ghostLoopEndSec{0.0};
+
+    // Overlay status rendering
+    QString overlayTitle;
+    QString overlayDetail;
+    bool overlayShowProgress{false};
+    double overlayProgress{0.0};
+    bool overlayFailed{false};
 
     void loadAndRenderWaveform();
     void rebuildMeshIfNeeded();
