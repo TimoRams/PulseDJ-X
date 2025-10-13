@@ -4,6 +4,7 @@
 #include "WaveformDisplay.h"
 #include "BeatIndicator.h"
 #include "PreferencesDialog.h"
+#include "ScratchEngine.h"
 #include <iostream>
 #include <QApplication>
 #include <QMessageBox>
@@ -964,6 +965,27 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     qDebug() << "QtMainWindow: Deck B created";
     std::cout << "=== DECK B CREATED ===" << std::endl;
 
+    scratchEngineA = std::make_unique<ScratchEngine>(this);
+    scratchEngineB = std::make_unique<ScratchEngine>(this);
+    if (deckA) {
+        deckA->setScratchEngine(scratchEngineA.get());
+        if (deckA->getTurntable()) {
+            ScratchEngine::TrackConfig cfg;
+            cfg.lengthSeconds = 0.0;
+            cfg.prerollSeconds = deckA->getTurntable()->getPrerollSeconds();
+            scratchEngineA->setTrackConfig(cfg);
+        }
+    }
+    if (deckB) {
+        deckB->setScratchEngine(scratchEngineB.get());
+        if (deckB->getTurntable()) {
+            ScratchEngine::TrackConfig cfg;
+            cfg.lengthSeconds = 0.0;
+            cfg.prerollSeconds = deckB->getTurntable()->getPrerollSeconds();
+            scratchEngineB->setTrackConfig(cfg);
+        }
+    }
+
     // BetaPulseX: Lade und wende gespeicherte Deck-Einstellungen an (verzögert)
     // Verwende QTimer::singleShot um sicherzustellen, dass alle Widgets initialisiert sind
     std::cout << "*** SCHEDULING applyDeckSettings() with 100ms delay ***" << std::endl;
@@ -977,6 +999,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     overviewTopB = new WaveformDisplay(this);
     overviewTopA->setScrollMode(true);
     overviewTopB->setScrollMode(true);
+    overviewTopA->setScratchEngine(scratchEngineA.get());
+    overviewTopB->setScratchEngine(scratchEngineB.get());
     // Click-to-seek on top overview waveforms (works while paused)
     connect(overviewTopA, &WaveformDisplay::positionClicked, this, [this](double absRel){
         if (!playerA) return;
@@ -1003,6 +1027,27 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         }
     });
 
+    connect(overviewTopA, &WaveformDisplay::pitchBendRequested, this, [this](double ratio) {
+        if (playerA) {
+            playerA->setPitchBendRatio(ratio);
+        }
+    });
+    connect(overviewTopA, &WaveformDisplay::pitchBendEnded, this, [this]() {
+        if (playerA) {
+            playerA->setPitchBendRatio(1.0);
+        }
+    });
+    connect(overviewTopB, &WaveformDisplay::pitchBendRequested, this, [this](double ratio) {
+        if (playerB) {
+            playerB->setPitchBendRatio(ratio);
+        }
+    });
+    connect(overviewTopB, &WaveformDisplay::pitchBendEnded, this, [this]() {
+        if (playerB) {
+            playerB->setPitchBendRatio(1.0);
+        }
+    });
+
     // Beat indicator for showing current beat position
     beatIndicator = new BeatIndicator(this);
     
@@ -1010,86 +1055,28 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     deckA->setBeatIndicator(beatIndicator);
     deckB->setBeatIndicator(beatIndicator);
 
-    // Scratch interactions for overview waveforms - proper vinyl-style scratching
-    connect(overviewTopA, &WaveformDisplay::scratchStart, this, [this]() {
-        if (!playerA) return;
-        if (scratchInertiaActiveA) {
-            stopScratchInertia(true, scratchInertiaResumeA);
+    auto connectScratchEngine = [this](ScratchEngine* engine, bool isDeckA) {
+        if (!engine) {
+            return;
         }
-        const bool wasAudible = playerA->isAudible();
-    scratchWasPlayingA = wasAudible;
-    playerA->setScratchPlaybackContext(wasAudible);
-    playerA->enableScratch(true);
-        if (!wasAudible) {
-            playerA->ensureScratchAudible();
-        }
-    });
-    connect(overviewTopA, &WaveformDisplay::scratchMove, this, [this](double absRel) {
-        applyScratchPosition(true, absRel);
-    });
-    connect(overviewTopA, &WaveformDisplay::scratchVelocityChanged, this, [this](double velocity) {
-        if (!playerA) return;
-        playerA->setScratchVelocity(velocity);
-    });
-    connect(overviewTopA, &WaveformDisplay::scratchEnd, this, [this]() {
-        if (!playerA || !overviewTopA) return;
+        connect(engine, &ScratchEngine::scratchStarted, this, [this, isDeckA](ScratchEngine::Controller controller) {
+            Q_UNUSED(controller);
+            handleScratchStart(isDeckA);
+        });
+        connect(engine, &ScratchEngine::positionChanged, this, [this, isDeckA](double seconds, double relative) {
+            Q_UNUSED(seconds);
+            applyScratchPosition(isDeckA, relative);
+        });
+        connect(engine, &ScratchEngine::velocityChanged, this, [this, isDeckA](double velocity) {
+            handleScratchVelocityChanged(isDeckA, velocity);
+        });
+        connect(engine, &ScratchEngine::scratchEnded, this, [this, isDeckA](double releaseVelocity) {
+            handleScratchEnd(isDeckA, releaseVelocity);
+        });
+    };
 
-        lastScratchEndA = QDateTime::currentMSecsSinceEpoch();
-
-        double releaseVelocity = overviewTopA->getLastScratchVelocity();
-        playerA->setScratchVelocity(0.0);
-
-        if (scratchWasPlayingA) {
-            playerA->enableScratch(false);
-            if (!playerA->isAudible()) {
-                playerA->ensureScratchAudible();
-            }
-            scratchInertiaResumeA = true;
-        } else {
-            scratchInertiaResumeA = false;
-            startScratchInertia(true, releaseVelocity, false);
-        }
-    });
-
-    connect(overviewTopB, &WaveformDisplay::scratchStart, this, [this]() {
-        if (!playerB) return;
-        if (scratchInertiaActiveB) {
-            stopScratchInertia(false, scratchInertiaResumeB);
-        }
-        const bool wasAudible = playerB->isAudible();
-    scratchWasPlayingB = wasAudible;
-    playerB->setScratchPlaybackContext(wasAudible);
-    playerB->enableScratch(true);
-        if (!wasAudible) {
-            playerB->ensureScratchAudible();
-        }
-    });
-    connect(overviewTopB, &WaveformDisplay::scratchMove, this, [this](double absRel) {
-        applyScratchPosition(false, absRel);
-    });
-    connect(overviewTopB, &WaveformDisplay::scratchVelocityChanged, this, [this](double velocity) {
-        if (!playerB) return;
-        playerB->setScratchVelocity(velocity);
-    });
-    connect(overviewTopB, &WaveformDisplay::scratchEnd, this, [this]() {
-        if (!playerB || !overviewTopB) return;
-
-        lastScratchEndB = QDateTime::currentMSecsSinceEpoch();
-
-        double releaseVelocity = overviewTopB->getLastScratchVelocity();
-        playerB->setScratchVelocity(0.0);
-
-        if (scratchWasPlayingB) {
-            playerB->enableScratch(false);
-            if (!playerB->isAudible()) {
-                playerB->ensureScratchAudible();
-            }
-            scratchInertiaResumeB = true;
-        } else {
-            scratchInertiaResumeB = false;
-            startScratchInertia(false, releaseVelocity, false);
-        }
-    });
+    connectScratchEngine(scratchEngineA.get(), true);
+    connectScratchEngine(scratchEngineB.get(), false);
 
     // NEW: Handle threaded audio file loading to prevent UI blocking
     connect(deckA, &QtDeckWidget::fileLoadingStarted, [this](const QString& filePath) {
@@ -1113,6 +1100,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     connect(deckA, &QtDeckWidget::fileLoaded, [this]() {
+        if (playerA) {
+            playerA->setPitchBendRatio(1.0);
+        }
         QString filePath = deckA->getCurrentFilePath();
         if (!filePath.isEmpty()) {
             // PERFORMANCE FIX: Generate top overview waveform in background
@@ -1134,6 +1124,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     connect(deckB, &QtDeckWidget::fileLoaded, [this]() {
+        if (playerB) {
+            playerB->setPitchBendRatio(1.0);
+        }
         QString filePath = deckB->getCurrentFilePath();
         if (!filePath.isEmpty()) {
             // Generate top overview waveform in background immediately (waveform visible)
@@ -1157,6 +1150,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         if (beatIndicator) {
             beatIndicator->setBeatGridAvailableDeckA(false);
         }
+        if (playerA) {
+            playerA->setPitchBendRatio(1.0);
+        }
         analysisActiveA = false; analysisFailedA = false; analysisProgressA = 0.0; algorithmA.clear();
         updateOverviewLabel(true);
     });
@@ -1166,6 +1162,9 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         }
         if (beatIndicator) {
             beatIndicator->setBeatGridAvailableDeckB(false);
+        }
+        if (playerB) {
+            playerB->setPitchBendRatio(1.0);
         }
         analysisActiveB = false; analysisFailedB = false; analysisProgressB = 0.0; algorithmB.clear();
         updateOverviewLabel(false);
@@ -2661,12 +2660,7 @@ void QtMainWindow::mousePressEvent(QMouseEvent* event)
             return;
         }
 
-        // Only allow dragging from the menubar area (top 30 pixels)
-        if (localPos.y() <= titleDragHeight) {
-            beginWindowDragInternal(globalPos, false);
-            event->accept();
-            return;
-        }
+        // Dragging now starts exclusively from the menu bar via its helpers.
     }
     QWidget::mousePressEvent(event);
 }
@@ -3397,6 +3391,65 @@ void QtMainWindow::applyScratchPosition(bool isDeckA, double absRel) {
     }
 }
 
+void QtMainWindow::handleScratchStart(bool isDeckA) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    if (!player) return;
+
+    bool& inertiaActive = isDeckA ? scratchInertiaActiveA : scratchInertiaActiveB;
+    bool& inertiaResume = isDeckA ? scratchInertiaResumeA : scratchInertiaResumeB;
+
+    if (inertiaActive) {
+        stopScratchInertia(isDeckA, inertiaResume);
+    }
+
+    const bool wasAudible = player->isAudible();
+    if (isDeckA) {
+        scratchWasPlayingA = wasAudible;
+    } else {
+        scratchWasPlayingB = wasAudible;
+    }
+
+    player->setScratchPlaybackContext(wasAudible);
+    player->enableScratch(true);
+
+    if (!wasAudible) {
+        player->ensureScratchAudible();
+    }
+}
+
+void QtMainWindow::handleScratchVelocityChanged(bool isDeckA, double velocity) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    if (!player) return;
+    player->setScratchVelocity(velocity);
+}
+
+void QtMainWindow::handleScratchEnd(bool isDeckA, double releaseVelocity) {
+    DJAudioPlayer* player = isDeckA ? playerA : playerB;
+    if (!player) return;
+
+    if (!std::isfinite(releaseVelocity)) {
+        releaseVelocity = 0.0;
+    }
+
+    qint64& lastScratchEnd = isDeckA ? lastScratchEndA : lastScratchEndB;
+    bool& scratchWasPlaying = isDeckA ? scratchWasPlayingA : scratchWasPlayingB;
+    bool& scratchInertiaResume = isDeckA ? scratchInertiaResumeA : scratchInertiaResumeB;
+
+    lastScratchEnd = QDateTime::currentMSecsSinceEpoch();
+    player->setScratchVelocity(0.0);
+
+    if (scratchWasPlaying) {
+        player->enableScratch(false);
+        if (!player->isAudible()) {
+            player->ensureScratchAudible();
+        }
+        scratchInertiaResume = true;
+    } else {
+        scratchInertiaResume = false;
+        startScratchInertia(isDeckA, releaseVelocity, false);
+    }
+}
+
 void QtMainWindow::startScratchInertia(bool isDeckA, double initialVelocity, bool resumePlayback) {
     DJAudioPlayer* player = isDeckA ? playerA : playerB;
     WaveformDisplay* overview = isDeckA ? overviewTopA : overviewTopB;
@@ -3543,33 +3596,8 @@ bool QtMainWindow::eventFilter(QObject *obj, QEvent *event) {
                             resizeStartPosition = globalPos;
                             resizeStartGeometry = geometry();
                             updateCursorForRegion(region);
-                            menuDragPending = false;
                             handled = true;
                             event->accept();
-                        } else {
-                            bool wantDrag = false;
-                            if (!isButton && !isMenu && !isWindowControl) {
-                                if (isMenuBarWidget) {
-                                    QAction* action = menuBar ? menuBar->actionAt(menuPos) : nullptr;
-                                    if (!action) {
-                                        wantDrag = true;
-                                    } else {
-                                        menuDragPending = true;
-                                        menuDragStartGlobal = globalPos;
-                                    }
-                                } else if (windowPos.y() <= titleDragHeight) {
-                                    wantDrag = true;
-                                }
-                            } else {
-                                menuDragPending = false;
-                            }
-
-                            if (wantDrag) {
-                                beginWindowDragInternal(globalPos, true);
-                                menuDragPending = false;
-                                handled = true;
-                                event->accept();
-                            }
                         }
                     }
                     break;
@@ -3577,22 +3605,6 @@ bool QtMainWindow::eventFilter(QObject *obj, QEvent *event) {
                 case QEvent::MouseMove: {
                     auto mouseEvent = static_cast<QMouseEvent*>(event);
                     const QPoint globalPos = mouseEvent->globalPosition().toPoint();
-                    if (menuDragPending && (mouseEvent->buttons() & Qt::LeftButton)) {
-                        if ((globalPos - menuDragStartGlobal).manhattanLength() > 6) {
-                            menuDragPending = false;
-                            beginWindowDragInternal(menuDragStartGlobal, true);
-                            if (menuBar) {
-                                if (QAction* active = menuBar->activeAction()) {
-                                    if (QMenu* openMenu = active->menu()) {
-                                        openMenu->hide();
-                                    }
-                                }
-                                menuBar->setActiveAction(nullptr);
-                                menuBar->clearFocus();
-                            }
-                        }
-                    }
-
                     if (isResizing && (mouseEvent->buttons() & Qt::LeftButton)) {
                         performResize(globalPos);
                         updateCursorForRegion(currentResizeRegion);
@@ -3618,7 +3630,6 @@ bool QtMainWindow::eventFilter(QObject *obj, QEvent *event) {
                 case QEvent::MouseButtonRelease: {
                     auto mouseEvent = static_cast<QMouseEvent*>(event);
                     if (mouseEvent->button() == Qt::LeftButton) {
-                        menuDragPending = false;
                         if (isResizing) {
                             isResizing = false;
                             ResizeRegion region = detectResizeRegion(mapFromGlobal(mouseEvent->globalPosition().toPoint()));

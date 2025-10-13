@@ -14,6 +14,8 @@
 #include <chrono>
 // DECK ISOLATION FIX: Removed GlobalBeatGrid.h to prevent deck interference
 
+#include "ScratchEngine.h"
+
 class WaveformDisplay : public QOpenGLWidget, protected QOpenGLFunctions
 {
     Q_OBJECT
@@ -112,6 +114,9 @@ public:
     // NEW: Clear the display to a pristine "NO TRACK LOADED" state
     void clearDisplay();
 
+    void setScratchEngine(ScratchEngine* engine);
+    ScratchEngine* getScratchEngine() const { return scratchEngine; }
+
     // Public access to track length and original BPM for external updates
     double trackLengthSec{0.0};
     double originalBpm{120.0}; // Public access for label updates
@@ -156,6 +161,8 @@ signals:
     void scratchMove(double relative);
     void scratchEnd();
     void scratchVelocityChanged(double velocity); // Signal for scratch speed
+    void pitchBendRequested(double ratio);
+    void pitchBendEnded();
     void zoomLevelChanged(int newLevel); // Signal when zoom level changes
 
 protected:
@@ -171,6 +178,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void leaveEvent(QEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     QSize sizeHint() const override { return QSize(1100, 240); }
     QSize minimumSizeHint() const override { return QSize(700, 160); }
@@ -180,10 +188,26 @@ protected:
     }
 
 private:
+    struct ViewportMetrics {
+        double playheadSeconds{0.0};
+        double safeTempo{1.0};
+        double leftSecond{0.0};
+        double rightSecond{0.0};
+        double displayCenterSecond{0.0};
+        double timeRange{0.0};
+        int viewportWidth{0};
+    };
+
     // Simplified rendering methods
     void renderSimpleScrollMode(QPainter& p, double dispPlayheadRel);
     void renderSimpleStaticMode(QPainter& p, double dispPlayheadRel);
     void renderSimpleBeatGrid(QPainter& p, double dispPlayheadRel);
+
+    bool computeViewportMetrics(ViewportMetrics& metrics) const;
+    double secondsAtViewportX(double x) const;
+    double secondsToRelative(double seconds) const;
+    bool seekToMousePosition(double x);
+    void updatePitchBendFromMouse(double x);
 
 private:
     // Waveform rendering - optimized for performance
@@ -216,6 +240,12 @@ private:
     bool ghostLoopEnabled{false};
     double ghostLoopStartSec{0.0};
     double ghostLoopEndSec{0.0};
+
+    ScratchEngine* scratchEngine{nullptr};
+    std::vector<QMetaObject::Connection> scratchEngineConnections;
+
+    void applyScratchResult(const ScratchEngine::UpdateResult& result);
+    double relativeToSeconds(double relative) const;
     
     // Performance optimization: Image cache and update throttling
     QTimer* updateThrottleTimer{nullptr};
@@ -276,6 +306,8 @@ private:
 
     // Scratch interaction state - SIMPLIFIED VINYL BEHAVIOR
     bool scratching{false};
+    bool seekActive{false};
+    bool pitchBendActive{false};
     double scratchStartX{0.0};          // Initial mouse X when scratch began
     double scratchStartPos{0.0};        // Initial track position (0..1) when scratch began
     double scratchVelocity{0.0};        // Current scratch velocity for audio feedback
@@ -297,6 +329,12 @@ private:
     // DECK ISOLATION FIX: Local pixels-per-second storage (was GlobalBeatGrid)
     double localPixelsPerSecond{100.0}; // Local pixels per second instead of global
     double scratchInitialAbsPos{0.0};   // Initial absolute position when scratch started
+    double pitchBendAnchorX{0.0};
+
+    static constexpr double pitchBendDeadZonePx{1.5};
+    static constexpr double pitchBendNormalizedSensitivity{2.0}; // ratio change across full widget width
+    static constexpr double pitchBendMinRatio{0.4};
+    static constexpr double pitchBendMaxRatio{2.5};
     
     // Preroll functionality for DJ-style cueing before track start
     bool prerollEnabled{true};           // Enable preroll by default

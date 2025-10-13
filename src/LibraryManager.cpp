@@ -1,4 +1,5 @@
 #include "LibraryManager.h"
+#include "AppConfig.h"
 #include <QApplication>
 #include <QFileDialog>
 #include <QMessageBox>
@@ -17,7 +18,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QPushButton> // (legacy, can be removed if no longer used)
+#include <QAbstractButton>
 #include <QComboBox>
 #include <QLineEdit>
 #include <QProgressBar>
@@ -31,28 +32,39 @@
 #include <QInputDialog>
 #include <QSignalBlocker>
 #include <QTabBar>
+#include <QStyle>
 #include <optional>
 #include <cstring>
 #include <cmath>
 #include <iostream>
 #include <QDebug>
 #include <algorithm>
-#include <QDateTime>
-#include "AppConfig.h"
-#include "LibraryDatabase.h"
-#include "AudioFormatGuard.h"
 
-// JUCE includes for audio format reading and ID3 tag extraction
-#include <juce_audio_formats/juce_audio_formats.h>
-#include <juce_core/juce_core.h>
-
-// LibraryManager Implementation
 LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget* parent)
-    : QWidget(parent), audioFormatManager(formatManager), loaderThread(nullptr)
+    : QWidget(parent),
+      mainSplitter(nullptr),
+      fileSystemTree(nullptr),
+      fileSystemModel(nullptr),
+      tableView(nullptr),
+      model(nullptr),
+      sortComboBox(nullptr),
+      filterLineEdit(nullptr),
+      actionAddFiles(nullptr),
+      actionAddFolder(nullptr),
+      actionRefresh(nullptr),
+      actionClearLibrary(nullptr),
+      statusLabel(nullptr),
+      progressBar(nullptr),
+      loaderThread(nullptr),
+      audioFormatManager(formatManager),
+      filterUpdateTimer(new QTimer(this))
 {
+    setObjectName("LibraryManager");
+    setAcceptDrops(true);
+
     initializeStoragePaths();
 
-    libraryDatabase = std::make_unique<LibraryDatabase>(this);
+    libraryDatabase = std::make_unique<LibraryDatabase>();
     if (!libraryDatabase->open(libraryDatabasePath))
     {
         qWarning() << "Failed to open library database at" << libraryDatabasePath;
@@ -60,28 +72,42 @@ LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget*
     }
 
     setupUI();
-    setupFileSystemModel();
-    
-    // Setup filter update timer (debounce filtering)
-    filterUpdateTimer = new QTimer(this);
+
+    filterUpdateTimer->setInterval(180);
     filterUpdateTimer->setSingleShot(true);
-    filterUpdateTimer->setInterval(300); // 300ms delay
     connect(filterUpdateTimer, &QTimer::timeout, this, &LibraryManager::onFilterTextChanged);
 
-    loadExistingTracks();
-    loadPlaylists();
+    setupFileSystemModel();
+
+    if (libraryDatabase)
+    {
+        loadExistingTracks();
+        loadPlaylists();
+    }
+    else
+    {
+        loadPlaylists();
+    }
+
+    updateStatusLabel();
 }
 
 LibraryManager::~LibraryManager()
 {
-    // Persist column sizes/order for next launch
     saveColumnState();
-    if (loaderThread && loaderThread->isRunning()) {
+
+    if (filterUpdateTimer)
+        filterUpdateTimer->stop();
+
+    if (loaderThread)
+    {
         loaderThread->stop();
-        loaderThread->wait(3000);
+        loaderThread->wait(2000);
         loaderThread->deleteLater();
+        loaderThread = nullptr;
     }
 }
+#include <QDateTime>
 
 void LibraryManager::setupUI()
 {
@@ -89,136 +115,163 @@ void LibraryManager::setupUI()
         "QWidget { background-color: #101114; color: #f0f0f0; font-family: 'Lato', 'Arial', sans-serif; }"
         "QSplitter::handle { background-color: #23262e; }"
         "QSplitter::handle:horizontal { width: 2px; }"
-        "#libraryNavPanel { background: #14161a; border-right: 1px solid #262931; }"
+        "#libraryIconSidebar { background: #0c0d10; border-right: 1px solid #23262e; }"
+        "QToolButton[sidebarButton=\"true\"] { background: transparent; border: none; padding: 8px; margin: 0; icon-size: 22px; }"
+        "QToolButton[sidebarButton=\"true\"]:hover { background: rgba(66,133,244,0.18); border-radius: 8px; }"
+        "QToolButton[sidebarButton=\"true\"]:checked { background: rgba(66,133,244,0.28); border-radius: 8px; }"
+        "#libraryMiddlePanel { background: #14161a; border-right: 1px solid #262931; }"
+        "#navigationHeaderLabel { font-weight: 600; font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: #8b92a3; }"
         "QTabWidget::pane { border: none; }"
-    "QTabBar::tab { background: transparent; color: #a8acb3; padding: 7px 6px; margin: 1px; border-radius: 7px; min-width: 70px; font-size: 9px; font-weight: 600; }"
+        "QTabBar::tab { background: transparent; color: #a8acb3; padding: 7px 6px; margin: 1px; border-radius: 7px; min-width: 70px; font-size: 9px; font-weight: 600; }"
         "QTabBar::tab:selected { background: #2f6ae0; color: #ffffff; }"
-    "QListWidget { background-color: transparent; border: none; font-size: 9px; }"
-    "QListWidget::item { padding: 3px 6px; border-radius: 5px; margin: 1px 2px; }"
-        "QListWidget::item:selected { background-color: #2f6ae0; color: #ffffff; }"
-        "QListWidget::item:hover { background-color: rgba(47,106,224,0.16); }"
         "#libraryToolbar { background: #14171d; border: 1px solid #242832; border-radius: 8px; }"
         "#librarySearchContainer { background: #1a1d24; border: 1px solid #2b303c; border-radius: 6px; }"
-    "#librarySearchContainer QLabel { color: #8b92a3; }"
+        "#librarySearchContainer QLabel { color: #8b92a3; }"
         "#libraryFooterBar { background: #14171d; border: 1px solid #242832; border-radius: 8px; }"
-    "QToolButton[class=\"primaryAction\"] { background: #1b1f27; border: 1px solid #2b303c; border-radius: 6px; padding: 3px 6px; font-size: 9px; min-width: 0px; min-height: 24px; color: #d8dce8; }"
+        "QToolButton[class=\"primaryAction\"] { background: #1b1f27; border: 1px solid #2b303c; border-radius: 6px; padding: 3px 6px; font-size: 9px; min-width: 0px; min-height: 24px; color: #d8dce8; }"
         "QToolButton[class=\"primaryAction\"]:hover { border-color: #3c7cff; color: #ffffff; }"
         "QToolButton[class=\"primaryAction\"]:pressed { background: #161a21; }"
-    "#filterCaption { color: #9aa3b5; font-size: 9px; font-weight: 600; padding-right: 2px; }"
+        "#filterCaption { color: #9aa3b5; font-size: 9px; font-weight: 600; padding-right: 2px; }"
         "#searchIcon { color: #7f8899; padding-right: 4px; }"
-    "QLineEdit { background-color: #1f232c; border: 1px solid #323845; padding: 3px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; }"
+        "QLineEdit { background-color: #1f232c; border: 1px solid #323845; padding: 3px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; }"
         "QLineEdit:focus { border-color: #4188ff; }"
-    "#librarySearchContainer QLineEdit { background: transparent; border: none; padding: 0; font-size: 9px; }"
+        "#librarySearchContainer QLineEdit { background: transparent; border: none; padding: 0; font-size: 9px; }"
         "#librarySearchContainer QLineEdit:focus { border: none; }"
-    "QComboBox { background-color: #1f232c; border: 1px solid #323845; padding: 2px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; min-width: 96px; }"
+        "QComboBox { background-color: #1f232c; border: 1px solid #323845; padding: 2px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; min-width: 96px; }"
         "QComboBox::drop-down { border: none; }"
-    "QTableView { font-size: 10px; background: #0f1014; alternate-background-color: #15171d; selection-background-color: #2f6ae0; border: none; gridline-color: #1f232c; }"
-    "QHeaderView::section { font-weight: 600; font-size: 9px; background: #181b22; color: #d8dce8; border: none; padding: 4px 3px; }"
+        "QTreeWidget { background-color: transparent; border: none; }"
+        "QTreeWidget::item { height: 20px; color: #d8dce8; }"
+        "QTreeWidget::item:selected { background: #2f6ae0; border-radius: 5px; color: #ffffff; }"
+        "QTreeWidget::item:hover { background: rgba(47,106,224,0.16); border-radius: 5px; }"
+        "QTableView { font-size: 10px; background: #0f1014; alternate-background-color: #15171d; selection-background-color: #2f6ae0; border: none; gridline-color: #1f232c; }"
+        "QHeaderView::section { font-weight: 600; font-size: 9px; background: #181b22; color: #d8dce8; border: none; padding: 4px 3px; }"
         "QTableView::item { padding-left: 5px; padding-right: 5px; }"
         "QProgressBar { height: 9px; background: #1f232c; border: 1px solid #323845; border-radius: 4px; }"
         "QProgressBar::chunk { background: #4188ff; border-radius: 4px; }"
-        "QTreeView { background-color: transparent; border: none; }"
-        "QTreeView::item:selected { background-color: #2f6ae0; }"
-        "QTreeView::item:hover { background-color: rgba(47,106,224,0.16); }"
     );
 
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(5);
     mainLayout->setContentsMargins(6, 6, 6, 6);
-    
-    // Create main splitter (horizontal)
+
     mainSplitter = new QSplitter(Qt::Horizontal, this);
-    
-    // === LEFT PANEL: Navigation Tabs ===
-    auto* leftPanel = new QWidget();
-    leftPanel->setObjectName("libraryNavPanel");
-    leftPanel->setMinimumWidth(120);
-    leftPanel->setMaximumWidth(180);
+    mainSplitter->setChildrenCollapsible(false);
+    mainSplitter->setHandleWidth(2);
 
-    auto* leftLayout = new QVBoxLayout(leftPanel);
-    leftLayout->setContentsMargins(2, 4, 2, 4);
-    leftLayout->setSpacing(5);
+    // === LEFT ICON SIDEBAR ===
+    iconSidebar = new QWidget(mainSplitter);
+    iconSidebar->setObjectName("libraryIconSidebar");
+    iconSidebar->setFixedWidth(60);
+    auto* iconLayout = new QVBoxLayout(iconSidebar);
+    iconLayout->setContentsMargins(10, 14, 10, 14);
+    iconLayout->setSpacing(10);
 
-    navigationTabs = new QTabWidget(leftPanel);
-    navigationTabs->setTabPosition(QTabWidget::West);
-    navigationTabs->setDocumentMode(true);
-    navigationTabs->setMovable(false);
-    navigationTabs->setIconSize(QSize(16, 16));
-    if (auto* bar = navigationTabs->tabBar())
-    {
-        bar->setIconSize(QSize(16, 16));
-        bar->setFocusPolicy(Qt::NoFocus);
-        bar->setExpanding(false);
-        bar->setMinimumWidth(64);
-    }
+    sidebarButtonGroup = new QButtonGroup(iconSidebar);
+    sidebarButtonGroup->setExclusive(true);
 
-    // Collection tab
-    auto* collectionPage = new QWidget(navigationTabs);
-    auto* collectionLayout = new QVBoxLayout(collectionPage);
-    collectionLayout->setContentsMargins(0, 0, 0, 0);
-    collectionLayout->setSpacing(4);
-    auto* collectionHeader = new QLabel(tr("Collection"), collectionPage);
-    collectionHeader->setObjectName("collectionHeader");
-    collectionHeader->setStyleSheet("font-weight: 600; font-size: 10px; padding: 4px 8px; color: #f0f0f0;");
-    collectionList = new QListWidget(collectionPage);
-    collectionList->setSelectionMode(QAbstractItemView::SingleSelection);
-    collectionList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    collectionList->setSpacing(2);
-    collectionList->addItem(tr("All Tracks"));
-    collectionLayout->addWidget(collectionHeader);
-    collectionLayout->addWidget(collectionList, 1);
-    navigationTabs->addTab(collectionPage, QIcon::fromTheme("media-playlist-shuffle"), tr("Collection"));
+    auto addSidebarButton = [&](SidebarSection section, const QIcon& icon, const QString& tooltip) {
+        QToolButton* button = createSidebarButton(section, icon, tooltip);
+        iconLayout->addWidget(button, 0, Qt::AlignHCenter);
+        return button;
+    };
 
-    // Playlists tab
-    auto* playlistPage = new QWidget(navigationTabs);
-    auto* playlistLayout = new QVBoxLayout(playlistPage);
-    playlistLayout->setContentsMargins(0, 0, 0, 0);
-    playlistLayout->setSpacing(4);
+    addSidebarButton(SidebarSection::Collection, style()->standardIcon(QStyle::SP_DirHomeIcon), tr("Collection"));
+    addSidebarButton(SidebarSection::Playlists, style()->standardIcon(QStyle::SP_FileDialogListView), tr("Playlists"));
+    addSidebarButton(SidebarSection::Explorer, style()->standardIcon(QStyle::SP_DirIcon), tr("Explorer"));
+    addSidebarButton(SidebarSection::Streaming, style()->standardIcon(QStyle::SP_BrowserReload), tr("Streaming"));
+    addSidebarButton(SidebarSection::Devices, style()->standardIcon(QStyle::SP_DriveHDIcon), tr("Devices"));
+    addSidebarButton(SidebarSection::Settings, style()->standardIcon(QStyle::SP_FileDialogDetailedView), tr("Settings"));
+    iconLayout->addStretch(1);
 
-    auto* playlistHeader = new QWidget(playlistPage);
-    auto* playlistHeaderLayout = new QHBoxLayout(playlistHeader);
-    playlistHeaderLayout->setContentsMargins(8, 4, 8, 4);
-    playlistHeaderLayout->setSpacing(4);
-    auto* playlistLabel = new QLabel(tr("Playlists"), playlistHeader);
-    playlistLabel->setStyleSheet("font-weight: 600; font-size: 9px; color: #f0f0f0;");
-    auto* addPlaylistButton = new QToolButton(playlistHeader);
-    addPlaylistButton->setIcon(QIcon::fromTheme("list-add"));
-    addPlaylistButton->setIconSize(QSize(12, 12));
+    connect(sidebarButtonGroup, QOverload<int>::of(&QButtonGroup::idClicked), this, &LibraryManager::onSidebarSectionChanged);
+
+    // === MIDDLE PANEL: CONTEXTUAL NAVIGATION ===
+    auto* middlePanel = new QWidget(mainSplitter);
+    middlePanel->setObjectName("libraryMiddlePanel");
+    middlePanel->setMinimumWidth(240);
+    middlePanel->setMaximumWidth(360);
+    auto* middleLayout = new QVBoxLayout(middlePanel);
+    middleLayout->setContentsMargins(6, 6, 6, 6);
+    middleLayout->setSpacing(6);
+
+    navigationHeader = new QWidget(middlePanel);
+    auto* navHeaderLayout = new QHBoxLayout(navigationHeader);
+    navHeaderLayout->setContentsMargins(0, 0, 0, 0);
+    navHeaderLayout->setSpacing(6);
+    navigationTitleLabel = new QLabel(tr("Collection"), navigationHeader);
+    navigationTitleLabel->setObjectName("navigationHeaderLabel");
+    addPlaylistButton = new QToolButton(navigationHeader);
+    addPlaylistButton->setIcon(QIcon::fromTheme("list-add", style()->standardIcon(QStyle::SP_FileDialogNewFolder)));
+    addPlaylistButton->setIconSize(QSize(14, 14));
     addPlaylistButton->setAutoRaise(true);
     addPlaylistButton->setCursor(Qt::PointingHandCursor);
     addPlaylistButton->setToolTip(tr("Create new playlist"));
-    playlistHeaderLayout->addWidget(playlistLabel, 1);
-    playlistHeaderLayout->addWidget(addPlaylistButton, 0, Qt::AlignRight);
+    navHeaderLayout->addWidget(navigationTitleLabel, 1);
+    navHeaderLayout->addWidget(addPlaylistButton, 0, Qt::AlignRight);
+    navigationHeader->setLayout(navHeaderLayout);
+    middleLayout->addWidget(navigationHeader, 0);
 
-    playlistList = new QListWidget(playlistPage);
-    playlistList->setSelectionMode(QAbstractItemView::SingleSelection);
-    playlistList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    playlistList->setSpacing(2);
-    playlistList->setContextMenuPolicy(Qt::CustomContextMenu);
+    navigationStack = new QStackedWidget(middlePanel);
+    navigationStack->setObjectName("libraryNavigationStack");
 
-    playlistLayout->addWidget(playlistHeader);
-    playlistLayout->addWidget(playlistList, 1);
+    collectionTree = new QTreeWidget(navigationStack);
+    collectionTree->setHeaderHidden(true);
+    collectionTree->setIndentation(18);
+    collectionTree->setUniformRowHeights(true);
+    collectionTree->setAnimated(true);
+    collectionTree->setSelectionMode(QAbstractItemView::SingleSelection);
 
-    navigationTabs->addTab(playlistPage, QIcon::fromTheme("view-media-playlist"), tr("Playlists"));
+    playlistPanel = new QWidget(navigationStack);
+    auto* playlistLayout = new QVBoxLayout(playlistPanel);
+    playlistLayout->setContentsMargins(0, 0, 0, 0);
+    playlistLayout->setSpacing(0);
+    navigationTree = new QTreeWidget(playlistPanel);
+    navigationTree->setObjectName("playlistNavigationTree");
+    navigationTree->setHeaderHidden(true);
+    navigationTree->setIndentation(18);
+    navigationTree->setUniformRowHeights(true);
+    navigationTree->setAnimated(true);
+    navigationTree->setSelectionMode(QAbstractItemView::SingleSelection);
+    navigationTree->setContextMenuPolicy(Qt::CustomContextMenu);
+    navigationTree->setFocusPolicy(Qt::StrongFocus);
+    playlistLayout->addWidget(navigationTree);
+    playlistPanel->setLayout(playlistLayout);
 
-    // Explorer tab
-    auto* explorerPage = new QWidget(navigationTabs);
-    auto* explorerLayout = new QVBoxLayout(explorerPage);
+    explorationPanel = new QWidget(navigationStack);
+    auto* explorerLayout = new QVBoxLayout(explorationPanel);
     explorerLayout->setContentsMargins(0, 0, 0, 0);
     explorerLayout->setSpacing(4);
-    auto* explorerHeader = new QLabel(tr("Folders"), explorerPage);
-    explorerHeader->setStyleSheet("font-weight: 600; font-size: 10px; padding: 5px 9px; color: #f0f0f0;");
-    fileSystemTree = new QTreeView(explorerPage);
+    auto* explorerLabel = new QLabel(tr("Folders"), explorationPanel);
+    explorerLabel->setStyleSheet("font-weight: 600; font-size: 9px; color: #8b92a3; padding-left: 4px;");
+    explorerContainer = new QWidget(explorationPanel);
+    auto* explorerContainerLayout = new QVBoxLayout(explorerContainer);
+    explorerContainerLayout->setContentsMargins(0, 0, 0, 0);
+    explorerContainerLayout->setSpacing(0);
+    fileSystemTree = new QTreeView(explorerContainer);
     fileSystemTree->setHeaderHidden(true);
     fileSystemTree->setRootIsDecorated(true);
     fileSystemTree->setDragEnabled(true);
     fileSystemTree->setDragDropMode(QAbstractItemView::DragOnly);
-    explorerLayout->addWidget(explorerHeader);
-    explorerLayout->addWidget(fileSystemTree, 1);
-    navigationTabs->addTab(explorerPage, QIcon::fromTheme("folder"), tr("Explorer"));
+    explorerContainerLayout->addWidget(fileSystemTree);
+    explorerContainer->setLayout(explorerContainerLayout);
+    explorerLayout->addWidget(explorerLabel);
+    explorerLayout->addWidget(explorerContainer, 1);
+    explorationPanel->setLayout(explorerLayout);
 
-    leftLayout->addWidget(navigationTabs);
-    
+    streamingPanel = createPlaceholderPanel(tr("Streaming"), tr("Connect a streaming service to browse playlists."));
+    devicesPanel = createPlaceholderPanel(tr("Devices"), tr("No devices connected."));
+    settingsPanel = createPlaceholderPanel(tr("Settings"), tr("Library settings coming soon."));
+
+    navigationStack->insertWidget(static_cast<int>(SidebarSection::Collection), collectionTree);
+    navigationStack->insertWidget(static_cast<int>(SidebarSection::Playlists), playlistPanel);
+    navigationStack->insertWidget(static_cast<int>(SidebarSection::Explorer), explorationPanel);
+    navigationStack->insertWidget(static_cast<int>(SidebarSection::Streaming), streamingPanel);
+    navigationStack->insertWidget(static_cast<int>(SidebarSection::Devices), devicesPanel);
+    navigationStack->insertWidget(static_cast<int>(SidebarSection::Settings), settingsPanel);
+    navigationStack->setCurrentIndex(static_cast<int>(SidebarSection::Collection));
+
+    middleLayout->addWidget(navigationStack, 1);
+
     // === RIGHT PANEL: Track Table ===
     auto* rightPanel = new QWidget();
     auto* rightLayout = new QVBoxLayout(rightPanel);
@@ -451,28 +504,197 @@ void LibraryManager::setupUI()
     // Assemble right panel
     rightLayout->addWidget(tableView, 1);
     rightLayout->addWidget(footerBar);
-    
-    // Add panels to splitter
-    mainSplitter->addWidget(leftPanel);
+
+    // Add sections to splitter
+    mainSplitter->addWidget(iconSidebar);
+    mainSplitter->addWidget(middlePanel);
     mainSplitter->addWidget(rightPanel);
-    
-    // Set splitter proportions (30% left, 70% right)
+
     mainSplitter->setStretchFactor(0, 0);
-    mainSplitter->setStretchFactor(1, 1);
-    mainSplitter->setSizes({250, 600});
-    
+    mainSplitter->setStretchFactor(1, 0);
+    mainSplitter->setStretchFactor(2, 1);
+    mainSplitter->setSizes({60, 280, 720});
+
     // Add splitter to main layout
     mainLayout->addWidget(mainSplitter);
-    
-    connect(navigationTabs, &QTabWidget::currentChanged, this, &LibraryManager::onNavigationTabChanged);
-    connect(collectionList, &QListWidget::currentRowChanged, this, &LibraryManager::onCollectionSelectionChanged);
-    connect(playlistList, &QListWidget::itemSelectionChanged, this, &LibraryManager::onPlaylistSelectionChanged);
-    connect(playlistList, &QWidget::customContextMenuRequested, this, &LibraryManager::onPlaylistContextMenu);
-    connect(playlistList, &QListWidget::itemDoubleClicked, this, &LibraryManager::onPlaylistItemDoubleClicked);
+
     connect(addPlaylistButton, &QToolButton::clicked, this, &LibraryManager::onAddPlaylistClicked);
+    connect(collectionTree, &QTreeWidget::currentItemChanged, this, &LibraryManager::onNavigationItemChanged);
+    connect(navigationTree, &QTreeWidget::currentItemChanged, this, &LibraryManager::onNavigationItemChanged);
+    connect(navigationTree, &QWidget::customContextMenuRequested, this, &LibraryManager::onNavigationContextMenu);
+
+    if (sidebarButtonGroup)
+    {
+        if (QAbstractButton* collectionButton = sidebarButtonGroup->button(static_cast<int>(SidebarSection::Collection)))
+            collectionButton->setChecked(true);
+    }
+
+    buildCollectionTree();
+    setActiveSidebarSection(SidebarSection::Collection);
 
     initializeNavigationState();
     updateStatusLabel();
+}
+
+QToolButton* LibraryManager::createSidebarButton(SidebarSection section, const QIcon& icon, const QString& tooltip)
+{
+    auto* button = new QToolButton(iconSidebar);
+    button->setCheckable(true);
+    button->setAutoRaise(true);
+    button->setCursor(Qt::PointingHandCursor);
+    button->setIcon(icon);
+    button->setIconSize(QSize(20, 20));
+    button->setToolTip(tooltip);
+    button->setProperty("sidebarButton", true);
+
+    if (sidebarButtonGroup)
+        sidebarButtonGroup->addButton(button, static_cast<int>(section));
+
+    return button;
+}
+
+QWidget* LibraryManager::createPlaceholderPanel(const QString& title, const QString& message)
+{
+    auto* panel = new QWidget(navigationStack);
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(12, 18, 12, 18);
+    layout->setSpacing(8);
+
+    auto* titleLabel = new QLabel(title, panel);
+    titleLabel->setStyleSheet("font-weight: 600; font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: #8b92a3;");
+    auto* messageLabel = new QLabel(message, panel);
+    messageLabel->setWordWrap(true);
+    messageLabel->setStyleSheet("font-size: 9px; color: #b0b6c2;");
+
+    layout->addWidget(titleLabel, 0, Qt::AlignTop);
+    layout->addWidget(messageLabel, 0, Qt::AlignTop);
+    layout->addStretch(1);
+
+    return panel;
+}
+
+void LibraryManager::buildCollectionTree()
+{
+    if (!collectionTree)
+        return;
+
+    collectionTree->clear();
+
+    collectionRoot = new QTreeWidgetItem(collectionTree);
+    collectionRoot->setText(0, tr("Collection"));
+    collectionRoot->setData(0, NavigationRole, static_cast<int>(NavigationType::CollectionAll));
+    collectionRoot->setFlags(collectionRoot->flags() & ~Qt::ItemIsDragEnabled);
+
+    allTracksItem = new QTreeWidgetItem(collectionRoot);
+    allTracksItem->setText(0, tr("All Tracks"));
+    allTracksItem->setData(0, NavigationRole, static_cast<int>(NavigationType::CollectionAll));
+    allTracksItem->setFlags(allTracksItem->flags() | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+
+    collectionTree->expandAll();
+}
+
+void LibraryManager::setActiveSidebarSection(SidebarSection section)
+{
+    activeSidebarSection = section;
+
+    if (sidebarButtonGroup)
+    {
+        QSignalBlocker blocker(*sidebarButtonGroup);
+        if (QAbstractButton* button = sidebarButtonGroup->button(static_cast<int>(section)))
+            button->setChecked(true);
+    }
+
+    if (navigationStack)
+        navigationStack->setCurrentIndex(static_cast<int>(section));
+
+    updateNavigationHeader(section);
+
+    const bool playlistToolsVisible = (section == SidebarSection::Playlists);
+    if (addPlaylistButton)
+        addPlaylistButton->setVisible(playlistToolsVisible);
+}
+
+void LibraryManager::updateNavigationHeader(SidebarSection section)
+{
+    if (!navigationTitleLabel)
+        return;
+
+    switch (section)
+    {
+        case SidebarSection::Collection:
+            navigationTitleLabel->setText(tr("Collection"));
+            break;
+        case SidebarSection::Playlists:
+            navigationTitleLabel->setText(tr("Playlists"));
+            break;
+        case SidebarSection::Explorer:
+            navigationTitleLabel->setText(tr("Explorer"));
+            break;
+        case SidebarSection::Streaming:
+            navigationTitleLabel->setText(tr("Streaming"));
+            break;
+        case SidebarSection::Devices:
+            navigationTitleLabel->setText(tr("Devices"));
+            break;
+        case SidebarSection::Settings:
+            navigationTitleLabel->setText(tr("Settings"));
+            break;
+    }
+}
+
+void LibraryManager::onSidebarSectionChanged(int sectionId)
+{
+    const auto section = static_cast<SidebarSection>(sectionId);
+    setActiveSidebarSection(section);
+
+    switch (section)
+    {
+        case SidebarSection::Collection:
+            if (collectionTree && allTracksItem)
+                collectionTree->setCurrentItem(allTracksItem);
+            currentPlaylistId = -1;
+            currentViewMode = LibraryViewMode::Collection;
+            clearPlaylistFilter();
+            updateStatusLabel();
+            break;
+        case SidebarSection::Playlists:
+            currentViewMode = LibraryViewMode::Playlists;
+            if (navigationTree)
+            {
+                if (QTreeWidgetItem* current = navigationTree->currentItem())
+                    onNavigationItemChanged(current, nullptr);
+                else if (playlistsRoot)
+                    navigationTree->setCurrentItem(playlistsRoot);
+            }
+            break;
+        case SidebarSection::Explorer:
+            currentViewMode = LibraryViewMode::Explorer;
+            currentPlaylistId = -1;
+            clearPlaylistFilter();
+            updateStatusLabel();
+            break;
+        case SidebarSection::Streaming:
+            currentViewMode = LibraryViewMode::Streaming;
+            currentPlaylistId = -1;
+            clearPlaylistFilter();
+            if (statusLabel)
+                statusLabel->setText(tr("Connect a streaming service to browse tracks"));
+            break;
+        case SidebarSection::Devices:
+            currentViewMode = LibraryViewMode::Devices;
+            currentPlaylistId = -1;
+            clearPlaylistFilter();
+            if (statusLabel)
+                statusLabel->setText(tr("No devices connected"));
+            break;
+        case SidebarSection::Settings:
+            currentViewMode = LibraryViewMode::Collection;
+            currentPlaylistId = -1;
+            clearPlaylistFilter();
+            if (statusLabel)
+                statusLabel->setText(tr("Library settings coming soon"));
+            break;
+    }
 }
 
 void LibraryManager::setupFileSystemModel()
@@ -514,96 +736,86 @@ void LibraryManager::setupFileSystemModel()
 
 void LibraryManager::initializeNavigationState()
 {
-    if (navigationTabs)
-        navigationTabs->setCurrentIndex(0);
+    QSignalBlocker blockButtons(sidebarButtonGroup);
+    if (sidebarButtonGroup)
+    {
+        if (QAbstractButton* button = sidebarButtonGroup->button(static_cast<int>(SidebarSection::Collection)))
+            button->setChecked(true);
+    }
 
-    if (collectionList && collectionList->count() > 0)
-        collectionList->setCurrentRow(0);
+    setActiveSidebarSection(SidebarSection::Collection);
+
+    if (collectionTree && allTracksItem)
+        collectionTree->setCurrentItem(allTracksItem);
 
     currentViewMode = LibraryViewMode::Collection;
+    currentPlaylistId = -1;
 }
 
-void LibraryManager::onNavigationTabChanged(int index)
+void LibraryManager::onNavigationItemChanged(QTreeWidgetItem* current, QTreeWidgetItem* previous)
 {
-    if (!model)
+    Q_UNUSED(previous);
+
+    if (!current)
         return;
 
-    switch (index)
+    auto* tree = qobject_cast<QTreeWidget*>(sender());
+    const auto type = static_cast<NavigationType>(current->data(0, NavigationRole).toInt());
+
+    if (tree == collectionTree && activeSidebarSection != SidebarSection::Collection)
+        setActiveSidebarSection(SidebarSection::Collection);
+    else if (tree == navigationTree && activeSidebarSection != SidebarSection::Playlists)
+        setActiveSidebarSection(SidebarSection::Playlists);
+
+    switch (type)
     {
-    case 0:
-        currentViewMode = LibraryViewMode::Collection;
-        clearPlaylistFilter();
-        updateStatusLabel();
-        break;
-    case 1:
-        currentViewMode = LibraryViewMode::Playlists;
-        ensurePlaylistSelection();
-        if (currentPlaylistId > 0)
-            applyPlaylistFilter(currentPlaylistId);
-        else
+        case NavigationType::CollectionAll:
+            currentViewMode = LibraryViewMode::Collection;
+            currentPlaylistId = -1;
+            clearPlaylistFilter();
             updateStatusLabel();
-        break;
-    case 2:
-    default:
-        currentViewMode = LibraryViewMode::Explorer;
-        clearPlaylistFilter();
-        updateStatusLabel();
-        break;
-    }
-}
-
-void LibraryManager::onCollectionSelectionChanged(int row)
-{
-    Q_UNUSED(row);
-    if (currentViewMode != LibraryViewMode::Collection)
-        return;
-
-    clearPlaylistFilter();
-    updateStatusLabel();
-}
-
-void LibraryManager::onPlaylistSelectionChanged()
-{
-    if (!playlistList)
-        return;
-
-    QListWidgetItem* item = playlistList->currentItem();
-    if (!item)
-    {
-        if (currentViewMode == LibraryViewMode::Playlists)
-        {
-            model->clearPlaylistFilter();
-            updateStatusLabel();
+            break;
+        case NavigationType::Playlist: {
+            currentViewMode = LibraryViewMode::Playlists;
+            const int playlistId = current->data(0, PlaylistIdRole).toInt();
+            currentPlaylistId = playlistId;
+            applyPlaylistFilter(playlistId);
+            break;
         }
-        return;
+        case NavigationType::PlaylistRoot:
+            currentViewMode = LibraryViewMode::Playlists;
+            currentPlaylistId = -1;
+            clearPlaylistFilter();
+            updateStatusLabel();
+            break;
+        default:
+            break;
     }
-
-    const int playlistId = item->data(Qt::UserRole).toInt();
-    currentPlaylistId = playlistId;
-
-    if (currentViewMode == LibraryViewMode::Playlists)
-        applyPlaylistFilter(playlistId);
 }
 
-void LibraryManager::onPlaylistContextMenu(const QPoint& pos)
+void LibraryManager::onNavigationContextMenu(const QPoint& pos)
 {
-    if (!playlistList)
+    if (!navigationTree)
         return;
 
-    QListWidgetItem* item = playlistList->itemAt(pos);
-    if (item && playlistList->currentItem() != item)
-        playlistList->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+    QTreeWidgetItem* item = navigationTree->itemAt(pos);
+    if (item)
+        navigationTree->setCurrentItem(item);
 
     QMenu menu(this);
     menu.addAction(tr("New Playlist"), this, &LibraryManager::onAddPlaylistClicked);
 
-    if (playlistList->currentItem())
+    if (item)
     {
-        menu.addAction(tr("Rename"), this, &LibraryManager::onRenamePlaylistRequested);
-        menu.addAction(tr("Delete"), this, &LibraryManager::onDeletePlaylistRequested);
+        const auto type = static_cast<NavigationType>(item->data(0, NavigationRole).toInt());
+        if (type == NavigationType::Playlist)
+        {
+            menu.addAction(tr("Rename"), this, &LibraryManager::onRenamePlaylistRequested);
+            menu.addAction(tr("Delete"), this, &LibraryManager::onDeletePlaylistRequested);
+        }
     }
 
-    menu.exec(playlistList->mapToGlobal(pos));
+    menu.exec(navigationTree->viewport()->mapToGlobal(pos));
 }
 
 void LibraryManager::onAddPlaylistClicked()
@@ -626,23 +838,19 @@ void LibraryManager::onAddPlaylistClicked()
     playlistRecords.append(record);
     playlistItemCache.remove(record.id);
     currentPlaylistId = record.id;
-    refreshPlaylistList();
-    ensurePlaylistSelection();
-
-    if (currentViewMode == LibraryViewMode::Playlists)
-        applyPlaylistFilter(record.id);
+    rebuildPlaylistBranch();
+    selectPlaylistById(record.id);
 }
 
 void LibraryManager::onRenamePlaylistRequested()
 {
-    if (!libraryDatabase || !playlistList)
+    if (!libraryDatabase)
         return;
 
-    QListWidgetItem* item = playlistList->currentItem();
-    if (!item)
+    const int playlistId = currentNavigationPlaylistId();
+    if (playlistId <= 0)
         return;
 
-    const int playlistId = item->data(Qt::UserRole).toInt();
     const QString currentName = playlistNameById(playlistId);
 
     bool ok = false;
@@ -660,21 +868,20 @@ void LibraryManager::onRenamePlaylistRequested()
     if (index >= 0)
         playlistRecords[index].name = newName;
 
-    refreshPlaylistList();
-    ensurePlaylistSelection();
+    rebuildPlaylistBranch();
+    selectPlaylistById(playlistId);
     updatePlaylistStatusUi();
 }
 
 void LibraryManager::onDeletePlaylistRequested()
 {
-    if (!libraryDatabase || !playlistList)
+    if (!libraryDatabase)
         return;
 
-    QListWidgetItem* item = playlistList->currentItem();
-    if (!item)
+    const int playlistId = currentNavigationPlaylistId();
+    if (playlistId <= 0)
         return;
 
-    const int playlistId = item->data(Qt::UserRole).toInt();
     const QString name = playlistNameById(playlistId);
 
     const auto answer = QMessageBox::question(this,
@@ -698,18 +905,9 @@ void LibraryManager::onDeletePlaylistRequested()
         model->clearPlaylistFilter();
 
     currentPlaylistId = -1;
-    refreshPlaylistList();
-    ensurePlaylistSelection();
+    rebuildPlaylistBranch();
+    selectCollection();
     updateStatusLabel();
-}
-
-void LibraryManager::onPlaylistItemDoubleClicked(QListWidgetItem* item)
-{
-    if (!item)
-        return;
-
-    playlistList->setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
-    onRenamePlaylistRequested();
 }
 
 void LibraryManager::loadPlaylists()
@@ -719,57 +917,114 @@ void LibraryManager::loadPlaylists()
 
     if (!libraryDatabase)
     {
-        refreshPlaylistList();
+        rebuildPlaylistBranch();
         return;
     }
 
     playlistRecords = libraryDatabase->loadAllPlaylists();
-    refreshPlaylistList();
-    ensurePlaylistSelection();
+    rebuildPlaylistBranch();
+    if (currentPlaylistId > 0)
+        selectPlaylistById(currentPlaylistId);
 }
 
-void LibraryManager::refreshPlaylistList()
+void LibraryManager::rebuildPlaylistBranch()
 {
-    if (!playlistList)
+    if (!navigationTree)
         return;
 
-    const int previousId = currentPlaylistId;
-    QSignalBlocker blocker(playlistList);
-    playlistList->clear();
+    if (!playlistsRoot)
+    {
+        playlistsRoot = new QTreeWidgetItem(navigationTree);
+        playlistsRoot->setText(0, tr("Playlists"));
+        playlistsRoot->setData(0, NavigationRole, static_cast<int>(NavigationType::PlaylistRoot));
+        playlistsRoot->setFlags(playlistsRoot->flags() & ~Qt::ItemIsDragEnabled);
+    }
+
+    playlistsRoot->takeChildren();
 
     for (const auto& record : playlistRecords)
     {
-        auto* item = new QListWidgetItem(QStringLiteral("%1 (%2)").arg(record.name).arg(record.trackCount), playlistList);
-        item->setData(Qt::UserRole, record.id);
-        item->setToolTip(tr("%1 tracks").arg(record.trackCount));
+        auto* item = new QTreeWidgetItem(playlistsRoot);
+        item->setData(0, NavigationRole, static_cast<int>(NavigationType::Playlist));
+        item->setData(0, PlaylistIdRole, record.id);
+        updatePlaylistNodeLabel(record.id, item);
     }
 
-    currentPlaylistId = previousId;
+    playlistsRoot->setExpanded(true);
+    navigationTree->expandItem(playlistsRoot);
 }
 
-void LibraryManager::ensurePlaylistSelection()
+void LibraryManager::selectCollection()
 {
-    if (!playlistList)
+    setActiveSidebarSection(SidebarSection::Collection);
+
+    if (collectionTree && allTracksItem)
+        collectionTree->setCurrentItem(allTracksItem);
+
+    currentViewMode = LibraryViewMode::Collection;
+    currentPlaylistId = -1;
+    clearPlaylistFilter();
+    updateStatusLabel();
+}
+
+void LibraryManager::selectPlaylistById(int playlistId)
+{
+    if (playlistId <= 0)
         return;
 
-    if (playlistRecords.isEmpty())
-    {
-        playlistList->clearSelection();
-        updateStatusLabel();
+    setActiveSidebarSection(SidebarSection::Playlists);
+
+    if (!navigationTree)
         return;
+
+    if (QTreeWidgetItem* target = findPlaylistTreeItem(playlistId))
+        navigationTree->setCurrentItem(target);
+}
+
+int LibraryManager::currentNavigationPlaylistId() const
+{
+    if (!navigationTree)
+        return -1;
+
+    if (QTreeWidgetItem* current = navigationTree->currentItem())
+    {
+        if (static_cast<NavigationType>(current->data(0, NavigationRole).toInt()) == NavigationType::Playlist)
+            return current->data(0, PlaylistIdRole).toInt();
+    }
+    return -1;
+}
+
+QTreeWidgetItem* LibraryManager::findPlaylistTreeItem(int playlistId) const
+{
+    if (!playlistsRoot)
+        return nullptr;
+
+    const int childCount = playlistsRoot->childCount();
+    for (int i = 0; i < childCount; ++i)
+    {
+        QTreeWidgetItem* child = playlistsRoot->child(i);
+        if (child->data(0, PlaylistIdRole).toInt() == playlistId)
+            return child;
+    }
+    return nullptr;
+}
+
+void LibraryManager::updatePlaylistNodeLabel(int playlistId, QTreeWidgetItem* item)
+{
+    if (!item)
+        return;
+
+    QString name = tr("Playlist");
+    int trackCount = 0;
+    const int index = findPlaylistIndexById(playlistId);
+    if (index >= 0)
+    {
+        name = playlistRecords.at(index).name;
+        trackCount = playlistRecords.at(index).trackCount;
     }
 
-    int index = findPlaylistIndexById(currentPlaylistId);
-    if (index < 0)
-        index = 0;
-
-    if (index >= 0 && index < playlistList->count())
-        playlistList->setCurrentRow(index);
-
-    currentPlaylistId = playlistList->currentItem() ? playlistList->currentItem()->data(Qt::UserRole).toInt() : -1;
-
-    if (currentViewMode == LibraryViewMode::Playlists && currentPlaylistId > 0)
-        applyPlaylistFilter(currentPlaylistId);
+    item->setText(0, QStringLiteral("%1 (%2)").arg(name).arg(trackCount));
+    item->setToolTip(0, tr("%1 tracks").arg(trackCount));
 }
 
 void LibraryManager::applyPlaylistFilter(int playlistId)
@@ -826,8 +1081,12 @@ void LibraryManager::addTracksToPlaylist(int playlistId, const QStringList& file
     if (index >= 0)
         playlistRecords[index].trackCount = refreshedItems.size();
 
-    refreshPlaylistList();
-    ensurePlaylistSelection();
+    if (QTreeWidgetItem* item = findPlaylistTreeItem(playlistId))
+        updatePlaylistNodeLabel(playlistId, item);
+    else
+        rebuildPlaylistBranch();
+
+    selectPlaylistById(playlistId);
 
     if (currentViewMode == LibraryViewMode::Playlists && currentPlaylistId == playlistId)
         applyPlaylistFilter(playlistId);
@@ -872,8 +1131,12 @@ void LibraryManager::removeTracksFromCurrentPlaylist(const QStringList& filePath
     if (index >= 0)
         playlistRecords[index].trackCount = refreshedItems.size();
 
-    refreshPlaylistList();
-    ensurePlaylistSelection();
+    if (QTreeWidgetItem* item = findPlaylistTreeItem(currentPlaylistId))
+        updatePlaylistNodeLabel(currentPlaylistId, item);
+    else
+        rebuildPlaylistBranch();
+
+    selectPlaylistById(currentPlaylistId);
 
     if (currentViewMode == LibraryViewMode::Playlists)
         applyPlaylistFilter(currentPlaylistId);
@@ -1205,10 +1468,8 @@ void LibraryManager::onClearLibraryClicked()
 
 void LibraryManager::onTableDoubleClicked(const QModelIndex& index)
 {
-    const TrackInfo* track = model->getTrack(index.row());
-    if (track) {
-        emit fileSelected(track->filePath);
-    }
+    Q_UNUSED(index);
+    // Double-click loading is intentionally disabled.
 }
 
 void LibraryManager::onSelectionChanged()

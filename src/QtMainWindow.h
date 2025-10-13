@@ -14,6 +14,7 @@
 #include <QAbstractButton>
 #include <ctime>
 #include <chrono>
+#include <memory>
 #include "QtDeckWidget.h"
 #include "BeatIndicator.h"
 #include "MenuBar.h"
@@ -24,6 +25,7 @@
 class DJAudioPlayer;
 class BpmAnalyzer;
 class PreferencesDialog;
+class ScratchEngine;
 
 // Custom audio callback for proper stereo mixing of both decks
 class StereoAudioCallback : public juce::AudioIODeviceCallback {
@@ -129,6 +131,8 @@ public:
     // THREADING FIX: Make players accessible to threads
     DJAudioPlayer* playerA;
     DJAudioPlayer* playerB;
+    std::unique_ptr<ScratchEngine> scratchEngineA;
+    std::unique_ptr<ScratchEngine> scratchEngineB;
 
 private:
     // Analysis status for overview labels
@@ -210,8 +214,6 @@ private:
     // Window drag functionality for frameless window
     bool isDragging{false};
     QPoint dragStartPosition;
-    bool menuDragPending{false};
-    QPoint menuDragStartGlobal;
     bool systemMoveActive{false};
     bool externalDragActive{false};
     enum class ResizeRegion {
@@ -226,7 +228,6 @@ private:
         BottomRight
     };
     static constexpr int resizeMargin = 8;
-    static constexpr int titleDragHeight = 36;
     ResizeRegion currentResizeRegion{ResizeRegion::None};
     bool isResizing{false};
     QPoint resizeStartPosition;
@@ -268,6 +269,9 @@ private:
     void startScratchInertia(bool isDeckA, double initialVelocity, bool resumePlayback);
     void stopScratchInertia(bool isDeckA, bool resumePlayback);
     void handleScratchInertiaTick(bool isDeckA);
+    void handleScratchStart(bool isDeckA);
+    void handleScratchVelocityChanged(bool isDeckA, double velocity);
+    void handleScratchEnd(bool isDeckA, double releaseVelocity);
     ResizeRegion detectResizeRegion(const QPoint& pos) const;
     void updateCursorForRegion(ResizeRegion region);
     void performResize(const QPoint& globalPos);

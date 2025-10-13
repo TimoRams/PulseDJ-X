@@ -112,6 +112,8 @@ target_sources(David
     src/DeckWaveformOverview.h
     src/PerformancePads.cpp
     src/PerformancePads.h
+    src/ScratchEngine.cpp
+    src/ScratchEngine.h
     src/DJAudioPlayer.cpp
     src/WaveformGenerator.cpp
     src/WaveformGenerator.h

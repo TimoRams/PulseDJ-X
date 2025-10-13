@@ -13,8 +13,10 @@
 #include <QComboBox>
 #include <QLineEdit>
 #include <QLabel>
-#include <QTabWidget>
-#include <QListWidget>
+#include <QTreeWidget>
+#include <QButtonGroup>
+#include <QStackedWidget>
+#include <QFrame>
 #include <QInputDialog>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -37,6 +39,8 @@
 #include <memory>
 #include <optional>
 
+#include "LibraryDatabase.h"
+
 // Forward declarations
 namespace juce {
     class AudioFormatManager;
@@ -46,8 +50,6 @@ namespace juce {
 class QMouseEvent;
 
 class LibraryDatabase;
-struct PlaylistRecord;
-struct PlaylistItemRecord;
 
 // Structure to hold track metadata
 struct TrackInfo {
@@ -293,21 +295,33 @@ private slots:
     void onTableDoubleClicked(const QModelIndex& index);
     void onSelectionChanged();
     void onFileSystemSelectionChanged();
-    void onNavigationTabChanged(int index);
-    void onCollectionSelectionChanged(int row);
-    void onPlaylistSelectionChanged();
-    void onPlaylistContextMenu(const QPoint& pos);
+    void onNavigationItemChanged(QTreeWidgetItem* current, QTreeWidgetItem* previous);
+    void onNavigationContextMenu(const QPoint& pos);
+    void onSidebarSectionChanged(int sectionId);
     void onAddPlaylistClicked();
     void onRenamePlaylistRequested();
     void onDeletePlaylistRequested();
-    void onPlaylistItemDoubleClicked(QListWidgetItem* item);
     
 private:
     // UI components
     QSplitter* mainSplitter;
-    QTabWidget* navigationTabs;
-    QListWidget* collectionList;
-    QListWidget* playlistList;
+    QWidget* iconSidebar = nullptr;
+    QButtonGroup* sidebarButtonGroup = nullptr;
+    QWidget* navigationHeader = nullptr;
+    QLabel* navigationTitleLabel = nullptr;
+    QToolButton* addPlaylistButton = nullptr;
+    QStackedWidget* navigationStack = nullptr;
+    QTreeWidget* navigationTree = nullptr; // playlists tree
+    QTreeWidget* collectionTree = nullptr;
+    QWidget* playlistPanel = nullptr;
+    QWidget* explorationPanel = nullptr;
+    QWidget* streamingPanel = nullptr;
+    QWidget* devicesPanel = nullptr;
+    QWidget* settingsPanel = nullptr;
+    QTreeWidgetItem* collectionRoot = nullptr;
+    QTreeWidgetItem* allTracksItem = nullptr;
+    QTreeWidgetItem* playlistsRoot = nullptr;
+    QWidget* explorerContainer = nullptr;
     QTreeView* fileSystemTree;
     QFileSystemModel* fileSystemModel;
     LibraryTableView* tableView;
@@ -336,16 +350,30 @@ private:
     QTimer* filterUpdateTimer;
     bool columnsSizedOnce = false; // run auto-size only after first load
 
-    enum class LibraryViewMode { Collection, Playlists, Explorer };
+    enum class LibraryViewMode { Collection, Playlists, Explorer, Devices, Streaming };
+    enum class SidebarSection { Collection = 0, Playlists, Explorer, Streaming, Devices, Settings };
+    enum class NavigationType {
+        None = 0,
+        CollectionAll,
+        PlaylistRoot,
+        Playlist,
+        Explorer,
+        Devices,
+        Streaming
+    };
+    static constexpr int NavigationRole = Qt::UserRole + 100;
+    static constexpr int PlaylistIdRole = Qt::UserRole + 101;
     LibraryViewMode currentViewMode = LibraryViewMode::Collection;
     QVector<PlaylistRecord> playlistRecords;
     QHash<int, QVector<PlaylistItemRecord>> playlistItemCache;
     int currentPlaylistId = -1;
+    SidebarSection activeSidebarSection = SidebarSection::Collection;
     
     void initializeStoragePaths();
     void setupUI();
     void setupFileSystemModel();
     void initializeNavigationState();
+    void buildCollectionTree();
     void updateStatusLabel();
     QStringList getSupportedAudioFiles(const QString& directory, bool recursive = true);
     void autoSizeColumnsInitial();
@@ -353,8 +381,16 @@ private:
     void saveColumnState();
     void loadExistingTracks();
     void loadPlaylists();
-    void refreshPlaylistList();
-    void ensurePlaylistSelection();
+    void rebuildPlaylistBranch();
+    void selectCollection();
+    void selectPlaylistById(int playlistId);
+    int currentNavigationPlaylistId() const;
+    QTreeWidgetItem* findPlaylistTreeItem(int playlistId) const;
+    void updatePlaylistNodeLabel(int playlistId, QTreeWidgetItem* item);
+    void setActiveSidebarSection(SidebarSection section);
+    void updateNavigationHeader(SidebarSection section);
+    QToolButton* createSidebarButton(SidebarSection section, const QIcon& icon, const QString& tooltip);
+    QWidget* createPlaceholderPanel(const QString& title, const QString& message);
     void applyPlaylistFilter(int playlistId);
     void clearPlaylistFilter();
     void addTracksToPlaylist(int playlistId, const QStringList& filePaths);

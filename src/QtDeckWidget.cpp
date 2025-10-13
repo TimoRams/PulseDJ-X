@@ -1,6 +1,7 @@
 #include "QtDeckWidget.h"
 #include "DJAudioPlayer.h"
 #include "WaveformGenerator.h"
+#include "ScratchEngine.h"
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QFileDialog>
@@ -326,6 +327,16 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
         turntable->setPositionSeconds(curSec); // supports preroll negative seconds
         if (detectedBpm > 0.0) {
             turntable->setBpm(detectedBpm);
+        }
+
+        if (scratchEngine) {
+            ScratchEngine::TrackConfig config;
+            config.lengthSeconds = trackLengthSec;
+            config.prerollSeconds = turntable ? turntable->getPrerollSeconds() : 8.0;
+            scratchEngine->setTrackConfig(config);
+            if (!scratchEngine->isScratching()) {
+                scratchEngine->syncExternalPosition(curSec);
+            }
         }
 
         // Emit only when the position changed to minimize redundant updates
@@ -937,5 +948,12 @@ void QtDeckWidget::onQuantizeToggle() {
 void QtDeckWidget::setBeatIndicator(BeatIndicator* indicator) {
     if (pads) {
         pads->setBeatIndicator(indicator);
+    }
+}
+
+void QtDeckWidget::setScratchEngine(ScratchEngine* engine) {
+    scratchEngine = engine;
+    if (turntable) {
+        turntable->setScratchEngine(engine);
     }
 }

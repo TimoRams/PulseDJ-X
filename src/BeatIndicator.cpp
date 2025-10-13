@@ -85,12 +85,10 @@ void BeatIndicator::setTrackPositionDeckA(double positionSeconds) {
         return;
     }
 
-    // Always apply tempo factor for consistent beat timing
-    const double tf = (tempoFactorA > 0.0) ? tempoFactorA : 1.0;
-    const double effectiveBpm = baseBpm * tf;
-    
-    // Calculate beat period in seconds (time between beats)
-    const double beatPeriod = 60.0 / effectiveBpm; // seconds per beat
+    // Calculate beat period from the analyzed BPM. The transport position we
+    // receive already reflects any tempo changes, so we must not apply the
+    // tempo factor a second time here.
+    const double beatPeriod = 60.0 / baseBpm; // seconds per beat in track time
     
     // SYNC WITH WAVEFORM: Use the same calculation as WaveformDisplay
     // In preroll: beatTime = -beatInterval, -2*beatInterval, etc.
@@ -140,12 +138,10 @@ void BeatIndicator::setTrackPositionDeckB(double positionSeconds) {
         return;
     }
 
-    // Always apply tempo factor for consistent beat timing
-    const double tf = (tempoFactorB > 0.0) ? tempoFactorB : 1.0;
-    const double effectiveBpm = baseBpm * tf;
-    
-    // Calculate beat period in seconds (time between beats)
-    const double beatPeriod = 60.0 / effectiveBpm; // seconds per beat
+    // Calculate beat period from the analyzed BPM. The transport position we
+    // receive already reflects any tempo changes, so we must not apply the
+    // tempo factor a second time here.
+    const double beatPeriod = 60.0 / baseBpm; // seconds per beat in track time
     
     // SYNC WITH WAVEFORM: Use the same calculation as WaveformDisplay
     // In preroll: beatTime = -beatInterval, -2*beatInterval, etc.

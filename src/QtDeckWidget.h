@@ -14,6 +14,7 @@
 #include "QtTurntableWidget.h"
 #include "PerformancePads.h"
 class DJAudioPlayer;
+class ScratchEngine;
 
 class QtDeckWidget : public QWidget {
     Q_OBJECT
@@ -31,6 +32,10 @@ signals:
     void syncToggled(QtDeckWidget* requester, bool enabled); // Toggle follow-sync
     void loopChanged(bool enabled, double startSec, double endSec); // NEW: Loop status signal
     void fileUnloaded(); // NEW: Emitted when the deck unloads the track
+    void turntableScratchStart();
+    void turntableScratchMove(double relative);
+    void turntableScratchVelocityChanged(double velocity);
+    void turntableScratchEnd(double releaseVelocity);
 
 public:
     void loadFile(const QString& path);
@@ -49,10 +54,13 @@ public:
 
     void setTrackNameDisplay(const QString& text, const QString& tooltip = QString());
     void setTrackInfoDisplay(const QString& text, const QString& style = QString(), const QString& tooltip = QString());
+    void setScratchEngine(ScratchEngine* engine);
+    ScratchEngine* getScratchEngine() const { return scratchEngine; }
     
     // Getter for Rekordbox-style layout (waveform now integrated into controls)
     QWidget* getControlsWidget() const { return controlsWidget; }
     DeckWaveformOverview* getWaveform() const { return waveform; }
+    QtTurntableWidget* getTurntable() const { return turntable; }
     PerformancePads* getPerformancePads() const { return pads; } // NEW: Access to performance pads
     
     // BetaPulseX: Getter für Settings-Integration
@@ -131,6 +139,7 @@ private:
     bool lastLoopEnabled{false};
     double lastLoopStart{-1.0};
     double lastLoopEnd{-1.0};
+    ScratchEngine* scratchEngine{nullptr};
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;

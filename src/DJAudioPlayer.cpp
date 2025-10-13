@@ -1,12 +1,20 @@
     // Copied from project root
 #include "DJAudioPlayer.h"
 #include <QDebug>
+#include <algorithm>
 #include <cmath>
 #include "AudioFormatGuard.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+namespace {
+constexpr double kMinSpeedRatio = 0.05;
+constexpr double kMaxSpeedRatio = 8.0;
+constexpr double kPitchBendMinRatio = 0.4;
+constexpr double kPitchBendMaxRatio = 2.5;
+}
 
 DJAudioPlayer::DJAudioPlayer(AudioFormatManager &_formatManager) : formatManager(_formatManager) {
     // Initialize with safe defaults
@@ -119,7 +127,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                       << ", lastBlockSizeHint=" << lastBlockSizeHint << std::endl;
         }
         if (enable) {
-            resampleSource.setResamplingRatio(1.0);
+            updateResampleRatio();
 #if defined(RUBBERBAND_FOUND)
             // Start RubberBand when keylock is enabled - it will run CONTINUOUSLY until disabled
             if (!rbReady) {
@@ -131,7 +139,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             }
 #endif
         } else {
-            resampleSource.setResamplingRatio(currentSpeed);
+            updateResampleRatio();
 #if defined(RUBBERBAND_FOUND)
             // Stop RB completely when keylock is disabled
             rbReady = false;
@@ -262,7 +270,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 if (keylockEnabled) {
                     resampleSource.setResamplingRatio(1.0);
                 } else {
-                    resampleSource.setResamplingRatio(currentSpeed);
+                    resampleSource.setResamplingRatio(effectiveSpeed());
                 }
                 resampleSource.getNextAudioBlock(endInfo);
                 
@@ -344,7 +352,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 if (keylockEnabled) {
                     resampleSource.setResamplingRatio(1.0);
                 } else {
-                    resampleSource.setResamplingRatio(currentSpeed);
+                    resampleSource.setResamplingRatio(effectiveSpeed());
                 }
                 resampleSource.getNextAudioBlock(preInfo);
                 
@@ -355,7 +363,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 if (keylockEnabled) {
                     resampleSource.setResamplingRatio(1.0);
                 } else {
-                    resampleSource.setResamplingRatio(currentSpeed);
+                    resampleSource.setResamplingRatio(effectiveSpeed());
                 }
                 resampleSource.getNextAudioBlock(bufferToFill);
                 
@@ -398,7 +406,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             if (keylockEnabled) {
                 resampleSource.setResamplingRatio(1.0);
             } else {
-                resampleSource.setResamplingRatio(currentSpeed);
+                resampleSource.setResamplingRatio(effectiveSpeed());
             }
             resampleSource.getNextAudioBlock(bufferToFill);
             
@@ -476,7 +484,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         // If keylock is off, use normal resampling and don't run RubberBand
         if (!isKeylockActive) {
             if (debugKeylock) std::cout << "[RB] Keylock OFF - using normal resampling" << std::endl;
-            resampleSource.setResamplingRatio(currentSpeed); // Normal pitch+tempo changes
+            resampleSource.setResamplingRatio(effectiveSpeed()); // Normal pitch+tempo changes
             resampleSource.getNextAudioBlock(bufferToFill);
             return;
         }
@@ -485,7 +493,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         // When keylock is active, ALWAYS use RubberBand processing (even at 1.0x speed)
         // This ensures consistent behavior and no audio dropout at unity speed
         // Set desired time ratio (tempo change) and keep pitch 1.0
-        const double speed = std::clamp(currentSpeed, 0.05, 8.0);
+    const double speed = effectiveSpeed();
         double timeRatio = 1.0 / speed; // speed up -> smaller ratio
         if (std::abs(timeRatio - rbLastTimeRatio) > 1e-4) {
             rb->setTimeRatio(timeRatio);
@@ -640,12 +648,12 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         }
     } else {
         // When keylock is disabled, use normal resampling (affects pitch+tempo together)
-        if (debugKeylock && keylockEnabled && std::abs(currentSpeed - 1.0) > 0.01) {
+        if (debugKeylock && keylockEnabled && std::abs(effectiveSpeed() - 1.0) > 0.01) {
             std::cout << "[KL] RubberBand not available - keylock disabled" << std::endl;
         }
         
         // Set speed normally (pitch and tempo change together)
-        resampleSource.setResamplingRatio(currentSpeed);
+        resampleSource.setResamplingRatio(effectiveSpeed());
         resampleSource.getNextAudioBlock(bufferToFill);
         
         // Debug: Log channel info occasionally for normal playback 
@@ -808,7 +816,7 @@ void DJAudioPlayer::renderScratchAudio(const AudioSourceChannelInfo &bufferToFil
         if (!std::isfinite(raw)) {
             return 0.0;
         }
-        const double baseLimit = contextWasPlaying ? 3.3 : 2.4;
+        const double baseLimit = contextWasPlaying ? 16.0 : 12.0;
         const double limit = std::max(0.6, keylockActive ? baseLimit * 0.85 : baseLimit);
         if (limit <= 0.0) {
             return 0.0;
@@ -835,7 +843,7 @@ void DJAudioPlayer::renderScratchAudio(const AudioSourceChannelInfo &bufferToFil
     }
 
     const double blockSeconds = std::max(invOutputRate, bufferToFill.numSamples * invOutputRate);
-    const double maxAccelPerSec = (contextWasPlaying ? 28.0 : 21.0) * (keylockActive ? 0.85 : 1.0);
+    const double maxAccelPerSec = (contextWasPlaying ? 72.0 : 54.0) * (keylockActive ? 0.85 : 1.0);
     const double maxDelta = std::max(0.0, maxAccelPerSec) * blockSeconds;
     if (maxDelta > 0.0) {
         velocityTarget = juce::jlimit(scratchSmoothedVelocity - maxDelta,
@@ -843,7 +851,7 @@ void DJAudioPlayer::renderScratchAudio(const AudioSourceChannelInfo &bufferToFil
                                       velocityTarget);
     }
 
-    const double smoothingTime = (contextWasPlaying ? 0.012 : 0.018) * (keylockActive ? 1.15 : 1.0);
+    const double smoothingTime = (contextWasPlaying ? 0.0075 : 0.012) * (keylockActive ? 1.05 : 1.0);
     double alpha = 0.0;
     if (smoothingTime > 0.0) {
         alpha = std::exp(-blockSeconds / smoothingTime);
@@ -1158,6 +1166,22 @@ void DJAudioPlayer::setGain(double gain) {
     }
 }
 
+double DJAudioPlayer::effectiveSpeed() const {
+    double speed = currentSpeed * pitchBendRatio;
+    if (!std::isfinite(speed) || speed <= 0.0) {
+        speed = 1.0;
+    }
+    return std::clamp(speed, kMinSpeedRatio, kMaxSpeedRatio);
+}
+
+void DJAudioPlayer::updateResampleRatio() {
+    if (keylockEnabled) {
+        resampleSource.setResamplingRatio(1.0);
+    } else {
+        resampleSource.setResamplingRatio(effectiveSpeed());
+    }
+}
+
 void DJAudioPlayer::setSpeed(double ratio) {
     if (ratio < 0.0 || ratio > 100.0) {
         std::cout << "DJAudioPlayer::setSpeed should be between 0.0 and 100.0\n";
@@ -1167,15 +1191,25 @@ void DJAudioPlayer::setSpeed(double ratio) {
     // Store the requested speed always
     currentSpeed = ratio;
     
+    updateResampleRatio();
+
     if (keylockEnabled) {
-        // KEYLOCK: Keep resampler at unity to preserve pitch; RubberBand will change tempo
-        resampleSource.setResamplingRatio(1.0);
-        std::cout << "Keylock enabled - Tempo via RubberBand: " << ratio << "x (pitch locked)" << std::endl;
+        std::cout << "Keylock enabled - Tempo via RubberBand: " << effectiveSpeed() << "x (pitch locked)" << std::endl;
     } else {
-        // Normal speed change (affects both tempo and pitch together)
-        resampleSource.setResamplingRatio(ratio);
-        std::cout << "Normal speed change: " << ratio << "x (tempo and pitch)" << std::endl;
+        std::cout << "Normal speed change: " << effectiveSpeed() << "x (tempo and pitch)" << std::endl;
     }
+}
+
+void DJAudioPlayer::setPitchBendRatio(double ratio) {
+    if (!std::isfinite(ratio)) {
+        ratio = 1.0;
+    }
+    double clamped = std::clamp(ratio, kPitchBendMinRatio, kPitchBendMaxRatio);
+    if (std::abs(clamped - pitchBendRatio) < 1e-4) {
+        return;
+    }
+    pitchBendRatio = clamped;
+    updateResampleRatio();
 }
 
 void DJAudioPlayer::setPosition(double posInSecs) {
@@ -1529,17 +1563,18 @@ void DJAudioPlayer::setKeylockQuality(KeylockQuality q) {
 #endif
 
 bool DJAudioPlayer::isPlaying() {
-    // SIMPLIFIED: Direct transport check without soft pause complications
-    bool transport_playing = transportSource.isPlaying();
-    
-    // Log only when state changes to avoid spam
+    const bool audible = transportSource.isPlaying() && !softPaused.load() && !forceSilent.load();
+
     static bool lastResult = false;
-    if (transport_playing != lastResult) {
-        std::cout << "*** isPlaying() state change: transport=" << transport_playing << std::endl;
-        lastResult = transport_playing;
+    if (audible != lastResult) {
+        std::cout << "*** isPlaying() state change: audible=" << audible
+                  << " transport=" << transportSource.isPlaying()
+                  << " softPaused=" << softPaused.load()
+                  << " forceSilent=" << forceSilent.load() << std::endl;
+        lastResult = audible;
     }
-    
-    return transport_playing; // Ignore softPaused for now to isolate the issue
+
+    return audible;
 }
 
 // Simple EQ/filter stubs (store values, no DSP applied yet) - optimized for real-time performance

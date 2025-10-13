@@ -28,6 +28,8 @@ public:
     void applyLoadedSource(std::unique_ptr<AudioFormatReaderSource> source, double sampleRate);
     void setGain(double gain);
     void setSpeed(double ratio);
+    void setPitchBendRatio(double ratio);
+    double getPitchBendRatio() const { return pitchBendRatio; }
     void setPositionRelative(double pos);
     double getPositionRelative();
     void start();
@@ -141,7 +143,10 @@ private:
     std::unique_ptr<juce::dsp::ProcessorChain<juce::dsp::Gain<float>>> timeStretchProcessor;
     
     double currentSpeed{1.0};
+    double pitchBendRatio{1.0};
     double pitchShiftRatio{1.0};
+    double effectiveSpeed() const;
+    void updateResampleRatio();
 
 #if defined(RUBBERBAND_FOUND)
     // High-quality Rubber Band time-stretcher (required for keylock functionality)

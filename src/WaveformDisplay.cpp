@@ -6,10 +6,12 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QSurfaceFormat>
+#include <QStaticText>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 // REMOVED: Static global zoom level to prevent deck interference
 // Each deck now has its own beatGridZoomLevel instance variable
@@ -58,7 +60,10 @@ WaveformDisplay::WaveformDisplay(QWidget* parent)
 
 void WaveformDisplay::paintGL()
 {
-    glViewport(0, 0, width(), height());
+    const qreal deviceScale = devicePixelRatioF();
+    glViewport(0, 0,
+               static_cast<GLint>(std::round(width() * deviceScale)),
+               static_cast<GLint>(std::round(height() * deviceScale)));
     glClearColor(8/255.0f, 8/255.0f, 10/255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     QPainter p(this);
@@ -71,21 +76,35 @@ void WaveformDisplay::paintGL()
     // Background already cleared by GL
 
     if (sourceMaxBins.empty() || audioLength <= 0.0) {
-        // Draw a perfectly centered placeholder when no track is loaded
-        // Using explicit bounding rect centering avoids tiny vertical bias on some platforms
-        p.setPen(QPen(QColor(120, 120, 120), 1));
-        QFont font("Arial", 12);
-        font.setStyleStrategy(QFont::PreferAntialias);
-        p.setFont(font);
+        // Draw a perfectly centered placeholder when no track is loaded.
+        // Use floating point metrics and static text to avoid sub-pixel drift between decks.
+        p.save();
 
-        const QString text = "NO TRACK LOADED";
-        const QRect widgetRect = rect();
-        QFontMetrics fm(font);
-        // Calculate tight text bounding size (single line) and center it in the widget
-        QSize textSize = fm.size(Qt::TextSingleLine, text);
-        QRect textRect(QPoint(0, 0), textSize);
-        textRect.moveCenter(widgetRect.center());
-        p.drawText(textRect, Qt::AlignCenter, text);
+        QPen placeholderPen(QColor(140, 140, 150));
+        placeholderPen.setWidthF(1.2);
+        p.setPen(placeholderPen);
+
+        const QString placeholderText = QStringLiteral("NO TRACK LOADED");
+
+        QFont placeholderFont("Lato", 14);
+        placeholderFont.setStyleStrategy(QFont::PreferAntialias);
+        // Scale font gently with widget height to keep visual balance across decks.
+    const qreal autoPointSize = std::clamp(static_cast<qreal>(height()) * qreal(0.12), qreal(12.0), qreal(26.0));
+        placeholderFont.setPointSizeF(autoPointSize);
+        placeholderFont.setWeight(QFont::DemiBold);
+        p.setFont(placeholderFont);
+
+        QStaticText staticText;
+        staticText.setTextFormat(Qt::PlainText);
+        staticText.setText(placeholderText);
+        staticText.prepare(QTransform(), placeholderFont);
+
+        const QSizeF textSize = staticText.size();
+        const qreal originX = (static_cast<qreal>(width()) - textSize.width()) * 0.5;
+        const qreal originY = (static_cast<qreal>(height()) - textSize.height()) * 0.5;
+        p.drawStaticText(QPointF(originX, originY), staticText);
+
+        p.restore();
         return;
     }
     
@@ -417,145 +436,229 @@ void WaveformDisplay::refreshBeatGrid() {
 // Scratching system with mouse drag for DJ-style control - ANTI-PLAY VERSION
 void WaveformDisplay::mousePressEvent(QMouseEvent* event)
 {
-    if (event->button() == Qt::LeftButton && trackLengthSec > 0.0) {
-        // Start scratching mode
-        scratching = true;
-        lastScratchX = event->position().x();
-        scratchStartPos = playheadPos; // Current playhead position when scratch started
-        
-        // IMPORTANT: Store the original scratch start X position for reference
-        scratchStartX = event->position().x();
-        
-        // Initialize timing for smooth velocity calculation
-        // FIXED: Use instance variable instead of static to prevent deck interference
-        scratchStartTime = std::chrono::steady_clock::now();
-        lastScratchTime = scratchStartTime;
-
-        // Capture absolute position in seconds at scratch start for stable offsets
-        double effectiveLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
-        if (playheadPos < 0.0 && prerollEnabled) {
-            scratchAnchorSeconds = playheadPos * prerollTimeSec;
-        } else if (effectiveLength > 0.0) {
-            scratchAnchorSeconds = std::clamp(playheadPos, 0.0, 1.0) * effectiveLength;
-        } else {
-            scratchAnchorSeconds = 0.0;
-        }
-        scratchLastSeconds = scratchAnchorSeconds;
-        scratchInitialAbsPos = scratchAnchorSeconds;
-
-    scratchVelocity = 0.0;
-    lastScratchVelocity = 0.0;
-        
-        // CRITICAL: Emit scratchStart FIRST before any other operations
-        // This should immediately disable normal playback and timer updates
-        emit scratchStart();
-        
-        // Set cursor to indicate scratching mode
-        setCursor(Qt::ClosedHandCursor);
-        
-        // DEBUG: Reduced logging to prevent spam
-        std::cout << "SCRATCH STARTED at pos: " << scratchStartPos 
-                  << ", preroll: " << (prerollEnabled ? "YES" : "NO") << std::endl;
-    }
-}
-
-// Scratching motion - STABILIZED to prevent bugs and accidental play
-void WaveformDisplay::mouseMoveEvent(QMouseEvent* event)
-{
-    if (scratching && trackLengthSec > 0.0) {
-        double currentX = event->position().x();
-
-        double totalLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
-        if (totalLength <= 0.0 && !prerollEnabled) {
-            lastScratchX = currentX;
+    if (event->button() == Qt::LeftButton) {
+        if (seekToMousePosition(event->position().x())) {
+            seekActive = true;
+            scratching = false;
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
             return;
         }
-
-        double zoomFactor = getBeatGridZoomFactor();
-        double basePps = 0.0;
-        if (useFixedPixelsPerSecond) {
-            basePps = std::max(10.0, localPixelsPerSecond);
-        } else if (totalLength > 0.0) {
-            basePps = (double)width() / std::max(totalLength, 1e-3);
-        }
-        if (basePps <= 0.0) {
-            basePps = std::max(10.0, localPixelsPerSecond);
-        }
-
-        double pixelsPerSecond = std::max(1.0, basePps * zoomFactor);
-        double secondsPerPixel = 1.0 / pixelsPerSecond;
-        secondsPerPixel = std::min(secondsPerPixel, 0.05); // cap sensitivity to avoid large jumps
-
-        double prevSeconds = scratchLastSeconds;
-        double deltaPixels = currentX - lastScratchX;
-        double targetSeconds = prevSeconds - deltaPixels * secondsPerPixel;
-
-        double minSeconds = prerollEnabled ? -prerollTimeSec : 0.0;
-        double maxSeconds = (totalLength > 0.0) ? totalLength : 0.0;
-        targetSeconds = std::clamp(targetSeconds, minSeconds, maxSeconds);
-
-        double newPos;
-        if (targetSeconds < 0.0 && prerollEnabled) {
-            double denom = std::max(0.001, prerollTimeSec);
-            newPos = targetSeconds / denom;
-        } else if (totalLength > 0.0) {
-            newPos = targetSeconds / totalLength;
-        } else {
-            newPos = playheadPos;
-        }
-
-        if (prerollEnabled) {
-            newPos = std::clamp(newPos, -1.0, 1.0);
-        } else {
-            newPos = std::clamp(newPos, 0.0, 1.0);
-        }
-
-        if (std::abs(newPos - playheadPos) > 0.00005) {
-            auto now = std::chrono::steady_clock::now();
-            double dt = std::chrono::duration<double>(now - lastScratchTime).count();
-            if (dt > 0.0) {
-                scratchVelocity = (targetSeconds - prevSeconds) / dt;
-                emit scratchVelocityChanged(scratchVelocity);
-            }
-            lastScratchTime = now;
-            scratchLastSeconds = targetSeconds;
-            lastScratchVelocity = scratchVelocity;
-
-            if (++scratchDebugCounter % 10 == 0) {
-                std::cout << "SCRATCH: deltaPx=" << deltaPixels
-                          << " targetSec=" << targetSeconds
-                          << " newPos=" << newPos
-                          << " (preroll=" << (targetSeconds < 0.0 ? "YES" : "NO") << ")" << std::endl;
-            }
-
-            playheadPos = newPos;
-            emit scratchMove(newPos);
-            update();
-        }
-
-        lastScratchX = currentX;
+    } else if (event->button() == Qt::RightButton) {
+        pitchBendAnchorX = event->position().x();
+        pitchBendActive = true;
+        emit pitchBendRequested(1.0);
+        event->accept();
+        return;
     }
+
+    QOpenGLWidget::mousePressEvent(event);
+}
+
+void WaveformDisplay::mouseMoveEvent(QMouseEvent* event)
+{
+    if (seekActive && (event->buttons() & Qt::LeftButton)) {
+        if (seekToMousePosition(event->position().x())) {
+            event->accept();
+            return;
+        }
+    }
+
+    if (pitchBendActive && (event->buttons() & Qt::RightButton)) {
+        updatePitchBendFromMouse(event->position().x());
+        event->accept();
+        return;
+    }
+
+    QOpenGLWidget::mouseMoveEvent(event);
 }
 
 void WaveformDisplay::mouseReleaseEvent(QMouseEvent* event)
 {
-    if (event->button() == Qt::LeftButton && scratching) {
-        // CRITICAL: End scratching mode FIRST
-        scratching = false;
-        
-        // IMPORTANT: Emit scratchEnd to restore normal playback behavior
-        // The audio player will handle whether to resume playing or stay paused
-        emit scratchEnd();
-
-    scratchVelocity = 0.0;
-    emit scratchVelocityChanged(0.0);
-        
-        // Reset cursor
+    if (event->button() == Qt::LeftButton && seekActive) {
+        seekActive = false;
         setCursor(Qt::ArrowCursor);
-        
-        // DEBUG: Simple end message
-        std::cout << "SCRATCH ENDED at pos: " << playheadPos << std::endl;
+        event->accept();
+        return;
     }
+
+    if (event->button() == Qt::RightButton && pitchBendActive) {
+        pitchBendActive = false;
+        emit pitchBendEnded();
+        setCursor(Qt::ArrowCursor);
+        event->accept();
+        return;
+    }
+
+    QOpenGLWidget::mouseReleaseEvent(event);
+}
+
+void WaveformDisplay::leaveEvent(QEvent* event)
+{
+    if (seekActive) {
+        seekActive = false;
+        setCursor(Qt::ArrowCursor);
+    }
+    if (pitchBendActive) {
+        pitchBendActive = false;
+        emit pitchBendEnded();
+        setCursor(Qt::ArrowCursor);
+    }
+    QOpenGLWidget::leaveEvent(event);
+}
+
+void WaveformDisplay::applyScratchResult(const ScratchEngine::UpdateResult& result) {
+    if (!std::isfinite(result.seconds)) {
+        return;
+    }
+    scratchLastSeconds = result.seconds;
+    playheadPos = result.relative;
+    scratchVelocity = result.velocity;
+    lastScratchVelocity = result.velocity;
+    update();
+}
+
+double WaveformDisplay::relativeToSeconds(double relative) const {
+    if (relative < 0.0 && prerollEnabled) {
+        return relative * prerollTimeSec;
+    }
+    double totalLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
+    if (totalLength > 0.0) {
+        return std::clamp(relative, 0.0, 1.0) * totalLength;
+    }
+    return 0.0;
+}
+
+bool WaveformDisplay::computeViewportMetrics(ViewportMetrics& metrics) const {
+    const int viewportWidth = std::max(width(), 1);
+    if (viewportWidth <= 1) {
+        return false;
+    }
+
+    const double zoomFactor = getBeatGridZoomFactor();
+    const double safeTempo = tempoFactor > 1e-6 ? tempoFactor : 1.0;
+
+    double totalLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
+    if (totalLength <= 0.0 && !prerollEnabled) {
+        totalLength = 0.0;
+    }
+
+    double basePps = 0.0;
+    if (useFixedPixelsPerSecond) {
+        basePps = std::max(10.0, localPixelsPerSecond);
+    } else if (audioLength > 0.0) {
+        basePps = static_cast<double>(viewportWidth) / std::max(audioLength, 1e-3);
+    }
+    if (basePps <= 0.0) {
+        basePps = std::max(10.0, localPixelsPerSecond);
+    }
+
+    const double pixelsPerSecond = std::max(1.0, basePps * zoomFactor);
+
+    double playheadSeconds = 0.0;
+    if (playheadPos < 0.0 && prerollEnabled) {
+        playheadSeconds = playheadPos * prerollTimeSec;
+    } else if (totalLength > 0.0) {
+        playheadSeconds = std::clamp(playheadPos, 0.0, 1.0) * totalLength;
+    }
+
+    const double displayCenterSeconds = (viewMode == ViewMode::BeatLocked)
+        ? (playheadSeconds / safeTempo)
+        : playheadSeconds;
+
+    const double bufferSec = std::max(0.05, 0.5 / std::max(1.0, zoomFactor));
+    const double halfViewportTime = static_cast<double>(viewportWidth) / (2.0 * pixelsPerSecond);
+    const double leftSecond = displayCenterSeconds - halfViewportTime - bufferSec;
+    const double rightSecond = displayCenterSeconds + halfViewportTime + bufferSec;
+
+    metrics.playheadSeconds = playheadSeconds;
+    metrics.displayCenterSecond = displayCenterSeconds;
+    metrics.safeTempo = safeTempo;
+    metrics.leftSecond = leftSecond;
+    metrics.rightSecond = rightSecond;
+    metrics.timeRange = rightSecond - leftSecond;
+    metrics.viewportWidth = viewportWidth;
+    return metrics.timeRange > 0.0;
+}
+
+double WaveformDisplay::secondsAtViewportX(double x) const {
+    ViewportMetrics metrics;
+    if (!computeViewportMetrics(metrics)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    const double clampedX = std::clamp(x, 0.0, static_cast<double>(metrics.viewportWidth));
+    const double positionRatio = clampedX / static_cast<double>(metrics.viewportWidth);
+    const double visualSeconds = metrics.leftSecond + (positionRatio * metrics.timeRange);
+
+    if (viewMode == ViewMode::BeatLocked) {
+        const double deltaVis = visualSeconds - metrics.displayCenterSecond;
+        return metrics.playheadSeconds + (deltaVis * metrics.safeTempo);
+    }
+    return visualSeconds;
+}
+
+double WaveformDisplay::secondsToRelative(double seconds) const {
+    if (std::isnan(seconds) || std::isinf(seconds)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    if (seconds < 0.0 && prerollEnabled) {
+        const double denom = std::max(0.001, prerollTimeSec);
+        return std::clamp(seconds / denom, -1.0, 0.0);
+    }
+
+    const double totalLength = (audioLength > 0.0) ? audioLength : trackLengthSec;
+    if (totalLength <= 0.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::clamp(seconds / totalLength, 0.0, 1.0);
+}
+
+bool WaveformDisplay::seekToMousePosition(double x) {
+    const double targetSeconds = secondsAtViewportX(x);
+    if (!std::isfinite(targetSeconds)) {
+        return false;
+    }
+
+    double relative = secondsToRelative(targetSeconds);
+    if (!std::isfinite(relative)) {
+        return false;
+    }
+
+    const double previousPos = playheadPos;
+    playheadPos = relative;
+    scratchLastSeconds = targetSeconds;
+    scratchVelocity = 0.0;
+    lastScratchVelocity = 0.0;
+
+    update();
+
+    if (std::abs(previousPos - playheadPos) > 1e-6) {
+        emit positionClicked(playheadPos);
+    }
+
+    if (scratchEngine) {
+        scratchEngine->syncExternalPosition(targetSeconds);
+    }
+    return true;
+}
+
+void WaveformDisplay::updatePitchBendFromMouse(double x) {
+    if (!pitchBendActive) {
+        return;
+    }
+
+    const double deltaPixels = x - pitchBendAnchorX;
+    if (std::abs(deltaPixels) <= pitchBendDeadZonePx) {
+        emit pitchBendRequested(1.0);
+        return;
+    }
+
+    const double normalized = deltaPixels / std::max(1.0, static_cast<double>(width()));
+    double ratio = 1.0 + normalized * pitchBendNormalizedSensitivity;
+    ratio = std::clamp(ratio, pitchBendMinRatio, pitchBendMaxRatio);
+    emit pitchBendRequested(ratio);
 }
 
 // Zoom controls with + and - keys
@@ -668,6 +771,57 @@ void WaveformDisplay::clearDisplay() {
     renderCache = RenderCache{}; // reset cache struct
     // Trigger repaint
     update();
+}
+
+void WaveformDisplay::setScratchEngine(ScratchEngine* engine) {
+    if (scratchEngine == engine) {
+        return;
+    }
+
+    for (const auto& connection : scratchEngineConnections) {
+        QObject::disconnect(connection);
+    }
+    scratchEngineConnections.clear();
+
+    scratchEngine = engine;
+    if (!scratchEngine) {
+        return;
+    }
+
+    scratchEngineConnections.push_back(connect(
+        scratchEngine,
+        &ScratchEngine::positionChanged,
+        this,
+        [this](double seconds, double relative) {
+            if (!std::isfinite(seconds)) {
+                return;
+            }
+            scratchLastSeconds = seconds;
+            if (std::abs(playheadPos - relative) > 1e-6) {
+                playheadPos = relative;
+                update();
+            } else {
+                playheadPos = relative;
+            }
+        }));
+
+    scratchEngineConnections.push_back(connect(
+        scratchEngine,
+        &ScratchEngine::velocityChanged,
+        this,
+        [this](double velocity) {
+            scratchVelocity = velocity;
+            lastScratchVelocity = velocity;
+        }));
+
+    scratchEngineConnections.push_back(connect(
+        scratchEngine,
+        &ScratchEngine::scratchEnded,
+        this,
+        [this](double releaseVelocity) {
+            lastScratchVelocity = releaseVelocity;
+            scratchVelocity = 0.0;
+        }));
 }
 
 // NEW: Ghost loop region support
