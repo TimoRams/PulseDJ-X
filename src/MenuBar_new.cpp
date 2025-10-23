@@ -16,7 +16,41 @@
 #include <QUrl>
 #include <QFile>
 #include <QTextStream>
+#include <QtGlobal>
 #include <cmath>
+
+namespace {
+QString detectCppStandardString()
+{
+#if defined(_MSC_VER) && defined(_MSVC_LANG)
+    const long standard = static_cast<long>(_MSVC_LANG);
+#else
+    const long standard = static_cast<long>(__cplusplus);
+#endif
+
+    struct Entry {
+        long value;
+        const char* name;
+    };
+
+    constexpr Entry entries[] = {
+        {202302L, "C++23"},
+        {202002L, "C++20"},
+        {201703L, "C++17"},
+        {201402L, "C++14"},
+        {201103L, "C++11"},
+        {199711L, "C++03/C++98"}
+    };
+
+    for (const Entry& entry : entries) {
+        if (standard >= entry.value) {
+            return QString("%1 (%2)").arg(QString::fromLatin1(entry.name), QString::number(standard));
+        }
+    }
+
+    return QString("Unknown (%1)").arg(QString::number(standard));
+}
+}
 
 MenuBar::MenuBar(QtMainWindow* parent) 
     : QMenuBar(parent), mainWindow(parent), preferencesDialog(nullptr) {
@@ -592,10 +626,16 @@ void MenuBar::showAbout() {
     QMessageBox about(this);
     about.setWindowTitle("About BetaPulseX");
     about.setTextFormat(Qt::RichText);
-    about.setText(
+    const QString qtVersion = QString::fromLatin1(qVersion());
+    const QString cppVersion = detectCppStandardString();
+    about.setText(QString(
         "<h3>BetaPulseX v1.0-beta</h3>"
         "<p>Professional DJ Software Suite</p>"
-        "<p>Built with Qt6 and JUCE Framework</p>"
+        "<p><b>Framework Versions</b></p>"
+        "<ul>"
+        "<li>Qt %1</li>"
+        "<li>C++ %2</li>"
+        "</ul>"
         "<br>"
         "<p><b>Features:</b></p>"
         "<ul>"
@@ -606,7 +646,7 @@ void MenuBar::showAbout() {
         "</ul>"
         "<br>"
         "<p>Copyright © 2025 BetaPulseX Development Team</p>"
-    );
+    ).arg(qtVersion, cppVersion));
     about.setStandardButtons(QMessageBox::Ok);
     about.exec();
 }

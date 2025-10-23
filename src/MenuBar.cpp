@@ -19,6 +19,39 @@
 #include <QtGlobal>
 #include <juce_core/juce_core.h>
 
+namespace {
+QString detectCppStandardString()
+{
+#if defined(_MSC_VER) && defined(_MSVC_LANG)
+    const long standard = static_cast<long>(_MSVC_LANG);
+#else
+    const long standard = static_cast<long>(__cplusplus);
+#endif
+
+    struct Entry {
+        long value;
+        const char* name;
+    };
+
+    constexpr Entry entries[] = {
+        {202302L, "C++23"},
+        {202002L, "C++20"},
+        {201703L, "C++17"},
+        {201402L, "C++14"},
+        {201103L, "C++11"},
+        {199711L, "C++03/C++98"}
+    };
+
+    for (const Entry& entry : entries) {
+        if (standard >= entry.value) {
+            return QString("%1 (%2)").arg(QString::fromLatin1(entry.name), QString::number(standard));
+        }
+    }
+
+    return QString("Unknown (%1)").arg(QString::number(standard));
+}
+}
+
 MenuBar::MenuBar(QtMainWindow* parent) 
     : QMenuBar(parent), mainWindow(parent), preferencesDialog(nullptr) {
     
@@ -602,6 +635,7 @@ void MenuBar::showAbout() {
     about.setTextFormat(Qt::RichText);
     const QString qtVersion = QString::fromLatin1(qVersion());
     const QString juceVersion = QString::fromStdString(juce::SystemStats::getJUCEVersion().toStdString());
+    const QString cppVersion = detectCppStandardString();
     const QString aboutText = QStringLiteral(
         "<h3>BetaPulseX v1.0-beta</h3>"
         "<p>Professional DJ Software Suite</p>"
@@ -609,6 +643,7 @@ void MenuBar::showAbout() {
         "<ul>"
         "<li>Qt %1</li>"
         "<li>JUCE %2</li>"
+        "<li>C++ %3</li>"
         "</ul>"
         "<br>"
         "<p><b>Highlights:</b></p>"
@@ -620,7 +655,7 @@ void MenuBar::showAbout() {
         "</ul>"
         "<br>"
         "<p>Copyright © 2025 BetaPulseX Development Team</p>"
-    ).arg(qtVersion, juceVersion);
+    ).arg(qtVersion, juceVersion, cppVersion);
     about.setText(aboutText);
     about.setStandardButtons(QMessageBox::Ok);
     about.exec();

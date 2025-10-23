@@ -29,7 +29,7 @@ if(NOT N EQUAL 0)
 endif()
 
 # Performance optimization: Use pre-compiled headers and unity builds when possible
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Optimization flags for release builds
@@ -199,7 +199,7 @@ if (WEBKIT2_FOUND)
 endif()
 
 set_target_properties(David PROPERTIES
-    CXX_STANDARD 17
+    CXX_STANDARD 23
     AUTOMOC ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 
