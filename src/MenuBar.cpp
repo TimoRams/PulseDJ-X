@@ -1,5 +1,5 @@
 #include "MenuBar.h"
-#include "QtMainWindow.h"
+#include "MainWindow.h"
 #include "PreferencesDialog.h"
 #include "AppConfig.h"
 #include "DeckSettings.h"
@@ -476,8 +476,8 @@ void MenuBar::showPreferences() {
         preferencesDialog = new PreferencesDialog(mainWindow);
         
         // Set player references for MIDI integration
-        if (mainWindow && mainWindow->playerA && mainWindow->playerB) {
-            preferencesDialog->setPlayerReferences(mainWindow->playerA, mainWindow->playerB, mainWindow);
+        if (mainWindow && mainWindow->getPlayerA() && mainWindow->getPlayerB()) {
+            preferencesDialog->setPlayerReferences(mainWindow->getPlayerA(), mainWindow->getPlayerB(), mainWindow);
             qDebug() << "MenuBar: Player references set for PreferencesDialog MIDI integration";
         } else {
             qDebug() << "MenuBar: Warning - Player references not available for MIDI integration";

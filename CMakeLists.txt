@@ -11,46 +11,45 @@
 
 cmake_minimum_required(VERSION 3.15)
 
-# Performance optimization: Enable ccache if available
+project(GUI_APP_EXAMPLE VERSION 0.0.1)
+
+# Build acceleration: use ccache if present
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
     message(STATUS "Using ccache for faster compilation")
 endif()
 
-project(GUI_APP_EXAMPLE VERSION 0.0.1)
-
-# Performance optimization: Enable parallel builds
+# Leverage all logical cores unless the user already configured a limit
 include(ProcessorCount)
-ProcessorCount(N)
-if(NOT N EQUAL 0)
-    set(CMAKE_BUILD_PARALLEL_LEVEL ${N})
-    message(STATUS "Using ${N} parallel build jobs")
+ProcessorCount(PROCESSOR_COUNT)
+if(PROCESSOR_COUNT GREATER 0 AND NOT DEFINED ENV{CMAKE_BUILD_PARALLEL_LEVEL})
+    set(CMAKE_BUILD_PARALLEL_LEVEL "${PROCESSOR_COUNT}")
+    message(STATUS "Using ${PROCESSOR_COUNT} parallel build jobs")
 endif()
 
-# Performance optimization: Use pre-compiled headers and unity builds when possible
+# Compiler configuration
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Optimization flags for release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG -march=native")
-    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -march=native")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG -march=native")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -DNDEBUG -march=native")
     message(STATUS "Optimized build flags enabled")
 endif()
 
-# This project now builds only the Qt frontend
-add_subdirectory(JUCE)                    # keep JUCE as a library for backend functionality
+# Backend: JUCE provides audio and DSP functionality
+add_subdirectory(JUCE)
 
-# Since we only use JUCE as an audio backend for Qt, disable JUCE GUI modules to avoid
-# pulling in GTK headers on Linux.
-set(JUCE_RECOMMENDED_GLOBAL_OPTIONS "JUCE_WEB_BROWSER=0;JUCE_USE_CURL=1;JUCE_USE_XINERAMA=0;JUCE_USE_XRANDR=0;JUCE_USE_XRENDER=0;JUCE_USE_XCURSOR=0")
+# Keep JUCE's GUI modules disabled; we only need the audio stack
+set(JUCE_RECOMMENDED_GLOBAL_OPTIONS
+    "JUCE_WEB_BROWSER=0;JUCE_USE_CURL=1;JUCE_USE_XINERAMA=0;JUCE_USE_XRANDR=0;JUCE_USE_XRENDER=0;JUCE_USE_XCURSOR=0")
 
-# Qt frontend target that uses JUCE as backend for audio/waveform rendering
-# Prefer Qt6, but provide a Qt5 fallback if Qt6 OpenGLWidgets is unavailable
+# Frontend: prefer Qt6, fall back to Qt5 if required
 set(QT_PACKAGE "")
 find_package(Qt6 QUIET COMPONENTS Widgets OpenGLWidgets Sql)
-if (Qt6_FOUND)
+if(Qt6_FOUND)
     set(QT_PACKAGE "Qt6")
     message(STATUS "Using Qt6 with OpenGLWidgets")
 else()
@@ -59,50 +58,46 @@ else()
     set(QT_PACKAGE "Qt5")
     message(STATUS "Using Qt5 with OpenGL module")
 endif()
+
 find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
+
 pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
 pkg_check_modules(AUBIO QUIET aubio)
-pkg_check_modules(RUBBERBAND QUIET rubberband)
+pkg_check_modules(RUBBERBAND REQUIRED rubberband)
 
-# Try common webkit2 pkg-config names (4.1 then 4.0)
-pkg_check_modules(WEBKIT2_41 QUIET webkit2gtk-4.1)
-if (WEBKIT2_41_FOUND)
-    set(WEBKIT2_FOUND TRUE)
-    set(WEBKIT2_INCLUDE_DIRS ${WEBKIT2_41_INCLUDE_DIRS})
-    set(WEBKIT2_LIBRARIES ${WEBKIT2_41_LIBRARIES})
-    set(WEBKIT2_CFLAGS_OTHER ${WEBKIT2_41_CFLAGS_OTHER})
-else()
-    pkg_check_modules(WEBKIT2_40 QUIET webkit2gtk-4.0)
-    if (WEBKIT2_40_FOUND)
-        set(WEBKIT2_FOUND TRUE)
-        set(WEBKIT2_INCLUDE_DIRS ${WEBKIT2_40_INCLUDE_DIRS})
-        set(WEBKIT2_LIBRARIES ${WEBKIT2_40_LIBRARIES})
-        set(WEBKIT2_CFLAGS_OTHER ${WEBKIT2_40_CFLAGS_OTHER})
-    else()
-        set(WEBKIT2_FOUND FALSE)
+# WebKit detection (Qt HTML widget replacement)
+set(WEBKIT2_FOUND FALSE)
+foreach(_webkit_module IN ITEMS webkit2gtk-4.1 webkit2gtk-4.0)
+    if(NOT WEBKIT2_FOUND)
+        pkg_check_modules(WEBKIT2 QUIET ${_webkit_module})
+        if(WEBKIT2_FOUND)
+            message(STATUS "Found ${_webkit_module} via pkg-config")
+        endif()
     endif()
-endif()
+endforeach()
 
 juce_add_console_app(David
     PRODUCT_NAME "David")
 
 juce_generate_juce_header(David)
 
-# Enable MP3 support in JUCE
-target_compile_definitions(David PRIVATE 
+target_compile_definitions(David PRIVATE
     JUCE_USE_MP3AUDIOFORMAT=1
     JUCE_INCLUDE_ZLIB_CODE=1)
 
-target_sources(David
-    PRIVATE
-    src/QtMain.cpp
-    src/QtMainWindow.cpp
-    src/QtMainWindow.h
-    src/QtDeckWidget.cpp
-    src/QtDeckWidget.h
-    src/QtTurntableWidget.cpp
-    src/QtTurntableWidget.h
+set(DAVID_SOURCES
+    src/Main.cpp
+    src/MainWindow.cpp
+    src/MainWindowDeckState.cpp
+    src/MainWindowScratch.cpp
+    src/MainWindowWindowing.cpp
+    src/MainWindowDeckSettings.cpp
+    src/MainWindow.h
+    src/DeckWidget.cpp
+    src/DeckWidget.h
+    src/TurntableWidget.cpp
+    src/TurntableWidget.h
     src/BeatIndicator.cpp
     src/BeatIndicator.h
     src/DraggableListWidget.h
@@ -117,6 +112,10 @@ target_sources(David
     src/DJAudioPlayer.cpp
     src/WaveformGenerator.cpp
     src/WaveformGenerator.h
+    src/StereoAudioCallback.cpp
+    src/StereoAudioCallback.h
+    src/MainWindowTasks.cpp
+    src/MainWindowTasks.h
     src/BpmAnalyzer.cpp
     src/AudioFormatGuard.cpp
     src/AudioFormatGuard.h
@@ -137,27 +136,28 @@ target_sources(David
     src/MidiEngine.h
     src/AppConfig.h
     src/DeckSettings.h)
-    # AudioMixer removed - using simplified AudioSourcePlayer approach
+
+target_sources(David PRIVATE ${DAVID_SOURCES})
 
 target_link_libraries(David
     PRIVATE
         juce::juce_core
         juce::juce_data_structures
-    juce::juce_audio_basics
-    juce::juce_audio_formats
-    juce::juce_audio_utils
-    juce::juce_audio_devices
-    juce::juce_graphics
-    juce::juce_dsp
-    CURL::libcurl
-    $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Widgets>
-    $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::OpenGLWidgets>
-    $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Sql>
-    $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Widgets>
-    $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::OpenGL>
-    $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Sql>)
+        juce::juce_audio_basics
+        juce::juce_audio_formats
+        juce::juce_audio_utils
+        juce::juce_audio_devices
+        juce::juce_graphics
+        juce::juce_dsp
+        CURL::libcurl
+        $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Widgets>
+        $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::OpenGLWidgets>
+        $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Sql>
+        $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Widgets>
+        $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::OpenGL>
+        $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Sql>)
 
-if (AUBIO_FOUND)
+if(AUBIO_FOUND)
     message(STATUS "Aubio found: including headers and linking libs")
     target_include_directories(David PRIVATE ${AUBIO_INCLUDE_DIRS})
     target_link_libraries(David PRIVATE ${AUBIO_LIBRARIES})
@@ -167,43 +167,31 @@ else()
     message(STATUS "Aubio not found - building with fallback BPM analyzer")
 endif()
 
-# Require Rubber Band time-stretcher for high-quality keylock
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(RUBBERBAND REQUIRED rubberband)
-if (RUBBERBAND_FOUND)
-    message(STATUS "Rubber Band found: enabling high-quality keylock")
-    target_include_directories(David PRIVATE ${RUBBERBAND_INCLUDE_DIRS})
-    target_link_libraries(David PRIVATE ${RUBBERBAND_LIBRARIES})
-    target_compile_options(David PRIVATE ${RUBBERBAND_CFLAGS_OTHER})
-    target_compile_definitions(David PRIVATE RUBBERBAND_FOUND=1)
-else()
-    message(FATAL_ERROR "Rubber Band is required but not found. Please install rubberband-dev")
-endif()
+message(STATUS "Rubber Band found: enabling high-quality keylock")
+target_include_directories(David PRIVATE ${RUBBERBAND_INCLUDE_DIRS})
+target_link_libraries(David PRIVATE ${RUBBERBAND_LIBRARIES})
+target_compile_options(David PRIVATE ${RUBBERBAND_CFLAGS_OTHER})
+target_compile_definitions(David PRIVATE RUBBERBAND_FOUND=1)
 
-# Add GTK/WebKit include/link flags if found via pkg-config
-if (GTK3_FOUND)
-    target_include_directories(David PRIVATE ${GTK3_INCLUDE_DIRS})
-    target_link_libraries(David PRIVATE ${GTK3_LIBRARIES})
-    target_compile_options(David PRIVATE ${GTK3_CFLAGS_OTHER})
-endif()
+target_include_directories(David PRIVATE ${GTK3_INCLUDE_DIRS})
+target_link_libraries(David PRIVATE ${GTK3_LIBRARIES})
+target_compile_options(David PRIVATE ${GTK3_CFLAGS_OTHER})
 
-if (MPG123_FOUND)
+if(MPG123_FOUND)
     target_include_directories(David PRIVATE ${MPG123_INCLUDE_DIRS})
     target_compile_options(David PRIVATE ${MPG123_CFLAGS_OTHER})
 endif()
 
-if (WEBKIT2_FOUND)
+if(WEBKIT2_FOUND)
     target_include_directories(David PRIVATE ${WEBKIT2_INCLUDE_DIRS})
     target_link_libraries(David PRIVATE ${WEBKIT2_LIBRARIES})
     target_compile_options(David PRIVATE ${WEBKIT2_CFLAGS_OTHER})
 endif()
 
 set_target_properties(David PROPERTIES
-    CXX_STANDARD 23
     AUTOMOC ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 
-# Make project headers available to the Qt target
 target_include_directories(David PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src)

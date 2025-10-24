@@ -1,5 +1,5 @@
 #include "MenuBar.h"
-#include "QtMainWindow.h"
+#include "MainWindow.h"
 #include "PreferencesDialog.h"
 #include "AppConfig.h"
 #include "DeckSettings.h"

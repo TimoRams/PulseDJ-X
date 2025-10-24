@@ -11,7 +11,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include "DeckWaveformOverview.h"
-#include "QtTurntableWidget.h"
+#include "TurntableWidget.h"
 #include "PerformancePads.h"
 class DJAudioPlayer;
 class ScratchEngine;

@@ -1,5 +1,6 @@
-#include "QtMainWindow.h"
+#include "MainWindow.h"
 #include "AppConfig.h"
+
 #include <QApplication>
 #include <QDebug>
 #include <QtCore/QEventLoop>
@@ -8,7 +9,19 @@
 #include <QtWidgets/QProgressBar>
 #include <QtWidgets/QVBoxLayout>
 
-class LoadingDialog : public QDialog
+#include <memory>
+
+namespace
+{
+constexpr QSize kDefaultWindowSize{1400, 900};
+
+void processUiEvents()
+{
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
+}
+
+class LoadingDialog final : public QDialog
 {
 public:
     explicit LoadingDialog(QWidget* parent = nullptr)
@@ -64,11 +77,10 @@ public:
         );
     }
 
-    void updateStatus(int value, const QString& text)
+    void updateStatus(int value, QString text)
     {
         progressBar->setValue(value);
-        statusLabel->setText(text);
-        QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        statusLabel->setText(std::move(text));
     }
 
 private:
@@ -81,46 +93,44 @@ int main(int argc, char** argv)
 {
     QApplication app(argc, argv);
 
-    LoadingDialog splash;
-    splash.show();
-    splash.raise();
-    splash.activateWindow();
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    splash.updateStatus(5, QObject::tr("Initialisiere System..."));
-    
-    // BetaPulseX: Initialisiere App-Konfiguration und erstelle Verzeichnisse
-    qDebug() << "=== BetaPulseX DJ Software Starting ===";
-    qDebug() << "Build Type:" << (AppConfig::instance().isDebugBuild() ? "DEBUG/DEVELOPMENT" : "RELEASE");
-    qDebug() << "Data Directory:" << AppConfig::instance().getAppDataDirectory();
-    qDebug() << "Config Directory:" << AppConfig::instance().getConfigDirectory();
-    qDebug() << "Library Database:" << AppConfig::instance().getLibraryDatabasePath();
-    
-    splash.updateStatus(25, QObject::tr("Prüfe Datenordner und Einstellungen..."));
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        auto splash = std::make_unique<LoadingDialog>();
+        splash->show();
+        splash->raise();
+        splash->activateWindow();
+        processUiEvents();
 
-    // Erstelle alle notwendigen Verzeichnisse
-    if (!AppConfig::instance().createDirectories()) {
-        qWarning() << "Failed to create app directories - some features may not work!";
-    }
+        const auto updateSplash = [&](int value, QString status) {
+            splash->updateStatus(value, std::move(status));
+            processUiEvents();
+        };
 
-    splash.updateStatus(55, QObject::tr("Initialisiere Benutzeroberfläche..."));
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        updateSplash(5, QObject::tr("Initialisiere System..."));
 
-    QtMainWindow w;
-    // Make window wider by default and enforce a minimum size so loading tracks
-    // can't slightly shift or expand the main window layout.
-    const int defaultW = 1400;
-    const int defaultH = 900;
-    w.resize(defaultW, defaultH);
-    w.setMinimumSize(defaultW, defaultH);
-    splash.updateStatus(80, QObject::tr("Starte Audio- und UI-Komponenten..."));
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        const auto& config = AppConfig::instance();
+        qDebug() << "=== BetaPulseX DJ Software Starting ===";
+        qDebug() << "Build Type:" << (config.isDebugBuild() ? "DEBUG/DEVELOPMENT" : "RELEASE");
+        qDebug() << "Data Directory:" << config.getAppDataDirectory();
+        qDebug() << "Config Directory:" << config.getConfigDirectory();
+        qDebug() << "Library Database:" << config.getLibraryDatabasePath();
 
-    w.show();
+        updateSplash(25, QObject::tr("Prüfe Datenordner und Einstellungen..."));
 
-    splash.updateStatus(100, QObject::tr("Bereit zum Durchstarten!"));
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    splash.close();
+        if (!config.createDirectories()) {
+            qWarning() << "Failed to create app directories - some features may not work!";
+        }
 
-    return app.exec();
+        updateSplash(55, QObject::tr("Initialisiere Benutzeroberfläche..."));
+
+        QtMainWindow mainWindow;
+        mainWindow.resize(kDefaultWindowSize);
+        mainWindow.setMinimumSize(kDefaultWindowSize);
+
+        updateSplash(80, QObject::tr("Starte Audio- und UI-Komponenten..."));
+
+        mainWindow.show();
+
+        updateSplash(100, QObject::tr("Bereit zum Durchstarten!"));
+        splash->close();
+
+        return app.exec();
 }

@@ -1,4 +1,4 @@
-#include "QtDeckWidget.h"
+#include "DeckWidget.h"
 #include "DJAudioPlayer.h"
 #include "WaveformGenerator.h"
 #include "ScratchEngine.h"
@@ -846,8 +846,6 @@ void QtDeckWidget::syncPlayState() {
         // Only update UI if there's a mismatch, don't call any transport actions
         if (actuallyPlaying != uiShowsPlaying) {
             playPauseBtn->setText(actuallyPlaying ? "Pause" : "Play");
-            std::cout << "*** UI corrected: UI=" << (actuallyPlaying ? 1 : 0) 
-                      << ", Actual=" << (actuallyPlaying ? 1 : 0) << std::endl;
         }
         
         // If no file is loaded, ensure button shows correct text
@@ -856,7 +854,6 @@ void QtDeckWidget::syncPlayState() {
                 playPauseBtn->setText("Load File");
             }
             if (playing) {
-                std::cout << "*** syncPlayState: No file loaded, stopping UI state" << std::endl;
                 playing = false;
                 turntable->stop();
                 emit playStateChanged(playing);
@@ -864,56 +861,39 @@ void QtDeckWidget::syncPlayState() {
             return;
         }
         
-        // CRITICAL: Only update UI, NEVER call player->stop() to avoid oscillation!
         if (actuallyPlaying != playing) {
-            std::cout << "*** syncPlayState: State mismatch detected! Correcting UI ONLY..." << std::endl;
-            std::cout << "    UI was: " << playing << ", player is: " << actuallyPlaying << std::endl;
-            
             playing = actuallyPlaying;
-            
+
             if (playing) {
-                std::cout << "    Updating UI to PLAYING state (no player action)" << std::endl;
                 playPauseBtn->setText("Pause");
                 turntable->start();
             } else {
-                std::cout << "    Updating UI to STOPPED state (no player action)" << std::endl;
                 playPauseBtn->setText("Play");
                 turntable->stop();
             }
-            
+
             emit playStateChanged(playing);
         }
     }
     
-    // IMPORTANT: Check for loop status changes every timer tick (not just every 50 ticks)
-    // This ensures loop visualization updates immediately when PerformancePads trigger loops
+    // Check loop status each tick to keep the UI responsive to external changes
     bool currentLoopEnabled = player->isLoopEnabled();
     double currentLoopStart = player->getLoopStart();
     double currentLoopEnd = player->getLoopEnd();
     
-    std::cout << "QtDeckWidget::syncPlayState - Loop status check: enabled=" << currentLoopEnabled 
-              << ", lastEnabled=" << lastLoopEnabled << ", start=" << currentLoopStart 
-              << ", end=" << currentLoopEnd << std::endl;
-    
     if (currentLoopEnabled != lastLoopEnabled || 
         currentLoopStart != lastLoopStart || 
         currentLoopEnd != lastLoopEnd) {
-        
-        std::cout << "QtDeckWidget::syncPlayState - LOOP STATUS CHANGED! Updating waveforms..." << std::endl;
-        
         // Update the waveform displays
         waveform->setLoopRegion(currentLoopEnabled, currentLoopStart, currentLoopEnd);
         
         // Emit signal so main waveform displays can also update
-        std::cout << "QtDeckWidget::syncPlayState - Emitting loopChanged signal..." << std::endl;
         emit loopChanged(currentLoopEnabled, currentLoopStart, currentLoopEnd);
         
         // Store current values for next comparison
         lastLoopEnabled = currentLoopEnabled;
         lastLoopStart = currentLoopStart;
         lastLoopEnd = currentLoopEnd;
-        
-        std::cout << "QtDeckWidget::syncPlayState - Loop status update complete" << std::endl;
     }
 }
 

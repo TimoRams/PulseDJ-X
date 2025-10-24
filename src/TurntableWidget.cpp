@@ -1,4 +1,4 @@
-#include "QtTurntableWidget.h"
+#include "TurntableWidget.h"
 
 #include <QCursor>
 #include <QMouseEvent>

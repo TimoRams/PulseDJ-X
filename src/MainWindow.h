@@ -15,54 +15,18 @@
 #include <ctime>
 #include <chrono>
 #include <memory>
-#include "QtDeckWidget.h"
+#include "DeckWidget.h"
 #include "BeatIndicator.h"
 #include "MenuBar.h"
 #include <QListWidget>
 #include "LibraryManager.h"
 #include "MasterLevelMonitor.h"
+#include "StereoAudioCallback.h"
 // #include "AudioMixer.h" // Removed - using simplified AudioSourcePlayer approach
 class DJAudioPlayer;
 class BpmAnalyzer;
 class PreferencesDialog;
 class ScratchEngine;
-
-// Custom audio callback for proper stereo mixing of both decks
-class StereoAudioCallback : public juce::AudioIODeviceCallback {
-public:
-    explicit StereoAudioCallback(DJAudioPlayer* playerA, DJAudioPlayer* playerB) 
-        : audioPlayerA(playerA), audioPlayerB(playerB),
-          volumeA(1.0f), volumeB(1.0f), crossfaderPos(0.0f), masterVolume(1.0f) {}
-    
-    void audioDeviceIOCallback(const float* const* inputChannelData, int numInputChannels,
-                              float* const* outputChannelData, int numOutputChannels, 
-                              int numSamples);
-    
-    void audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
-                                         float* const* outputChannelData, int numOutputChannels, 
-                                         int numSamples, const juce::AudioIODeviceCallbackContext& context) override;
-    
-    void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
-    void audioDeviceStopped() override;
-    
-    // Mixer controls
-    void setVolumeA(float vol) { volumeA.store(juce::jlimit(0.0f, 1.0f, vol)); }
-    void setVolumeB(float vol) { volumeB.store(juce::jlimit(0.0f, 1.0f, vol)); }
-    void setCrossfader(float pos) { crossfaderPos.store(juce::jlimit(-1.0f, 1.0f, pos)); }
-    void setMasterVolume(float vol) { masterVolume.store(juce::jlimit(0.0f, 1.0f, vol)); }
-    
-private:
-    DJAudioPlayer* audioPlayerA{nullptr};
-    DJAudioPlayer* audioPlayerB{nullptr};
-    juce::AudioBuffer<float> tempBufferA;
-    juce::AudioBuffer<float> tempBufferB;
-    
-    // Mixer parameters (atomic for thread safety)
-    std::atomic<float> volumeA{1.0f};
-    std::atomic<float> volumeB{1.0f};
-    std::atomic<float> crossfaderPos{0.0f};  // -1.0 = A only, 0.0 = center, +1.0 = B only
-    std::atomic<float> masterVolume{1.0f};
-};
 
 class QtMainWindow : public QWidget {
     Q_OBJECT
@@ -104,11 +68,9 @@ private slots:
     void onRightVolumeChanged(int v);
 
 public:
-    // Performance optimization: Handle BPM analysis results (public for thread access)
     void handleBpmAnalysisResult(double bpm, const std::vector<double>& beatsSec, double totalSec, 
-                                const std::string& algorithm, double firstBeatOffset, bool isDeckA);
-    // Performance optimization: Make BPM analyzer accessible to threaded tasks
-    BpmAnalyzer* bpmAnalyzer{nullptr};
+                                 const std::string& algorithm, double firstBeatOffset, bool isDeckA);
+    std::unique_ptr<BpmAnalyzer> bpmAnalyzer;
     
     // MIDI control access methods
     void setCrossfaderPosition(float normalizedValue); // 0.0 = full A, 1.0 = full B
@@ -118,19 +80,18 @@ public:
     void setDeckBTempo(float normalizedValue); // MIDI control for Deck B tempo/pitch (0.0 = -100%, 0.5 = normal, 1.0 = +100%)
     void setDeckAVolume(float normalizedValue); // MIDI control for Deck A channel volume (0.0 = mute, 1.0 = full)
     void setDeckBVolume(float normalizedValue); // MIDI control for Deck B channel volume (0.0 = mute, 1.0 = full)
-    // THREADING FIX: Make waveform displays accessible to threads
+    DJAudioPlayer* getPlayerA() const { return playerA.get(); }
+    DJAudioPlayer* getPlayerB() const { return playerB.get(); }
+    DJAudioPlayer* getPlayer(bool isDeckA) const { return isDeckA ? playerA.get() : playerB.get(); }
     class WaveformDisplay* overviewTopA;
     class WaveformDisplay* overviewTopB;
-    // THREADING FIX: Make format manager accessible to threads
-    static juce::AudioFormatManager* sharedFormatManager;
-    
-    // THREADING FIX: Make deck widgets accessible to threads
+    static std::shared_ptr<juce::AudioFormatManager> sharedFormatManager;
+
     QtDeckWidget* deckA;
     QtDeckWidget* deckB;
-    
-    // THREADING FIX: Make players accessible to threads
-    DJAudioPlayer* playerA;
-    DJAudioPlayer* playerB;
+
+    std::unique_ptr<DJAudioPlayer> playerA;
+    std::unique_ptr<DJAudioPlayer> playerB;
     std::unique_ptr<ScratchEngine> scratchEngineA;
     std::unique_ptr<ScratchEngine> scratchEngineB;
 
@@ -179,9 +140,6 @@ private:
     // Scratching state management to prevent timer conflicts
     qint64 lastScratchEndA{0};
     qint64 lastScratchEndB{0};
-    
-    // Performance optimization: Cached format manager to avoid repeated initialization
-    static int formatManagerRefCount;
     
     // Thread pool optimization
     std::unique_ptr<QThreadPool> bpmThreadPool;
@@ -278,4 +236,5 @@ private:
     void beginWindowDragInternal(const QPoint& globalPos, bool fromExternalSource);
     void updateWindowDragInternal(const QPoint& globalPos);
     void endWindowDragInternal();
+    DJAudioPlayer* playerForDeck(bool isDeckA) const { return isDeckA ? playerA.get() : playerB.get(); }
 };

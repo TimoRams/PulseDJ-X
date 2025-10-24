@@ -1,6 +1,6 @@
 #include "MidiEngine.h"
 #include "DJAudioPlayer.h"
-#include "QtMainWindow.h"
+#include "MainWindow.h"
 #include <QDebug>
 #include <QApplication>
 
