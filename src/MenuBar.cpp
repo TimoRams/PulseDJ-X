@@ -13,6 +13,8 @@
 #include <QTimer>
 #include <QFile>
 #include <QTextStream>
+#include <QProcess>
+#include <QRegularExpression>
 #include <QtGlobal>
 #include <QDateTime>
 #include <QColor>
@@ -422,9 +424,16 @@ void MenuBar::setupSystemMonitoring() {
     systemTimer = new QTimer(this);
     connect(systemTimer, &QTimer::timeout, this, &MenuBar::updateSystemStats);
     systemTimer->start(2000); // Update every 2 seconds
+    
+    // Initial update to avoid showing 0% on startup
+    QTimer::singleShot(100, this, &MenuBar::updateSystemStats);
 }
 
 void MenuBar::updateSystemStats() {
+    // Cross-platform CPU usage monitoring
+    double cpuUsage = 0.0;
+    
+#ifdef Q_OS_LINUX
     QFile cpuFile("/proc/stat");
     if (cpuFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         QTextStream in(&cpuFile);
@@ -443,8 +452,7 @@ void MenuBar::updateSystemStats() {
                     long long totalDiff = total - lastTotal;
                     long long idleDiff = idle - lastIdle;
                     if (totalDiff > 0) {
-                        double cpuUsage = 100.0 * (totalDiff - idleDiff) / totalDiff;
-                        updateCpuUsage(cpuUsage);
+                        cpuUsage = 100.0 * (totalDiff - idleDiff) / totalDiff;
                     }
                 }
                 
@@ -454,46 +462,151 @@ void MenuBar::updateSystemStats() {
         }
         cpuFile.close();
     }
+#elif defined(Q_OS_WIN)
+    // Windows: Use JUCE SystemStats
+    cpuUsage = juce::SystemStats::getCpuUsage() * 100.0;
+#elif defined(Q_OS_MACOS)
+    // macOS: Use JUCE SystemStats
+    cpuUsage = juce::SystemStats::getCpuUsage() * 100.0;
+#endif
     
-    updateRamUsage(62.0);
+    updateCpuUsage(cpuUsage);
     
-    QFile batteryCapacityFile("/sys/class/power_supply/BAT0/capacity");
-    if (batteryCapacityFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QTextStream in(&batteryCapacityFile);
-        int batteryLevel = in.readLine().trimmed().toInt();
+    // Cross-platform RAM usage monitoring
+    double ramUsage = 0.0;
+    
+#ifdef Q_OS_LINUX
+    QFile memFile("/proc/meminfo");
+    if (memFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        long long totalMem = 0, availMem = 0;
         
-        QFile batteryStatusFile("/sys/class/power_supply/BAT0/status");
-        bool isCharging = false;
-        if (batteryStatusFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream statusIn(&batteryStatusFile);
-            QString status = statusIn.readLine().trimmed();
-            isCharging = (status == "Charging");
-            batteryStatusFile.close();
-        }
-        
-        updateBatteryLevel(batteryLevel, isCharging);
-        batteryCapacityFile.close();
-    } else {
-        QFile batteryCapacityFile1("/sys/class/power_supply/BAT1/capacity");
-        if (batteryCapacityFile1.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&batteryCapacityFile1);
-            int batteryLevel = in.readLine().trimmed().toInt();
+        while (!memFile.atEnd()) {
+            QString line = QString::fromLatin1(memFile.readLine()).trimmed();
             
-            QFile batteryStatusFile1("/sys/class/power_supply/BAT1/status");
-            bool isCharging = false;
-            if (batteryStatusFile1.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                QTextStream statusIn(&batteryStatusFile1);
-                QString status = statusIn.readLine().trimmed();
-                isCharging = (status == "Charging");
-                batteryStatusFile1.close();
+            if (line.startsWith("MemTotal:")) {
+                // Parse: "MemTotal:       32295968 kB"
+                QString numStr = line.mid(9).trimmed(); // Remove "MemTotal:"
+                numStr = numStr.split(' ').first(); // Get first token (the number)
+                totalMem = numStr.toLongLong();
+            } else if (line.startsWith("MemAvailable:")) {
+                // Parse: "MemAvailable:   20393164 kB"
+                QString numStr = line.mid(13).trimmed(); // Remove "MemAvailable:"
+                numStr = numStr.split(' ').first(); // Get first token (the number)
+                availMem = numStr.toLongLong();
             }
             
-            updateBatteryLevel(batteryLevel, isCharging);
-            batteryCapacityFile1.close();
-        } else {
-            updateBatteryLevel(100, false);
+            // Break early if we have both values
+            if (totalMem > 0 && availMem > 0) {
+                break;
+            }
+        }
+        
+        memFile.close();
+        
+        if (totalMem > 0 && availMem > 0) {
+            long long usedMem = totalMem - availMem;
+            ramUsage = 100.0 * static_cast<double>(usedMem) / static_cast<double>(totalMem);
         }
     }
+#elif defined(Q_OS_WIN)
+    // Windows: Use JUCE SystemStats
+    const juce::int64 totalRAM = juce::SystemStats::getMemorySizeInMegabytes();
+    const juce::int64 freeRAM = juce::SystemStats::getMemorySizeInMegabytes() - 
+                                (juce::SystemStats::getMemorySizeInMegabytes() * juce::SystemStats::getCpuUsage());
+    if (totalRAM > 0) {
+        ramUsage = 100.0 * (totalRAM - freeRAM) / totalRAM;
+    }
+#elif defined(Q_OS_MACOS)
+    // macOS: Use system command
+    QProcess process;
+    process.start("vm_stat");
+    process.waitForFinished();
+    QString output = process.readAllStandardOutput();
+    
+    long long pageSize = 4096; // Default page size
+    long long pagesActive = 0, pagesWired = 0, pagesFree = 0, pagesInactive = 0;
+    
+    for (const QString& line : output.split('\n')) {
+        if (line.contains("Pages active:")) {
+            pagesActive = line.split(':')[1].trimmed().remove('.').toLongLong();
+        } else if (line.contains("Pages wired down:")) {
+            pagesWired = line.split(':')[1].trimmed().remove('.').toLongLong();
+        } else if (line.contains("Pages free:")) {
+            pagesFree = line.split(':')[1].trimmed().remove('.').toLongLong();
+        } else if (line.contains("Pages inactive:")) {
+            pagesInactive = line.split(':')[1].trimmed().remove('.').toLongLong();
+        }
+    }
+    
+    long long usedPages = pagesActive + pagesWired;
+    long long totalPages = usedPages + pagesFree + pagesInactive;
+    
+    if (totalPages > 0) {
+        ramUsage = 100.0 * usedPages / totalPages;
+    }
+#endif
+    
+    updateRamUsage(ramUsage);
+    
+    // Cross-platform battery monitoring
+    int batteryLevel = 100;
+    bool isCharging = false;
+    
+#ifdef Q_OS_LINUX
+    // Try BAT0 first, then BAT1
+    for (const QString& batteryPath : {"/sys/class/power_supply/BAT0", "/sys/class/power_supply/BAT1"}) {
+        QFile batteryCapacityFile(batteryPath + "/capacity");
+        if (batteryCapacityFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream in(&batteryCapacityFile);
+            batteryLevel = in.readLine().trimmed().toInt();
+            batteryCapacityFile.close();
+            
+            QFile batteryStatusFile(batteryPath + "/status");
+            if (batteryStatusFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QTextStream statusIn(&batteryStatusFile);
+                QString status = statusIn.readLine().trimmed();
+                isCharging = (status == "Charging" || status == "Full");
+                batteryStatusFile.close();
+            }
+            
+            break; // Found a battery
+        }
+    }
+#elif defined(Q_OS_WIN)
+    // Windows: Use system power status
+    QProcess process;
+    process.start("powershell", QStringList() << "-Command" << 
+                  "(Get-WmiObject Win32_Battery).EstimatedChargeRemaining");
+    process.waitForFinished();
+    QString output = process.readAllStandardOutput().trimmed();
+    if (!output.isEmpty()) {
+        batteryLevel = output.toInt();
+    }
+    
+    QProcess chargingProcess;
+    chargingProcess.start("powershell", QStringList() << "-Command" << 
+                         "(Get-WmiObject Win32_Battery).BatteryStatus");
+    chargingProcess.waitForFinished();
+    QString chargingOutput = chargingProcess.readAllStandardOutput().trimmed();
+    isCharging = (chargingOutput == "2"); // 2 = Charging
+#elif defined(Q_OS_MACOS)
+    // macOS: Use pmset command
+    QProcess process;
+    process.start("pmset", QStringList() << "-g" << "batt");
+    process.waitForFinished();
+    QString output = process.readAllStandardOutput();
+    
+    // Parse output like: "Now drawing from 'Battery Power' -InternalBattery-0 (id=1234567)  85%; discharging; 3:45 remaining"
+    QRegularExpression batteryRegex("(\\d+)%");
+    QRegularExpressionMatch match = batteryRegex.match(output);
+    if (match.hasMatch()) {
+        batteryLevel = match.captured(1).toInt();
+    }
+    
+    isCharging = output.contains("charging") || output.contains("AC Power");
+#endif
+    
+    updateBatteryLevel(batteryLevel, isCharging);
     updateMasterLevels(0.0, 0.0);
 }
 

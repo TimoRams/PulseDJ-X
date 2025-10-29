@@ -41,8 +41,6 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     setMouseTracking(true);
     setAttribute(Qt::WA_Hover, true);
     setAttribute(Qt::WA_StyledBackground, true);
-    if (qApp)
-        qApp->installEventFilter(this);
     
     // Remove window decorations and make frameless
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
@@ -63,6 +61,11 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     const int maxBmpThreads = std::min(4, std::max(2, idealThreads / 2));
     bpmThreadPool->setMaxThreadCount(maxBmpThreads);
     bpmThreadPool->setExpiryTimeout(30000);
+
+    // Create a dedicated single-threaded, low-priority pool for waveform streaming
+    waveformThreadPool = std::make_unique<QThreadPool>();
+    waveformThreadPool->setMaxThreadCount(1);
+    waveformThreadPool->setExpiryTimeout(60000);
 
     playerA = std::make_unique<DJAudioPlayer>(*sharedFormatManager);
     playerB = std::make_unique<DJAudioPlayer>(*sharedFormatManager);
@@ -102,6 +105,13 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     overviewTopB->setScrollMode(true);
     overviewTopA->setScratchEngine(scratchEngineA.get());
     overviewTopB->setScratchEngine(scratchEngineB.get());
+    // Load and apply global render latency compensation for waveform alignment
+    {
+        QSettings s("DJDavid", "David");
+        userRenderLatencySec = s.value("renderLatency/global", 0.03).toDouble();
+        overviewTopA->setOutputLatencyComp(userRenderLatencySec);
+        overviewTopB->setOutputLatencyComp(userRenderLatencySec);
+    }
     // Click-to-seek on top overview waveforms (works while paused)
     connect(overviewTopA, &WaveformDisplay::positionClicked, this, [this](double absRel){
         if (!playerA) return;
@@ -143,11 +153,11 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         }
     });
 
-    connect(overviewTopA, &WaveformDisplay::waveformRegionNeeded, this, [this](double startSec, double endSec) {
-        handleWaveformRegionRequestDeckA(startSec, endSec);
+    connWaveformRegionA = connect(overviewTopA, &WaveformDisplay::waveformRegionNeeded, this, [this](double startSec, double endSec) {
+        handleWaveformRegionRequest(true, startSec, endSec);
     });
-    connect(overviewTopB, &WaveformDisplay::waveformRegionNeeded, this, [this](double startSec, double endSec) {
-        handleWaveformRegionRequestDeckB(startSec, endSec);
+    connWaveformRegionB = connect(overviewTopB, &WaveformDisplay::waveformRegionNeeded, this, [this](double startSec, double endSec) {
+        handleWaveformRegionRequest(false, startSec, endSec);
     });
 
     // Beat indicator for showing current beat position
@@ -204,7 +214,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         if (playerA) [[likely]] playerA->setPitchBendRatio(1.0);
         const QString filePath = deckA->getCurrentFilePath();
         if (!filePath.isEmpty()) [[likely]] {
-            bpmThreadPool->start(new TopWaveformDisplayTask(this, filePath, true));
+            // Run top waveform display setup on dedicated waveform thread to avoid any interference
+            if (waveformThreadPool) waveformThreadPool->start(new TopWaveformDisplayTask(this, filePath, true));
             startDeckAnalysisIfNeeded(filePath, true);
         }
     });
@@ -223,7 +234,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         if (playerB) [[likely]] playerB->setPitchBendRatio(1.0);
         const QString filePath = deckB->getCurrentFilePath();
         if (!filePath.isEmpty()) [[likely]] {
-            bpmThreadPool->start(new TopWaveformDisplayTask(this, filePath, false));
+            if (waveformThreadPool) waveformThreadPool->start(new TopWaveformDisplayTask(this, filePath, false));
             startDeckAnalysisIfNeeded(filePath, false);
         }
     });    connect(deckB, &QtDeckWidget::fileLoaded, this, [this]() {
@@ -584,16 +595,18 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     
     // Main deck controls side by side (more compact spacing)
     auto decksLayout = new QHBoxLayout;
-    decksLayout->setSpacing(8);
+    decksLayout->setSpacing(6);
+    decksLayout->setContentsMargins(0, 0, 0, 0);
     decksLayout->addWidget(deckA->getControlsWidget(), 2);
     
     // Mixer section in the center (more compact)
     auto mixerSection = new QVBoxLayout;
-    mixerSection->setSpacing(4);
+    mixerSection->setSpacing(2);
+    mixerSection->setContentsMargins(4, 4, 4, 4);
     auto crossfaderLabel = new QLabel("CROSSFADER", this);
     crossfaderLabel->setAlignment(Qt::AlignCenter);
-    crossfaderLabel->setStyleSheet("font-weight: bold; color: #fff; font-size: 10px;");
-    crossfaderLabel->setFixedHeight(16);
+    crossfaderLabel->setStyleSheet("font-weight: bold; color: #fff; font-size: 9px;");
+    crossfaderLabel->setFixedHeight(14);
     mixerSection->addWidget(crossfaderLabel);
     mixerSection->addWidget(crossfader);
     
@@ -644,10 +657,10 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     rightHigh->setValue(0); rightMid->setValue(0); rightLow->setValue(0); rightFilter->setValue(0);
     
     // Make knobs smaller
-    leftHigh->setFixedSize(35, 35); leftMid->setFixedSize(35, 35); 
-    leftLow->setFixedSize(35, 35); leftFilter->setFixedSize(35, 35);
-    rightHigh->setFixedSize(35, 35); rightMid->setFixedSize(35, 35);
-    rightLow->setFixedSize(35, 35); rightFilter->setFixedSize(35, 35);
+    leftHigh->setFixedSize(32, 32); leftMid->setFixedSize(32, 32); 
+    leftLow->setFixedSize(32, 32); leftFilter->setFixedSize(32, 32);
+    rightHigh->setFixedSize(32, 32); rightMid->setFixedSize(32, 32);
+    rightLow->setFixedSize(32, 32); rightFilter->setFixedSize(32, 32);
 
     // Arrange top-to-bottom: High, Mid, Low, Filter
     leftEqLayout->addWidget(leftHigh);
@@ -680,8 +693,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     leftVolumeSlider = new QSlider(Qt::Vertical, this);
     leftVolumeSlider->setRange(0, 100);
     leftVolumeSlider->setValue(100);
-    leftVolumeSlider->setFixedHeight(60);
-    leftVolumeSlider->setFixedWidth(20);
+    leftVolumeSlider->setFixedHeight(50);
+    leftVolumeSlider->setFixedWidth(18);
     
     leftVolLayout->addWidget(leftVolLabel);
     leftVolLayout->addWidget(leftVolumeSlider);
@@ -697,8 +710,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     rightVolumeSlider = new QSlider(Qt::Vertical, this);
     rightVolumeSlider->setRange(0, 100);
     rightVolumeSlider->setValue(100);
-    rightVolumeSlider->setFixedHeight(60);
-    rightVolumeSlider->setFixedWidth(20);
+    rightVolumeSlider->setFixedHeight(50);
+    rightVolumeSlider->setFixedWidth(18);
     
     rightVolLayout->addWidget(rightVolLabel);
     rightVolLayout->addWidget(rightVolumeSlider);
@@ -711,7 +724,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     
     auto mixerWidget = new QWidget(this);
     mixerWidget->setLayout(mixerSection);
-    mixerWidget->setFixedWidth(130);
+    mixerWidget->setFixedWidth(120);
     mixerWidget->setStyleSheet("background-color: #2a2a2a; border: 1px solid #555; border-radius: 0px;");
     
     decksLayout->addWidget(mixerWidget, 1);
@@ -759,7 +772,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 
     // Main layout: Vertical stack (Compact Serato style)
     auto mainLayout = new QVBoxLayout(this);
-    mainLayout->setSpacing(3);
+    mainLayout->setSpacing(2);
     mainLayout->setContentsMargins(0, 0, 0, 0);
     
     // Add menu bar to the top of the layout
@@ -773,8 +786,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     mainLayout->addLayout(beatIndicatorLayout, 0);
     
     mainLayout->addLayout(overviewLayout, 0);    // Overview waveforms at top (fixed size)
-    mainLayout->addLayout(decksLayout, 2);       // Deck controls + mixer (reduced from 4 to 2)
-    mainLayout->addLayout(libLayout, 2);         // Library at bottom (increased from 1 to 2)
+    mainLayout->addLayout(decksLayout, 1);       // Deck controls + mixer (compact)
+    mainLayout->addLayout(libLayout, 3);         // Library at bottom (more space)
     setLayout(mainLayout);
 
     positionUpdateTimer = new QTimer(this);
@@ -812,6 +825,47 @@ void QtMainWindow::initializeAudio()
             return;
         }
 
+        // Request an audio buffer size close to 5 ms to minimize audible glitches on seek/keylock
+        {
+            juce::AudioDeviceManager::AudioDeviceSetup setup;
+            deviceManager.getAudioDeviceSetup(setup);
+            const double sr = (setup.sampleRate > 0.0) ? setup.sampleRate : currentDevice->getCurrentSampleRate();
+            const int targetSamples = (sr > 0.0) ? std::max(32, (int) std::lround(sr * 0.005)) : 256; // ~5 ms
+
+            int chosen = targetSamples;
+#if JUCE_MODULE_AVAILABLE_juce_audio_devices
+            // Prefer a supported device buffer size closest to our target
+            const auto sizes = currentDevice->getAvailableBufferSizes();
+            if (sizes.size() > 0) {
+                int best = sizes[0];
+                double bestDiff = std::abs(best - targetSamples);
+                for (int i = 1; i < sizes.size(); ++i) {
+                    const int v = sizes[i];
+                    const double d = std::abs(v - targetSamples);
+                    if (d < bestDiff) { best = v; bestDiff = d; }
+                }
+                chosen = best;
+            }
+#endif
+            setup.bufferSize = chosen;
+            if (setup.sampleRate <= 0.0) setup.sampleRate = (sr > 0.0 ? sr : 48000.0);
+            deviceManager.setAudioDeviceSetup(setup, true);
+
+            // Refresh device pointer after potential re-open
+            currentDevice = deviceManager.getCurrentAudioDevice();
+            if (!currentDevice) [[unlikely]] {
+                return;
+            }
+
+            // Log the actual buffer size and sample rate the device settled on
+            {
+                const int bs = currentDevice->getCurrentBufferSizeSamples();
+                const double srNow = currentDevice->getCurrentSampleRate();
+                const double ms = (srNow > 0.0) ? (1000.0 * (double) bs / srNow) : 0.0;
+                qDebug() << "Audio device configured:" << bs << "samples (~" << ms << "ms) @" << srNow << "Hz";
+            }
+        }
+
         if (playerA) [[likely]] {
             playerA->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
         }
@@ -819,7 +873,7 @@ void QtMainWindow::initializeAudio()
             playerB->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
         }
 
-        stereoCallback = std::make_unique<StereoAudioCallback>(playerA.get(), playerB.get());
+    stereoCallback = std::make_unique<StereoAudioCallback>(playerA.get(), playerB.get());
         deviceManager.addAudioCallback(stereoCallback.get());
         deviceManager.addAudioCallback(&masterLevelMonitor);
 
@@ -832,8 +886,6 @@ void QtMainWindow::initializeAudio()
 
 QtMainWindow::~QtMainWindow()
 {
-    if (qApp)
-        qApp->removeEventFilter(this);
     if (cursorOverridden) {
         QApplication::restoreOverrideCursor();
         cursorOverridden = false;
@@ -849,6 +901,19 @@ void QtMainWindow::performCleanup()
     if (cleanupCompleted) [[unlikely]] return;
     
     try {
+        // Stop periodic UI updates early to avoid timers firing during teardown
+        if (positionUpdateTimer) {
+            positionUpdateTimer->stop();
+        }
+
+        // Proactively disconnect waveform region requests to avoid late queued invokes
+        if (connWaveformRegionA) {
+            disconnect(connWaveformRegionA);
+        }
+        if (connWaveformRegionB) {
+            disconnect(connWaveformRegionB);
+        }
+
         if (playerA) playerA->stop();
         if (playerB) playerB->stop();
         
@@ -861,6 +926,9 @@ void QtMainWindow::performCleanup()
         
         if (bpmThreadPool) {
             bpmThreadPool->waitForDone(1000);
+        }
+        if (waveformThreadPool) {
+            waveformThreadPool->waitForDone(1000);
         }
         
         playerA.reset();
@@ -916,6 +984,7 @@ void QtMainWindow::closeEvent(QCloseEvent* event)
         DeckSettings::instance().setVisualTrim(0, userVisualTrimA);
         DeckSettings::instance().setVisualTrim(1, userVisualTrimB);
         DeckSettings::instance().saveSettings();
+        QSettings("DJDavid", "David").setValue("renderLatency/global", userRenderLatencySec);
     } catch (...) {}
 
     shutdownProgress.setLabelText(tr("Decks werden deaktiviert..."));
@@ -1085,6 +1154,24 @@ void QtMainWindow::keyPressEvent(QKeyEvent* event) {
             if (overviewTopB) [[likely]] overviewTopB->resetBeatGridZoom();
             event->accept();
             break;
+        case Qt::Key_F9: {
+            // Decrease global render latency compensation by 5 ms
+            userRenderLatencySec = std::clamp(userRenderLatencySec - 0.005, -0.25, 0.25);
+            if (overviewTopA) overviewTopA->setOutputLatencyComp(userRenderLatencySec);
+            if (overviewTopB) overviewTopB->setOutputLatencyComp(userRenderLatencySec);
+            QSettings("DJDavid", "David").setValue("renderLatency/global", userRenderLatencySec);
+            event->accept();
+            break;
+        }
+        case Qt::Key_F10: {
+            // Increase global render latency compensation by 5 ms
+            userRenderLatencySec = std::clamp(userRenderLatencySec + 0.005, -0.25, 0.25);
+            if (overviewTopA) overviewTopA->setOutputLatencyComp(userRenderLatencySec);
+            if (overviewTopB) overviewTopB->setOutputLatencyComp(userRenderLatencySec);
+            QSettings("DJDavid", "David").setValue("renderLatency/global", userRenderLatencySec);
+            event->accept();
+            break;
+        }
         default:
             QWidget::keyPressEvent(event);
             break;
@@ -1134,8 +1221,19 @@ void QtMainWindow::handleWaveformRegionRequest(bool deckIsA, double startSec, do
         return;
     }
 
+    const int alignedStart = std::max(0, startBin - (startBin % session.chunkBinSize));
+    const int requestCenterBin = (startBin + endBin) / 2;
+    const int microSize = std::max(256, std::min(1024, session.chunkBinSize));
+    int microStart = std::clamp(requestCenterBin - microSize / 2, 0, std::max(0, session.totalBins - microSize));
+
+    // If we have no cache yet, start directly at the aligned request
     if (!session.hasCache) {
-        const int alignedStart = std::max(0, startBin - (startBin % session.chunkBinSize));
+        // Schedule a tiny center chunk first for instant paint, then the aligned chunk
+        if (!session.pendingChunks.contains(microStart)) {
+            session.pendingChunks.insert(microStart);
+            const int count = std::min(microSize, session.totalBins - microStart);
+            scheduleWaveformChunk(deckIsA, microStart, count);
+        }
         if (!session.pendingChunks.contains(alignedStart)) {
             session.pendingChunks.insert(alignedStart);
             const int count = std::min(session.chunkBinSize, session.totalBins - alignedStart);
@@ -1144,6 +1242,34 @@ void QtMainWindow::handleWaveformRegionRequest(bool deckIsA, double startSec, do
         return;
     }
 
+    // Determine if requested region is outside or far from current cached window
+    const bool outsideLeft = endBin <= session.cachedStartBin;
+    const bool outsideRight = startBin >= session.cachedEndBin;
+    const bool farFromCached = (outsideLeft || outsideRight) ||
+        (std::min(std::abs(alignedStart - session.cachedStartBin), std::abs(alignedStart - session.cachedEndBin)) > session.chunkBinSize * 2);
+
+    if (farFromCached) {
+        // Jump directly to requested region: schedule that chunk and a neighbor forward for faster fill-in
+        auto scheduleIfNeeded = [&](int chunkStart){
+            if (chunkStart < 0 || chunkStart >= session.totalBins) return;
+            if (!session.pendingChunks.contains(chunkStart)) {
+                session.pendingChunks.insert(chunkStart);
+                const int count = std::min(session.chunkBinSize, session.totalBins - chunkStart);
+                scheduleWaveformChunk(deckIsA, chunkStart, count);
+            }
+        };
+        // First, schedule a small micro-chunk centered on the request to get instant pixels
+        if (!session.pendingChunks.contains(microStart)) {
+            session.pendingChunks.insert(microStart);
+            const int count = std::min(microSize, session.totalBins - microStart);
+            scheduleWaveformChunk(deckIsA, microStart, count);
+        }
+        scheduleIfNeeded(alignedStart);
+        scheduleIfNeeded(std::min(session.totalBins, alignedStart + session.chunkBinSize));
+        return;
+    }
+
+    // Otherwise, extend cache progressively toward the requested region as before
     if (startBin < session.cachedStartBin) {
         const int nextStart = std::max(0, session.cachedStartBin - session.chunkBinSize);
         if (!session.pendingChunks.contains(nextStart) && session.cachedStartBin > 0) {
@@ -1166,7 +1292,7 @@ void QtMainWindow::handleWaveformRegionRequest(bool deckIsA, double startSec, do
 
 void QtMainWindow::scheduleWaveformChunk(bool deckIsA, int startBin, int binCount)
 {
-    if (!bpmThreadPool || binCount <= 0) {
+    if (!waveformThreadPool || binCount <= 0) {
         return;
     }
 
@@ -1187,7 +1313,7 @@ void QtMainWindow::scheduleWaveformChunk(bool deckIsA, int startBin, int binCoun
                                             session.totalBins,
                                             startBin,
                                             binCount);
-    bpmThreadPool->start(task);
+    waveformThreadPool->start(task);
 }
 
 void QtMainWindow::handleWaveformChunkResult(bool deckIsA,
@@ -1195,7 +1321,10 @@ void QtMainWindow::handleWaveformChunkResult(bool deckIsA,
                                              int startBin,
                                              std::shared_ptr<std::vector<float>> maxBins,
                                              std::shared_ptr<std::vector<float>> minBins,
-                                             bool success)
+                                             bool success,
+                                             std::shared_ptr<std::vector<float>> lowBins,
+                                             std::shared_ptr<std::vector<float>> midBins,
+                                             std::shared_ptr<std::vector<float>> highBins)
 {
     WaveformStreamSession& session = deckIsA ? streamSessionA : streamSessionB;
     session.pendingChunks.remove(startBin);
@@ -1231,7 +1360,14 @@ void QtMainWindow::handleWaveformChunkResult(bool deckIsA,
     const bool wasEmpty = !session.hasCache;
     const int chunkSize = static_cast<int>(maxBins->size());
 
-    wf->appendStreamBins(startBin, *maxBins, *minBins, false);
+    if (lowBins && midBins && highBins &&
+        lowBins->size() == maxBins->size() &&
+        midBins->size() == maxBins->size() &&
+        highBins->size() == maxBins->size()) {
+        wf->appendStreamBins(startBin, *maxBins, *minBins, *lowBins, *midBins, *highBins, false);
+    } else {
+        wf->appendStreamBins(startBin, *maxBins, *minBins, false);
+    }
     wf->setAnalysisFailed(false);
 
     const auto range = wf->getCachedBinRange();

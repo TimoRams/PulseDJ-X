@@ -117,7 +117,7 @@ void LibraryTableModel::sort(int column, Qt::SortOrder order)
 
 QStringList LibraryTableModel::mimeTypes() const
 {
-    return QStringList() << "text/uri-list";
+    return { QStringLiteral("text/uri-list") };
 }
 
 QMimeData* LibraryTableModel::mimeData(const QModelIndexList& indexes) const
@@ -131,7 +131,9 @@ QMimeData* LibraryTableModel::mimeData(const QModelIndexList& indexes) const
             rows.insert(index.row());
         }
     }
-    
+
+    urls.reserve(rows.size());
+
     for (int row : rows) {
         if (row < filteredTracks.size()) {
             const TrackInfo* track = filteredTracks[row];
@@ -200,7 +202,7 @@ void LibraryTableModel::setSortMode(SortMode mode, Qt::SortOrder order)
 
 void LibraryTableModel::setFilterText(const QString& filter)
 {
-    filterText = filter.toLower();
+    filterText = filter;
     updateFilteredTracks();
 }
 
@@ -223,14 +225,15 @@ void LibraryTableModel::clearPlaylistFilter()
 void LibraryTableModel::updateFilteredTracks()
 {
     beginResetModel();
-    
+
     filteredTracks.clear();
+    filteredTracks.reserve(allTracks.size());
     for (const auto& track : allTracks) {
         if (matchesFilter(track)) {
             filteredTracks.push_back(&track);
         }
     }
-    
+
     sortFilteredTracks();
     endResetModel();
 }
@@ -249,33 +252,34 @@ bool LibraryTableModel::matchesFilter(const TrackInfo& track) const
         return false;
 
     if (filterText.isEmpty()) return true;
-    
-    return track.getDisplayTitle().toLower().contains(filterText) ||
-           track.getDisplayArtist().toLower().contains(filterText) ||
-           track.album.toLower().contains(filterText) ||
-           track.genre.toLower().contains(filterText) ||
-           track.year.toLower().contains(filterText) ||
-           track.comment.toLower().contains(filterText) ||
-           track.key.toLower().contains(filterText);
+
+    const auto& f = filterText;
+    return track.getDisplayTitle().contains(f, Qt::CaseInsensitive) ||
+           track.getDisplayArtist().contains(f, Qt::CaseInsensitive) ||
+           track.album.contains(f, Qt::CaseInsensitive) ||
+           track.genre.contains(f, Qt::CaseInsensitive) ||
+           track.year.contains(f, Qt::CaseInsensitive) ||
+           track.comment.contains(f, Qt::CaseInsensitive) ||
+           track.key.contains(f, Qt::CaseInsensitive);
 }
 
 bool LibraryTableModel::isLessThan(const TrackInfo* a, const TrackInfo* b) const
 {
     if (!a || !b) return false;
-    
+
     switch (currentSortMode) {
         case SortByTitle:
-            return a->getDisplayTitle().toLower() < b->getDisplayTitle().toLower();
+            return QString::compare(a->getDisplayTitle(), b->getDisplayTitle(), Qt::CaseInsensitive) < 0;
         case SortByArtist:
-            return a->getDisplayArtist().toLower() < b->getDisplayArtist().toLower();
+            return QString::compare(a->getDisplayArtist(), b->getDisplayArtist(), Qt::CaseInsensitive) < 0;
         case SortByAlbum:
-            return a->album.toLower() < b->album.toLower();
+            return QString::compare(a->album, b->album, Qt::CaseInsensitive) < 0;
         case SortByDuration:
             return a->duration < b->duration;
         case SortByBpm:
             return a->bpm < b->bpm;
         case SortByGenre:
-            return a->genre.toLower() < b->genre.toLower();
+            return QString::compare(a->genre, b->genre, Qt::CaseInsensitive) < 0;
         case SortByYear:
             return a->year < b->year;
         case SortByFileSize:

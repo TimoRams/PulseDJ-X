@@ -6,11 +6,6 @@
 #include <QDirIterator>
 #include <QStandardPaths>
 #include <QSettings>
-#include <QSortFilterProxyModel>
-#include <QUrl>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
 #include <QSplitter>
 #include <QFrame>
 #include <QTreeView>
@@ -18,27 +13,43 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QAbstractButton>
 #include <QComboBox>
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QToolButton>
 #include <QMenu>
-#include <QFile>
-#include <QHash>
+#include <QFileInfo>
 #include <QItemSelectionModel>
-#include <QRegularExpression>
-#include <QLocale>
 #include <QInputDialog>
 #include <QSignalBlocker>
-#include <QTabBar>
 #include <QStyle>
+#include <QHeaderView>
+#include <QDateTime>
 #include <optional>
-#include <cstring>
-#include <cmath>
-#include <iostream>
-#include <QDebug>
 #include <algorithm>
+
+namespace {
+// Centralized supported audio extensions and name filters reused across the library.
+[[nodiscard]] static const QSet<QString>& supportedExtensionsSet() {
+    static const QSet<QString> exts = QSet<QString>{
+        QStringLiteral("mp3"), QStringLiteral("wav"), QStringLiteral("flac"),
+        QStringLiteral("aac"), QStringLiteral("ogg"), QStringLiteral("m4a")
+    };
+    return exts;
+}
+
+[[nodiscard]] static const QStringList& supportedNameFilters() {
+    static const QStringList filters = QStringList{
+        QStringLiteral("*.mp3"), QStringLiteral("*.wav"), QStringLiteral("*.flac"),
+        QStringLiteral("*.aac"), QStringLiteral("*.ogg"), QStringLiteral("*.m4a")
+    };
+    return filters;
+}
+
+[[nodiscard]] inline bool isSupportedAudioFile(const QFileInfo& info) {
+    return info.exists() && info.isFile() && supportedExtensionsSet().contains(info.suffix().toLower());
+}
+}
 
 LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget* parent)
     : QWidget(parent),
@@ -46,8 +57,7 @@ LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget*
       fileSystemTree(nullptr),
       fileSystemModel(nullptr),
       tableView(nullptr),
-      model(nullptr),
-      sortComboBox(nullptr),
+    model(nullptr),
       filterLineEdit(nullptr),
       actionAddFiles(nullptr),
       actionAddFolder(nullptr),
@@ -107,48 +117,71 @@ LibraryManager::~LibraryManager()
         loaderThread = nullptr;
     }
 }
-#include <QDateTime>
 
 void LibraryManager::setupUI()
 {
-    setStyleSheet(
-        "QWidget { background-color: #101114; color: #f0f0f0; font-family: 'Lato', 'Arial', sans-serif; }"
-        "QSplitter::handle { background-color: #23262e; }"
-        "QSplitter::handle:horizontal { width: 2px; }"
-        "#libraryIconSidebar { background: #0c0d10; border-right: 1px solid #23262e; }"
-        "QToolButton[sidebarButton=\"true\"] { background: transparent; border: none; padding: 8px; margin: 0; icon-size: 22px; }"
-        "QToolButton[sidebarButton=\"true\"]:hover { background: rgba(66,133,244,0.18); border-radius: 8px; }"
-        "QToolButton[sidebarButton=\"true\"]:checked { background: rgba(66,133,244,0.28); border-radius: 8px; }"
-        "#libraryMiddlePanel { background: #14161a; border-right: 1px solid #262931; }"
-        "#navigationHeaderLabel { font-weight: 600; font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: #8b92a3; }"
-        "QTabWidget::pane { border: none; }"
-        "QTabBar::tab { background: transparent; color: #a8acb3; padding: 7px 6px; margin: 1px; border-radius: 7px; min-width: 70px; font-size: 9px; font-weight: 600; }"
-        "QTabBar::tab:selected { background: #2f6ae0; color: #ffffff; }"
-        "#libraryToolbar { background: #14171d; border: 1px solid #242832; border-radius: 8px; }"
-        "#librarySearchContainer { background: #1a1d24; border: 1px solid #2b303c; border-radius: 6px; }"
-        "#librarySearchContainer QLabel { color: #8b92a3; }"
-        "#libraryFooterBar { background: #14171d; border: 1px solid #242832; border-radius: 8px; }"
-        "QToolButton[class=\"primaryAction\"] { background: #1b1f27; border: 1px solid #2b303c; border-radius: 6px; padding: 3px 6px; font-size: 9px; min-width: 0px; min-height: 24px; color: #d8dce8; }"
-        "QToolButton[class=\"primaryAction\"]:hover { border-color: #3c7cff; color: #ffffff; }"
-        "QToolButton[class=\"primaryAction\"]:pressed { background: #161a21; }"
-        "#filterCaption { color: #9aa3b5; font-size: 9px; font-weight: 600; padding-right: 2px; }"
-        "#searchIcon { color: #7f8899; padding-right: 4px; }"
-        "QLineEdit { background-color: #1f232c; border: 1px solid #323845; padding: 3px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; }"
-        "QLineEdit:focus { border-color: #4188ff; }"
-        "#librarySearchContainer QLineEdit { background: transparent; border: none; padding: 0; font-size: 9px; }"
-        "#librarySearchContainer QLineEdit:focus { border: none; }"
-        "QComboBox { background-color: #1f232c; border: 1px solid #323845; padding: 2px 6px; font-size: 9px; color: #e5e9f0; border-radius: 5px; min-width: 96px; }"
-        "QComboBox::drop-down { border: none; }"
-        "QTreeWidget { background-color: transparent; border: none; }"
-        "QTreeWidget::item { height: 20px; color: #d8dce8; }"
-        "QTreeWidget::item:selected { background: #2f6ae0; border-radius: 5px; color: #ffffff; }"
-        "QTreeWidget::item:hover { background: rgba(47,106,224,0.16); border-radius: 5px; }"
-        "QTableView { font-size: 10px; background: #0f1014; alternate-background-color: #15171d; selection-background-color: #2f6ae0; border: none; gridline-color: #1f232c; }"
-        "QHeaderView::section { font-weight: 600; font-size: 9px; background: #181b22; color: #d8dce8; border: none; padding: 4px 3px; }"
-        "QTableView::item { padding-left: 5px; padding-right: 5px; }"
-        "QProgressBar { height: 9px; background: #1f232c; border: 1px solid #323845; border-radius: 4px; }"
-        "QProgressBar::chunk { background: #4188ff; border-radius: 4px; }"
-    );
+    static constexpr auto kLibraryStyleSheet = 
+        "QWidget{background:#101114;color:#f0f0f0}"
+        "QSplitter::handle{background:#23262e;width:2px}"
+        /* Menus (dropdowns) fully square and compact */
+        "QMenu{background:#181b22;border:1px solid #242832;border-radius:0px;padding:0}"
+        "QMenu::item{padding:4px 8px;color:#d8dce8;background:transparent;border-radius:0px}"
+        "QMenu::item:selected{background:#2f6ae0;color:#fff}"
+        "QMenu::separator{height:1px;margin:4px 6px;background:#242832}"
+        /* Split-button (menu button) square with no extra rounding */
+        "QToolButton::menu-button{border:none;border-left:1px solid #2b303c;width:14px;margin:0;padding:0;border-radius:0px}"
+        "QToolButton::menu-button:hover{background:rgba(66,133,244,0.18)}"
+        "QToolButton::menu-button:pressed{background:#161a21}"
+        "QToolButton::menu-indicator{image:none;width:0px;height:0px}"
+        /* Side panels square */
+        "#libraryIconSidebar{background:#0c0d10;border:1px solid #23262e;border-radius:0px}"
+    "QToolButton[sidebarButton=\"true\"]{background:transparent;border:none;padding:2px;icon-size:14px;border-radius:0px}"
+        "QToolButton[sidebarButton=\"true\"]:hover{background:rgba(66,133,244,0.18)}"
+        "QToolButton[sidebarButton=\"true\"]:checked{background:rgba(66,133,244,0.28)}"
+        "#libraryMiddlePanel{background:#14161a;border:1px solid #262931;border-radius:0px}"
+        "#navigationHeaderLabel{font-weight:600;font-size:10px;letter-spacing:0.8px;text-transform:uppercase;color:#8b92a3}"
+        "QTabWidget::pane{border:none}"
+        "QTabBar::tab{background:transparent;color:#a8acb3;padding:7px 6px;margin:1px;border-radius:0px;min-width:70px;font-size:9px;font-weight:600}"
+        "QTabBar::tab:selected{background:#2f6ae0;color:#fff}"
+        /* Toolbar & search */
+        "#libraryToolbar{background:#14171d;border:1px solid #242832;border-radius:0px}"
+        "#librarySearchContainer{background:#1a1d24;border:1px solid #2b303c;border-radius:0px}"
+        "#librarySearchContainer QLabel{color:#8b92a3}"
+        "#libraryFooterBar{background:#14171d;border:1px solid #242832;border-radius:0px}"
+        "QToolButton[class=\"primaryAction\"]{background:#1b1f27;border:1px solid #2b303c;border-radius:0px;padding:3px 6px;margin:0;font-size:9px;min-height:24px;color:#d8dce8}"
+        "QToolButton[class=\"primaryAction\"]:hover{border-color:#3c7cff;color:#fff}"
+        "QToolButton[class=\"primaryAction\"]:pressed{background:#161a21}"
+        /* Search and filter */
+        "#filterCaption{color:#9aa3b5;font-size:9px;font-weight:600;padding-right:2px}"
+        "#searchIcon{color:#7f8899;padding-right:4px}"
+        "QLineEdit{background:#1f232c;border:1px solid #323845;padding:3px 6px;font-size:9px;color:#e5e9f0;border-radius:0px}"
+        "QLineEdit:focus{border-color:#4188ff}"
+        "#librarySearchContainer QLineEdit{background:transparent;border:none;padding:0;font-size:9px;border-radius:0px}"
+        "QComboBox{background:#1f232c;border:1px solid #323845;padding:2px 6px;font-size:9px;color:#e5e9f0;border-radius:0px;min-width:96px}"
+        "QComboBox::drop-down{border:none}"
+        "QComboBox QAbstractItemView{background:#181b22;border:1px solid #242832;border-radius:0px;selection-background-color:#2f6ae0;outline:0}"
+        /* Sidebar trees and playlist trees */
+        "QTreeWidget{background:transparent;border:none}"
+        "QTreeWidget::viewport{border-radius:0px}"
+        "QTreeWidget::item{height:20px;color:#d8dce8}"
+        "QTreeWidget::item:selected{background:#2f6ae0;border-radius:0px;color:#fff}"
+        "QTreeWidget::item:hover{background:rgba(47,106,224,0.16);border-radius:0px}"
+        /* Primary action buttons */
+        "QToolButton[class=\"primaryAction\"]{background:#1b1f27;border:1px solid #2b303c;border-radius:0px;padding:3px 6px;margin:0;font-size:9px;min-height:24px;color:#d8dce8}"
+        "QToolButton[class=\"primaryAction\"]:hover{border-color:#3c7cff;color:#fff}"
+        "QToolButton[class=\"primaryAction\"]:pressed{background:#161a21}"
+        /* Table view square */
+        "QTableView{font-size:10px;background:#0f1014;alternate-background-color:#15171d;selection-background-color:#2f6ae0;border:1px solid #242832;border-radius:0px;gridline-color:#1f232c}"
+        "QTableView::viewport{border-radius:0px}"
+        "QHeaderView::section{font-weight:600;font-size:9px;background:#181b22;color:#d8dce8;border:none;padding:4px 3px;border-top-left-radius:0px;border-top-right-radius:0px}"
+        "QTableView::item{padding-left:5px;padding-right:5px}"
+        /* Footer */
+        "#libraryFooterBar{background:#14171d;border:1px solid #242832;border-radius:0px}"
+        /* Progress bars */
+        "QProgressBar{height:9px;background:#1f232c;border:1px solid #323845;border-radius:0px}"
+        "QProgressBar::chunk{background:#4188ff;border-radius:0px}";
+    
+    setStyleSheet(QLatin1String(kLibraryStyleSheet));
 
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(5);
@@ -158,13 +191,12 @@ void LibraryManager::setupUI()
     mainSplitter->setChildrenCollapsible(false);
     mainSplitter->setHandleWidth(2);
 
-    // === LEFT ICON SIDEBAR ===
     iconSidebar = new QWidget(mainSplitter);
     iconSidebar->setObjectName("libraryIconSidebar");
-    iconSidebar->setFixedWidth(60);
+    iconSidebar->setFixedWidth(24);
     auto* iconLayout = new QVBoxLayout(iconSidebar);
-    iconLayout->setContentsMargins(10, 14, 10, 14);
-    iconLayout->setSpacing(10);
+    iconLayout->setContentsMargins(4, 6, 4, 6);
+    iconLayout->setSpacing(4);
 
     sidebarButtonGroup = new QButtonGroup(iconSidebar);
     sidebarButtonGroup->setExclusive(true);
@@ -185,19 +217,18 @@ void LibraryManager::setupUI()
 
     connect(sidebarButtonGroup, QOverload<int>::of(&QButtonGroup::idClicked), this, &LibraryManager::onSidebarSectionChanged);
 
-    // === MIDDLE PANEL: CONTEXTUAL NAVIGATION ===
     auto* middlePanel = new QWidget(mainSplitter);
     middlePanel->setObjectName("libraryMiddlePanel");
-    middlePanel->setMinimumWidth(240);
-    middlePanel->setMaximumWidth(360);
+    middlePanel->setMinimumWidth(180);
+    middlePanel->setMaximumWidth(280);
     auto* middleLayout = new QVBoxLayout(middlePanel);
-    middleLayout->setContentsMargins(6, 6, 6, 6);
-    middleLayout->setSpacing(6);
+    middleLayout->setContentsMargins(4, 4, 4, 4);
+    middleLayout->setSpacing(4);
 
     navigationHeader = new QWidget(middlePanel);
     auto* navHeaderLayout = new QHBoxLayout(navigationHeader);
     navHeaderLayout->setContentsMargins(0, 0, 0, 0);
-    navHeaderLayout->setSpacing(6);
+    navHeaderLayout->setSpacing(4);
     navigationTitleLabel = new QLabel(tr("Collection"), navigationHeader);
     navigationTitleLabel->setObjectName("navigationHeaderLabel");
     addPlaylistButton = new QToolButton(navigationHeader);
@@ -218,7 +249,7 @@ void LibraryManager::setupUI()
     collectionTree->setHeaderHidden(true);
     collectionTree->setIndentation(18);
     collectionTree->setUniformRowHeights(true);
-    collectionTree->setAnimated(true);
+    collectionTree->setAnimated(false);
     collectionTree->setSelectionMode(QAbstractItemView::SingleSelection);
 
     playlistPanel = new QWidget(navigationStack);
@@ -230,7 +261,7 @@ void LibraryManager::setupUI()
     navigationTree->setHeaderHidden(true);
     navigationTree->setIndentation(18);
     navigationTree->setUniformRowHeights(true);
-    navigationTree->setAnimated(true);
+    navigationTree->setAnimated(false);
     navigationTree->setSelectionMode(QAbstractItemView::SingleSelection);
     navigationTree->setContextMenuPolicy(Qt::CustomContextMenu);
     navigationTree->setFocusPolicy(Qt::StrongFocus);
@@ -240,7 +271,7 @@ void LibraryManager::setupUI()
     explorationPanel = new QWidget(navigationStack);
     auto* explorerLayout = new QVBoxLayout(explorationPanel);
     explorerLayout->setContentsMargins(0, 0, 0, 0);
-    explorerLayout->setSpacing(4);
+    explorerLayout->setSpacing(3);
     auto* explorerLabel = new QLabel(tr("Folders"), explorationPanel);
     explorerLabel->setStyleSheet("font-weight: 600; font-size: 9px; color: #8b92a3; padding-left: 4px;");
     explorerContainer = new QWidget(explorationPanel);
@@ -272,34 +303,20 @@ void LibraryManager::setupUI()
 
     middleLayout->addWidget(navigationStack, 1);
 
-    // === RIGHT PANEL: Track Table ===
     auto* rightPanel = new QWidget();
     auto* rightLayout = new QVBoxLayout(rightPanel);
     rightLayout->setContentsMargins(0, 0, 0, 0);
-    rightLayout->setSpacing(6);
+    rightLayout->setSpacing(4);
 
-    // Sort combo is now exposed in filter row
-    sortComboBox = new QComboBox(rightPanel);
-    sortComboBox->addItem("Title", LibraryTableModel::SortByTitle);
-    sortComboBox->addItem("Artist", LibraryTableModel::SortByArtist);
-    sortComboBox->addItem("Album", LibraryTableModel::SortByAlbum);
-    sortComboBox->addItem("Duration", LibraryTableModel::SortByDuration);
-    sortComboBox->addItem("BPM", LibraryTableModel::SortByBpm);
-    sortComboBox->addItem("Genre", LibraryTableModel::SortByGenre);
-    sortComboBox->addItem("Year", LibraryTableModel::SortByYear);
-    sortComboBox->addItem("File Size", LibraryTableModel::SortByFileSize);
-    sortComboBox->setMinimumWidth(108);
-    sortComboBox->setFixedHeight(22);
-    connect(sortComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &LibraryManager::onSortModeChanged);
+    
 
-    // Actions
     actionAddFiles = new QAction(QIcon::fromTheme("list-add"), "Add Files", this);
     actionAddFolder = new QAction(QIcon::fromTheme("folder-open"), "Add Folder", this);
     actionRefresh = new QAction(QIcon::fromTheme("view-refresh"), "Refresh", this);
     actionClearLibrary = new QAction(QIcon::fromTheme("edit-delete"), "Clear Library", this);
-    actionAnalyzeTrack = new QAction(QIcon::fromTheme("view-statistics"), tr("Analyze Track"), this);
+    actionAnalyzeTrack = new QAction(QIcon::fromTheme("view-statistics"), tr("Analyze BPM"), this);
     actionAnalyzeTrack->setEnabled(false);
-    actionAnalyzeAdvanced = new QAction(QIcon::fromTheme("tools-wizard"), tr("Analyze (adv)"), this);
+    actionAnalyzeAdvanced = new QAction(QIcon::fromTheme("tools-wizard"), tr("Advanced Analysis..."), this);
     actionAnalyzeAdvanced->setEnabled(false);
     connect(actionAddFiles, &QAction::triggered, this, &LibraryManager::onAddFilesClicked);
     connect(actionAddFolder, &QAction::triggered, this, &LibraryManager::onAddFolderClicked);
@@ -315,14 +332,13 @@ void LibraryManager::setupUI()
         if (selected.isEmpty())
             return;
 
-        struct Preset { QString label; double minBpm; double maxBpm; };
-        const QVector<Preset> presets = {
-            {tr("78–155 BPM"), 78.0, 155.0},
-            {tr("70–140 BPM"), 70.0, 140.0},
-            {tr("90–180 BPM"), 90.0, 180.0},
-            {tr("100–200 BPM"), 100.0, 200.0},
-            {tr("120–240 BPM"), 120.0, 240.0}
-        };
+        constexpr std::array<std::pair<const char*, std::pair<double, double>>, 5> presets = {{
+            {"78–155 BPM", {78.0, 155.0}},
+            {"70–140 BPM", {70.0, 140.0}},
+            {"90–180 BPM", {90.0, 180.0}},
+            {"100–200 BPM", {100.0, 200.0}},
+            {"120–240 BPM", {120.0, 240.0}}
+        }};
 
         QDialog dialog(this);
         dialog.setWindowTitle(tr("Advanced Analysis"));
@@ -332,15 +348,14 @@ void LibraryManager::setupUI()
         layout->setContentsMargins(16, 16, 16, 16);
         layout->setSpacing(12);
 
-        auto* label = new QLabel(tr("Select a BPM range preset:"), &dialog);
-        label->setWordWrap(true);
+        auto* label = new QLabel(tr("Select BPM range:"), &dialog);
         layout->addWidget(label);
 
         auto* presetCombo = new QComboBox(&dialog);
-        for (const auto& preset : presets) {
-            QVariantList range;
-            range << preset.minBpm << preset.maxBpm;
-            presetCombo->addItem(preset.label, range);
+        for (const auto& [name, range] : presets) {
+            QVariantList list;
+            list << range.first << range.second;
+            presetCombo->addItem(tr(name), list);
         }
         presetCombo->setCurrentIndex(0);
         layout->addWidget(presetCombo);
@@ -354,26 +369,18 @@ void LibraryManager::setupUI()
         if (dialog.exec() != QDialog::Accepted)
             return;
 
-        const QVariant data = presetCombo->currentData();
-        double minBpm = 78.0;
-        double maxBpm = 155.0;
-        if (data.canConvert<QVariantList>()) {
-            const auto list = data.toList();
-            if (list.size() == 2) {
-                minBpm = list.at(0).toDouble();
-                maxBpm = list.at(1).toDouble();
-            }
-        }
+        const auto data = presetCombo->currentData().toList();
+        const double minBpm = data.size() == 2 ? data[0].toDouble() : 78.0;
+        const double maxBpm = data.size() == 2 ? data[1].toDouble() : 155.0;
 
         emit analyzeTracksAdvancedRequested(selected, minBpm, maxBpm);
     });
 
-    // Compact toolbar with search, sort and actions
     auto* toolbar = new QFrame(rightPanel);
     toolbar->setObjectName("libraryToolbar");
     auto* toolbarLayout = new QHBoxLayout(toolbar);
-    toolbarLayout->setContentsMargins(10, 6, 10, 6);
-    toolbarLayout->setSpacing(6);
+    toolbarLayout->setContentsMargins(8, 4, 8, 4);
+    toolbarLayout->setSpacing(4);
 
     auto makeActionButton = [toolbar](QAction* action, const QString& tooltip) {
         auto* button = new QToolButton(toolbar);
@@ -393,8 +400,8 @@ void LibraryManager::setupUI()
     auto* searchContainer = new QFrame(toolbar);
     searchContainer->setObjectName("librarySearchContainer");
     auto* searchLayout = new QHBoxLayout(searchContainer);
-    searchLayout->setContentsMargins(8, 0, 8, 0);
-    searchLayout->setSpacing(4);
+    searchLayout->setContentsMargins(6, 0, 6, 0);
+    searchLayout->setSpacing(3);
     auto* searchIcon = new QLabel(searchContainer);
     searchIcon->setObjectName("searchIcon");
     searchIcon->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
@@ -419,53 +426,80 @@ void LibraryManager::setupUI()
     searchLayout->addWidget(filterLineEdit, 1);
     searchContainer->setLayout(searchLayout);
 
-    auto* sortContainer = new QWidget(toolbar);
-    auto* sortLayout = new QHBoxLayout(sortContainer);
-    sortLayout->setContentsMargins(0, 0, 0, 0);
-    sortLayout->setSpacing(4);
-    auto* sortLabel = new QLabel(tr("Sort"), sortContainer);
-    sortLabel->setObjectName("filterCaption");
-    sortLayout->addWidget(sortLabel, 0, Qt::AlignVCenter);
-    sortLayout->addWidget(sortComboBox, 0, Qt::AlignVCenter);
-    sortContainer->setLayout(sortLayout);
+    
 
     auto* actionContainer = new QWidget(toolbar);
     auto* actionLayout = new QHBoxLayout(actionContainer);
     actionLayout->setContentsMargins(0, 0, 0, 0);
-    actionLayout->setSpacing(4);
-    auto* addFilesBtn = makeActionButton(actionAddFiles, tr("Import individual tracks"));
-    auto* addFolderBtn = makeActionButton(actionAddFolder, tr("Scan an entire folder"));
-    auto* refreshBtn = makeActionButton(actionRefresh, tr("Reload metadata and playlists"));
-    auto* clearBtn = makeActionButton(actionClearLibrary, tr("Remove everything from the library"));
-    auto* analyzeColumn = new QWidget(actionContainer);
-    auto* analyzeLayout = new QVBoxLayout(analyzeColumn);
-    analyzeLayout->setContentsMargins(0, 0, 0, 0);
-    analyzeLayout->setSpacing(2);
-    auto* analyzeBtn = makeActionButton(actionAnalyzeTrack, tr("Analyze BPM and beatgrid for selected tracks"));
-    auto* analyzeAdvBtn = makeActionButton(actionAnalyzeAdvanced, tr("Analyze with BPM range presets"));
-    analyzeAdvBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    analyzeLayout->addWidget(analyzeBtn);
-    analyzeLayout->addWidget(analyzeAdvBtn);
-    analyzeColumn->setLayout(analyzeLayout);
+    actionLayout->setSpacing(2);
+    
+    // Import button with dropdown menu
+    auto* importBtn = new QToolButton(toolbar);
+    importBtn->setDefaultAction(actionAddFiles);
+    importBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    importBtn->setIconSize(QSize(12, 12));
+    importBtn->setCursor(Qt::PointingHandCursor);
+    importBtn->setAutoRaise(false);
+    importBtn->setProperty("class", "primaryAction");
+    importBtn->setMinimumHeight(24);
+    importBtn->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    importBtn->setPopupMode(QToolButton::MenuButtonPopup);
+    
+    auto* importMenu = new QMenu(importBtn);
+    importMenu->addAction(actionAddFiles);
+    importMenu->addAction(actionAddFolder);
+    importBtn->setMenu(importMenu);
+    
+    // Analyze button with dropdown menu
+    auto* analyzeBtn = new QToolButton(toolbar);
+    analyzeBtn->setDefaultAction(actionAnalyzeTrack);
+    analyzeBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    analyzeBtn->setIconSize(QSize(12, 12));
+    analyzeBtn->setCursor(Qt::PointingHandCursor);
+    analyzeBtn->setAutoRaise(false);
+    analyzeBtn->setProperty("class", "primaryAction");
+    analyzeBtn->setMinimumHeight(24);
+    analyzeBtn->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    analyzeBtn->setPopupMode(QToolButton::MenuButtonPopup);
+    
+    auto* analyzeMenu = new QMenu(analyzeBtn);
+    analyzeMenu->addAction(actionAnalyzeTrack);
+    analyzeMenu->addAction(actionAnalyzeAdvanced);
+    analyzeBtn->setMenu(analyzeMenu);
+    
+    auto* refreshBtn = makeActionButton(actionRefresh, tr("Refresh"));
+    auto* clearBtn = makeActionButton(actionClearLibrary, tr("Clear"));
 
-    actionLayout->addWidget(addFilesBtn);
-    actionLayout->addWidget(addFolderBtn);
-    actionLayout->addWidget(analyzeColumn);
+    actionLayout->addWidget(importBtn);
+    actionLayout->addWidget(analyzeBtn);
     actionLayout->addWidget(refreshBtn);
     actionLayout->addWidget(clearBtn);
     actionContainer->setLayout(actionLayout);
 
     toolbarLayout->addWidget(searchContainer, 1);
-    toolbarLayout->addWidget(sortContainer, 0);
     toolbarLayout->addStretch(1);
     toolbarLayout->addWidget(actionContainer, 0, Qt::AlignRight);
 
     rightLayout->addWidget(toolbar);
     
-    // Table view
     model = new LibraryTableModel(rightPanel);
     tableView = new LibraryTableView(rightPanel);
     tableView->setModel(model);
+    // Table behavior: make columns user-resizable and movable. Title column stretches by default.
+    tableView->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tableView->setAlternatingRowColors(true);
+    tableView->setShowGrid(false);
+    if (tableView->horizontalHeader()) {
+        auto* hh = tableView->horizontalHeader();
+        hh->setSectionsMovable(true);
+        hh->setSectionsClickable(true);
+        hh->setHighlightSections(false);
+        hh->setDefaultSectionSize(120);
+        hh->setStretchLastSection(false);
+        hh->setSectionResizeMode(QHeaderView::Interactive);
+        // Keep title column dominant
+        hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
+    }
     tableView->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(tableView, &QWidget::customContextMenuRequested, this, &LibraryManager::onContextMenuRequested);
     // Restore previously saved column sizes/order if available
@@ -474,10 +508,10 @@ void LibraryManager::setupUI()
     connect(tableView, &QTableView::doubleClicked, this, &LibraryManager::onTableDoubleClicked);
     connect(tableView->selectionModel(), &QItemSelectionModel::selectionChanged, this, &LibraryManager::onSelectionChanged);
     
-    // Status and progress for right panel
     analysisStatusLabel = new QLabel(tr("Analysis idle"), rightPanel);
     analysisStatusLabel->setStyleSheet("QLabel { color: #a0a0a0; }");
     analysisStatusLabel->setVisible(true);
+    analysisStatusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     analysisProgressBar = new QProgressBar(rightPanel);
     analysisProgressBar->setRange(0, 100);
     analysisProgressBar->setValue(0);
@@ -486,26 +520,27 @@ void LibraryManager::setupUI()
     analysisProgressBar->setEnabled(false);
     analysisProgressBar->setVisible(true);
     analysisProgressBar->setFixedHeight(12);
+    analysisProgressBar->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
 
     auto* footerBar = new QFrame(rightPanel);
     footerBar->setObjectName("libraryFooterBar");
     auto* footerLayout = new QHBoxLayout(footerBar);
     footerLayout->setContentsMargins(8, 4, 8, 4);
     footerLayout->setSpacing(6);
-    statusLabel = new QLabel("Ready", footerBar);
+    statusLabel = new QLabel(QStringLiteral("Ready"), footerBar);
+    statusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     progressBar = new QProgressBar(footerBar);
     progressBar->setVisible(false);
+    progressBar->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
     footerLayout->addWidget(statusLabel, 1);
     footerLayout->addWidget(progressBar, 0);
     footerLayout->addSpacing(6);
     footerLayout->addWidget(analysisStatusLabel, 0);
     footerLayout->addWidget(analysisProgressBar, 0);
 
-    // Assemble right panel
     rightLayout->addWidget(tableView, 1);
     rightLayout->addWidget(footerBar);
 
-    // Add sections to splitter
     mainSplitter->addWidget(iconSidebar);
     mainSplitter->addWidget(middlePanel);
     mainSplitter->addWidget(rightPanel);
@@ -513,9 +548,8 @@ void LibraryManager::setupUI()
     mainSplitter->setStretchFactor(0, 0);
     mainSplitter->setStretchFactor(1, 0);
     mainSplitter->setStretchFactor(2, 1);
-    mainSplitter->setSizes({60, 280, 720});
+    mainSplitter->setSizes({24, 220, 820});
 
-    // Add splitter to main layout
     mainLayout->addWidget(mainSplitter);
 
     connect(addPlaylistButton, &QToolButton::clicked, this, &LibraryManager::onAddPlaylistClicked);
@@ -699,25 +733,19 @@ void LibraryManager::onSidebarSectionChanged(int sectionId)
 
 void LibraryManager::setupFileSystemModel()
 {
-    // Create file system model for browsing
     fileSystemModel = new QFileSystemModel(this);
     fileSystemModel->setRootPath(QDir::rootPath());
-    
-    // Set name filters for audio files
-    QStringList nameFilters;
-    nameFilters << "*.mp3" << "*.wav" << "*.flac" << "*.aac" << "*.ogg" << "*.m4a";
-    fileSystemModel->setNameFilters(nameFilters);
+    fileSystemModel->setNameFilters(supportedNameFilters());
     fileSystemModel->setNameFilterDisables(false);
     
-    // Set the model to the tree view
     fileSystemTree->setModel(fileSystemModel);
+    fileSystemTree->setUniformRowHeights(true);
+    fileSystemTree->setAnimated(false);
     
-    // Hide size, type, and date columns - only show name
     fileSystemTree->hideColumn(1); // Size
     fileSystemTree->hideColumn(2); // Type
     fileSystemTree->hideColumn(3); // Date Modified
     
-    // Set root to Music directory by default
     QString musicPath = QStandardPaths::writableLocation(QStandardPaths::MusicLocation);
     if (QDir(musicPath).exists()) {
         QModelIndex musicIndex = fileSystemModel->index(musicPath);
@@ -725,11 +753,9 @@ void LibraryManager::setupFileSystemModel()
         fileSystemTree->expand(musicIndex);
     }
     
-    // Connect file system tree selection
     connect(fileSystemTree->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &LibraryManager::onFileSystemSelectionChanged);
     
-    // Enable drag from file system tree
     fileSystemTree->setDragEnabled(true);
     fileSystemTree->setDragDropMode(QAbstractItemView::DragOnly);
 }
@@ -1199,16 +1225,13 @@ void LibraryManager::addFiles(const QStringList& files)
 {
     if (files.isEmpty() || isLoading) return;
     
-    // Filter for supported audio files
     QStringList audioFiles;
-    QStringList supportedExtensions = {"mp3", "wav", "flac", "aac", "ogg", "m4a"};
-    
+    audioFiles.reserve(files.size());
+
     for (const QString& file : files) {
-        QFileInfo info(file);
-        if (info.exists() && info.isFile() && 
-            supportedExtensions.contains(info.suffix().toLower())) {
+        const QFileInfo info(file);
+        if (isSupportedAudioFile(info))
             audioFiles.append(file);
-        }
     }
     
     if (audioFiles.isEmpty()) {
@@ -1229,7 +1252,7 @@ void LibraryManager::addFiles(const QStringList& files)
     
     loaderThread->start();
     
-    statusLabel->setText(QString("Loading %1 files...").arg(audioFiles.size()));
+    statusLabel->setText(QStringLiteral("Loading %1 files...").arg(audioFiles.size()));
 }
 
 void LibraryManager::addDirectory(const QString& directory, bool recursive)
@@ -1243,10 +1266,8 @@ void LibraryManager::addDirectory(const QString& directory, bool recursive)
 QStringList LibraryManager::getSupportedAudioFiles(const QString& directory, bool recursive)
 {
     QStringList files;
-    QStringList nameFilters = {"*.mp3", "*.wav", "*.flac", "*.aac", "*.ogg", "*.m4a"};
-    
-    QDirIterator::IteratorFlag flags = recursive ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags;
-    QDirIterator it(directory, nameFilters, QDir::Files, flags);
+    const QDirIterator::IteratorFlag flags = recursive ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags;
+    QDirIterator it(directory, supportedNameFilters(), QDir::Files, flags);
     
     while (it.hasNext()) {
         files.append(it.next());
@@ -1258,26 +1279,21 @@ QStringList LibraryManager::getSupportedAudioFiles(const QString& directory, boo
 QStringList LibraryManager::getSelectedFiles() const
 {
     QStringList files;
-    QModelIndexList indexes = tableView->selectionModel()->selectedRows();
-    
+    const QModelIndexList indexes = tableView->selectionModel()->selectedRows();
+    files.reserve(indexes.size());
     for (const QModelIndex& index : indexes) {
-        const TrackInfo* track = model->getTrack(index.row());
-        if (track) {
+        if (const TrackInfo* track = model->getTrack(index.row()))
             files.append(track->filePath);
-        }
     }
-    
     return files;
 }
 
 QString LibraryManager::getCurrentFile() const
 {
-    QModelIndex current = tableView->currentIndex();
+    const QModelIndex current = tableView->currentIndex();
     if (current.isValid()) {
-        const TrackInfo* track = model->getTrack(current.row());
-        if (track) {
+        if (const TrackInfo* track = model->getTrack(current.row()))
             return track->filePath;
-        }
     }
     return QString();
 }
@@ -1344,7 +1360,7 @@ void LibraryManager::onTrackLoaded(const TrackInfo& track)
 void LibraryManager::onLoadingProgress(int current, int total)
 {
     progressBar->setValue(current);
-    statusLabel->setText(QString("Loading files... %1/%2").arg(current).arg(total));
+    statusLabel->setText(QStringLiteral("Loading files... %1/%2").arg(current).arg(total));
 }
 
 void LibraryManager::onLoadingFinished()
@@ -1361,26 +1377,7 @@ void LibraryManager::onLoadingFinished()
     }
 }
 
-void LibraryManager::onSortModeChanged()
-{
-    LibraryTableModel::SortMode mode = static_cast<LibraryTableModel::SortMode>(
-        sortComboBox->currentData().toInt());
-    model->setSortMode(mode);
-    // Map SortMode to column index for header sorting and indicator
-    int column = 0;
-    switch (mode) {
-        case LibraryTableModel::SortByTitle:    column = LibraryTableModel::TitleColumn; break;
-        case LibraryTableModel::SortByArtist:   column = LibraryTableModel::ArtistColumn; break;
-        case LibraryTableModel::SortByAlbum:    column = LibraryTableModel::AlbumColumn; break;
-        case LibraryTableModel::SortByDuration: column = LibraryTableModel::DurationColumn; break;
-        case LibraryTableModel::SortByBpm:      column = LibraryTableModel::BpmColumn; break;
-        case LibraryTableModel::SortByGenre:    column = LibraryTableModel::GenreColumn; break;
-        case LibraryTableModel::SortByYear:     column = LibraryTableModel::YearColumn; break;
-        case LibraryTableModel::SortByFileSize: column = LibraryTableModel::FileSizeColumn; break;
-    }
-    tableView->horizontalHeader()->setSortIndicatorShown(true);
-    tableView->sortByColumn(column, Qt::AscendingOrder);
-}
+ 
 
 void LibraryManager::onFilterTextChanged()
 {
@@ -1392,13 +1389,13 @@ void LibraryManager::onAddFilesClicked()
 {
     QStringList files = QFileDialog::getOpenFileNames(
         this,
-        "Add Audio Files",
+        QStringLiteral("Add Audio Files"),
         QStandardPaths::writableLocation(QStandardPaths::MusicLocation),
-        "Audio Files (*.mp3 *.wav *.flac *.aac *.ogg *.m4a);;All Files (*)"
+        QStringLiteral("Audio Files (*.mp3 *.wav *.flac *.aac *.ogg *.m4a);;All Files (*)")
     );
     
     if (!files.isEmpty()) {
-        addFiles(files);
+        addFiles(std::move(files));
     }
 }
 
@@ -1406,48 +1403,42 @@ void LibraryManager::onAddFolderClicked()
 {
     QString directory = QFileDialog::getExistingDirectory(
         this,
-        "Add Audio Folder",
+        QStringLiteral("Add Audio Folder"),
         QStandardPaths::writableLocation(QStandardPaths::MusicLocation)
     );
     
     if (!directory.isEmpty()) {
-        addDirectory(directory, true);
+        addDirectory(std::move(directory), true);
     }
 }
 
 void LibraryManager::onRefreshClicked()
 {
-    // Refresh the current folder view
     if (fileSystemModel) {
-        QString currentPath = fileSystemModel->rootPath();
-        fileSystemModel->setRootPath("");
+        const QString currentPath = fileSystemModel->rootPath();
+        fileSystemModel->setRootPath(QString());
         fileSystemModel->setRootPath(currentPath);
     }
 }
 
 void LibraryManager::onFileSystemSelectionChanged()
 {
-    QModelIndexList selected = fileSystemTree->selectionModel()->selectedIndexes();
+    const QModelIndexList selected = fileSystemTree->selectionModel()->selectedIndexes();
     if (selected.isEmpty()) return;
-    
-    QModelIndex index = selected.first();
-    QString path = fileSystemModel->filePath(index);
-    QFileInfo info(path);
-    
+
+    const QModelIndex index = selected.first();
+    const QString path = fileSystemModel->filePath(index);
+    const QFileInfo info(path);
+
     if (info.isDir()) {
-        // If it's a directory, load all audio files from it
-        QStringList audioFiles = getSupportedAudioFiles(path, false); // Don't recurse
+        QStringList audioFiles = getSupportedAudioFiles(path, false);
         if (!audioFiles.isEmpty()) {
-            // Clear current library and load this folder
             model->clearTracks();
-            addFiles(audioFiles);
+            addFiles(std::move(audioFiles));
         }
     } else if (info.isFile()) {
-        // If it's a file, load just this file
-        QStringList singleFile;
-        singleFile << path;
         model->clearTracks();
-        addFiles(singleFile);
+        addFiles(QStringList{path});
     }
 }
 
@@ -1649,12 +1640,6 @@ void LibraryManager::initializeStoragePaths()
     libraryDatabasePath = config.getLibraryDatabasePath();
     libraryXmlBackupPath = config.getLibraryXmlBackupPath();
     libraryUiStatePath = config.getUiStatePath("library_ui.ini");
-
-    qDebug() << "LibraryManager storage initialized:";
-    qDebug() << "  App data root:" << config.getAppDataDirectory();
-    qDebug() << "  Library database:" << libraryDatabasePath;
-    qDebug() << "  Legacy XML backup:" << libraryXmlBackupPath;
-    qDebug() << "  UI state file:" << libraryUiStatePath;
 }
 
 void LibraryManager::loadExistingTracks()
@@ -1891,11 +1876,7 @@ void LibraryManager::updateAnalysisUi()
         analysisProgressBar->setEnabled(false);
         analysisProgressBar->setRange(0, 100);
         analysisProgressBar->setValue(0);
-
-        const QString currentText = analysisStatusLabel->text();
-        if (currentText.trimmed().isEmpty() || currentText.startsWith(QStringLiteral("Analyzing")))
-            analysisStatusLabel->setText(QStringLiteral("Analysis idle"));
-
+        analysisStatusLabel->setText(QStringLiteral("Analysis idle"));
         analysesCompleted = 0;
         return;
     }
@@ -1911,12 +1892,9 @@ void LibraryManager::updateAnalysisUi()
     analysisProgressBar->setRange(0, 100);
     analysisProgressBar->setValue(static_cast<int>(std::round(average * 100.0)));
 
-    const int totalTasks = analysesCompleted + activeCount;
-    const QString labelText = QStringLiteral("Analyzing %1 track%2 (%3/%4 done)")
+    analysisStatusLabel->setText(QStringLiteral("Analyzing %1 track%2 (%3/%4 done)")
                                   .arg(activeCount)
                                   .arg(activeCount == 1 ? QString() : QStringLiteral("s"))
                                   .arg(analysesCompleted)
-                                  .arg(std::max(totalTasks, 1));
-
-    analysisStatusLabel->setText(labelText);
+                                  .arg(std::max(analysesCompleted + activeCount, 1)));
 }

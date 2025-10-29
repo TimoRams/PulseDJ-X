@@ -295,7 +295,7 @@ private slots:
     void onTrackLoaded(const TrackInfo& track);
     void onLoadingProgress(int current, int total);
     void onLoadingFinished();
-    void onSortModeChanged();
+    
     void onFilterTextChanged();
          void onAddFilesClicked(); // Replaced QPushButton with QAction
          void onAddFolderClicked(); // Replaced QPushButton with QAction
@@ -336,7 +336,7 @@ private:
     QFileSystemModel* fileSystemModel;
     LibraryTableView* tableView;
     LibraryTableModel* model;
-    QComboBox* sortComboBox;
+    
     QLineEdit* filterLineEdit;
         QAction* actionAddFiles; // Replaced QPushButton with QAction
         QAction* actionAddFolder; // Replaced QPushButton with QAction

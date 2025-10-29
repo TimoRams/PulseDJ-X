@@ -66,6 +66,18 @@ public:
                          std::vector<float>& outMax,
                          std::vector<float>& outMin);
 
+    // Extended: also compute rough 3-band RMS energies (bass/mid/treble) per bin
+    bool renderBinWindow(const juce::File& file,
+                         const AnalysisMetadata& metadata,
+                         int totalBins,
+                         int startBin,
+                         int binCount,
+                         std::vector<float>& outMax,
+                         std::vector<float>& outMin,
+                         std::vector<float>& outLow,
+                         std::vector<float>& outMid,
+                         std::vector<float>& outHigh);
+
 private:
     juce::AudioFormatManager formatManager;
 };

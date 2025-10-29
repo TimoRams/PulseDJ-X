@@ -296,3 +296,136 @@ bool WaveformGenerator::renderBinWindow(const juce::File& file,
 
     return true;
 }
+
+bool WaveformGenerator::renderBinWindow(const juce::File& file,
+                                        const AnalysisMetadata& metadata,
+                                        int totalBins,
+                                        int startBin,
+                                        int binCount,
+                                        std::vector<float>& outMax,
+                                        std::vector<float>& outMin,
+                                        std::vector<float>& outLow,
+                                        std::vector<float>& outMid,
+                                        std::vector<float>& outHigh)
+{
+    // Compute min/max as usual and also rough 3-band RMS energies using dual lowpass filters
+    if (totalBins <= 0 || binCount <= 0 || startBin < 0 || startBin >= totalBins) [[unlikely]] return false;
+
+    const int safeCount = std::min(binCount, totalBins - startBin);
+    if (safeCount <= 0) [[unlikely]] return false;
+
+    std::unique_ptr<juce::AudioFormatReader> reader;
+    {
+        AudioFormatManagerGuard formatGuard;
+        reader.reset(formatManager.createReaderFor(file));
+    }
+
+    if (!reader || reader->lengthInSamples <= metadata.audioStartSample) [[unlikely]] return false;
+
+    const int64 samplesFromStart = std::max<int64>(0, metadata.totalSamples - metadata.audioStartSample);
+    if (samplesFromStart <= 0) [[unlikely]] return false;
+
+    const double samplesPerBin = static_cast<double>(samplesFromStart) / totalBins;
+    if (samplesPerBin <= 0.0) [[unlikely]] return false;
+
+    const double startOffsetSamples = static_cast<double>(startBin) * samplesPerBin;
+    const double endOffsetSamples = static_cast<double>(startBin + safeCount) * samplesPerBin;
+
+    const int64 sampleStart = std::clamp<int64>(metadata.audioStartSample + static_cast<int64>(std::floor(startOffsetSamples)), metadata.audioStartSample, metadata.totalSamples);
+    const int64 sampleEnd = std::clamp<int64>(metadata.audioStartSample + static_cast<int64>(std::ceil(endOffsetSamples)), sampleStart, metadata.totalSamples);
+
+    const int64 samplesToRead = sampleEnd - sampleStart;
+    if (samplesToRead <= 0) [[unlikely]] {
+        outMax.assign(safeCount, 0.0f);
+        outMin.assign(safeCount, 0.0f);
+        outLow.assign(safeCount, 0.0f);
+        outMid.assign(safeCount, 0.0f);
+        outHigh.assign(safeCount, 0.0f);
+        return true;
+    }
+
+    outMax.assign(safeCount, 0.0f);
+    outMin.assign(safeCount, 0.0f);
+    outLow.assign(safeCount, 0.0f);
+    outMid.assign(safeCount, 0.0f);
+    outHigh.assign(safeCount, 0.0f);
+    std::vector<bool> touched(safeCount, false);
+    std::vector<int> counts(safeCount, 0);
+
+    constexpr int streamChunk = 4096;
+    juce::AudioBuffer<float> buffer(static_cast<int>(reader->numChannels), streamChunk);
+
+    // Simple dual lowpass approach to split bands:
+    // low = LP(sample, 200 Hz)
+    // mid = LP(sample, 2000 Hz) - LP(sample, 200 Hz)
+    // high = sample - LP(sample, 2000 Hz)
+    const double fs = std::max(1000.0, static_cast<double>(reader->sampleRate));
+    auto lpAlpha = [&](double fc) {
+        const double omega = 2.0 * M_PI * std::max(1.0, fc);
+        return static_cast<float>(omega / (fs + omega));
+    };
+    const float a200 = lpAlpha(200.0);
+    const float a2000 = lpAlpha(2000.0);
+    float lp200_state = 0.0f;
+    float lp2000_state = 0.0f;
+
+    int64 processed = 0;
+    while (processed < samplesToRead) [[likely]] {
+        const int toRead = static_cast<int>(std::min<int64>(streamChunk, samplesToRead - processed));
+        reader->read(&buffer, 0, toRead, sampleStart + processed, true, true);
+
+        const int numChannels = buffer.getNumChannels();
+        const float invChannels = 1.0f / std::max(1, numChannels);
+
+        for (int i = 0; i < toRead; ++i) [[likely]] {
+            float sample = 0.0f;
+            for (int ch = 0; ch < numChannels; ++ch) {
+                sample += buffer.getReadPointer(ch)[i];
+            }
+            sample *= invChannels;
+
+            // Bin index mapping
+            const double sampleIndexFromStart = static_cast<double>(sampleStart - metadata.audioStartSample) + processed + i;
+            const int bin = static_cast<int>(std::floor(sampleIndexFromStart / samplesPerBin));
+            if (bin < startBin) [[unlikely]] continue;
+            const int localIndex = bin - startBin;
+            if (localIndex < 0 || localIndex >= safeCount) [[unlikely]] continue;
+
+            // Min/Max
+            if (!touched[localIndex]) [[unlikely]] {
+                outMin[localIndex] = outMax[localIndex] = sample;
+                touched[localIndex] = true;
+            } else {
+                outMin[localIndex] = std::min(outMin[localIndex], sample);
+                outMax[localIndex] = std::max(outMax[localIndex], sample);
+            }
+
+            // Lowpass filters (one-pole)
+            lp200_state  += a200  * (sample - lp200_state);
+            lp2000_state += a2000 * (sample - lp2000_state);
+
+            const float low  = lp200_state;
+            const float mid  = lp2000_state - lp200_state;
+            const float high = sample - lp2000_state;
+
+            outLow[localIndex]  += low  * low;
+            outMid[localIndex]  += mid  * mid;
+            outHigh[localIndex] += high * high;
+            counts[localIndex]++;
+        }
+
+        processed += toRead;
+    }
+
+    for (int i = 0; i < safeCount; ++i) {
+        if (!touched[i]) [[unlikely]] {
+            outMin[i] = outMax[i] = 0.0f;
+        }
+        const int n = std::max(1, counts[i]);
+        outLow[i]  = std::sqrt(outLow[i]  / n);
+        outMid[i]  = std::sqrt(outMid[i]  / n);
+        outHigh[i] = std::sqrt(outHigh[i] / n);
+    }
+
+    return true;
+}

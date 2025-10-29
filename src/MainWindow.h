@@ -161,6 +161,13 @@ private:
     
     // Thread pool optimization
     std::unique_ptr<QThreadPool> bpmThreadPool;
+    // Dedicated low-priority pool for waveform streaming/generation (isolated from BPM/audio tasks)
+    std::unique_ptr<QThreadPool> waveformThreadPool;
+
+    // Connections we want to explicitly disconnect during shutdown to avoid
+    // queued region requests racing with widget teardown
+    QMetaObject::Connection connWaveformRegionA;
+    QMetaObject::Connection connWaveformRegionB;
     // Scratch resume state per deck
     bool scratchWasPlayingA{false};
     bool scratchWasPlayingB{false};
@@ -189,6 +196,8 @@ private:
     // Useful for tiny per-system calibration without changing core logic.
     double userVisualTrimA{0.0};
     double userVisualTrimB{0.0};
+    // Global output latency compensation (seconds) applied to waveform displays
+    double userRenderLatencySec{0.03};
     
     // Window drag functionality for frameless window
     bool isDragging{false};
@@ -225,7 +234,10 @@ private:
                                    int startBin,
                                    std::shared_ptr<std::vector<float>> maxBins,
                                    std::shared_ptr<std::vector<float>> minBins,
-                                   bool success);
+                                   bool success,
+                                   std::shared_ptr<std::vector<float>> lowBins,
+                                   std::shared_ptr<std::vector<float>> midBins,
+                                   std::shared_ptr<std::vector<float>> highBins);
     
 protected:
     void closeEvent(QCloseEvent* event) override;

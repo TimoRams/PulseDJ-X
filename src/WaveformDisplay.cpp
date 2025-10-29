@@ -22,6 +22,10 @@ WaveformDisplay::WaveformDisplay(QWidget* parent)
     if (fmt.samples() < 4) fmt.setSamples(4);
     fmt.setSwapInterval(1);
     setFormat(fmt);
+    setUpdateBehavior(QOpenGLWidget::NoPartialUpdate);
+
+    // Avoid unnecessary background compositing with OpenGL, helps reduce flicker
+    setAutoFillBackground(false);
 
     formatManager.registerBasicFormats();
     cuePoints.fill(-1.0);
@@ -31,6 +35,10 @@ WaveformDisplay::WaveformDisplay(QWidget* parent)
     renderTimer->setTimerType(Qt::PreciseTimer);
     renderTimer->setInterval(FrameTiming::kFrameIntervalMs);
     connect(renderTimer, &QTimer::timeout, this, [this]() { if (isVisible()) update(); });
+
+    // Default: keep potentially-distracting overlays disabled unless explicitly enabled
+    missingSegmentsOverlayEnabled = false;
+    prerollOverlayEnabled = false;
 }
 
 WaveformDisplay::~WaveformDisplay()
@@ -40,6 +48,9 @@ WaveformDisplay::~WaveformDisplay()
     for (auto& connection : scratchEngineConnections) QObject::disconnect(connection);
     scratchEngineConnections.clear();
 
+    // Ensure streaming stops and internal state is cleared before GL teardown
+    resetStreamingState();
+
     QOpenGLContext* ctx = context();
     if (ctx && ctx->isValid()) {
         makeCurrent();
@@ -48,7 +59,12 @@ WaveformDisplay::~WaveformDisplay()
     } else {
         // No valid context; ensure we don't try to use GL after this
         glResources.initialized = false;
-        glResources.fillVbo = glResources.topLineVbo = glResources.bottomLineVbo = 0;
+        glResources.fillVbo[0] = glResources.fillVbo[1] = 0;
+        glResources.topLineVbo[0] = glResources.topLineVbo[1] = 0;
+        glResources.bottomLineVbo[0] = glResources.bottomLineVbo[1] = 0;
+        glResources.fillVertexCountFront = 0;
+        glResources.topLineVertexCountFront = 0;
+        glResources.bottomLineVertexCountFront = 0;
     }
 }
 
@@ -62,54 +78,42 @@ static const QColor kCueColors[8] = {
 
 const char* kWaveformFillVertexShaderCore = R"(#version 330 core
 layout(location = 0) in vec2 position;
-out float vY;
+layout(location = 1) in vec3 color;
+out vec3 vColor;
 void main()
 {
     gl_Position = vec4(position, 0.0, 1.0);
-    vY = position.y;
+    vColor = color;
 }
 )";
 
 const char* kWaveformFillFragmentShaderCore = R"(#version 330 core
-in float vY;
+in vec3 vColor;
 out vec4 fragColor;
-uniform vec4 uColorTop;
-uniform vec4 uColorMid;
-uniform vec4 uColorBottom;
-uniform float uMidStrength;
 void main()
 {
-    float t = clamp((vY + 1.0) * 0.5, 0.0, 1.0);
-    vec4 base = mix(uColorTop, uColorBottom, t);
-    float centerBias = 1.0 - clamp(abs(t - 0.5) * 2.0, 0.0, 1.0);
-    fragColor = mix(base, uColorMid, centerBias * uMidStrength);
+    fragColor = vec4(vColor, 0.78);
 }
 )";
 
 const char* kWaveformFillVertexShaderEs = R"(#version 300 es
 layout(location = 0) in vec2 position;
-out float vY;
+layout(location = 1) in vec3 color;
+out mediump vec3 vColor;
 void main()
 {
     gl_Position = vec4(position, 0.0, 1.0);
-    vY = position.y;
+    vColor = color;
 }
 )";
 
 const char* kWaveformFillFragmentShaderEs = R"(#version 300 es
 precision mediump float;
-in float vY;
+in mediump vec3 vColor;
 out vec4 fragColor;
-uniform vec4 uColorTop;
-uniform vec4 uColorMid;
-uniform vec4 uColorBottom;
-uniform float uMidStrength;
 void main()
 {
-    float t = clamp((vY + 1.0) * 0.5, 0.0, 1.0);
-    vec4 base = mix(uColorTop, uColorBottom, t);
-    float centerBias = 1.0 - clamp(abs(t - 0.5) * 2.0, 0.0, 1.0);
-    fragColor = mix(base, uColorMid, centerBias * uMidStrength);
+    fragColor = vec4(vColor, 0.78);
 }
 )";
 
@@ -185,6 +189,9 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     lowerPoints.clear();
     missingSegments.clear();
 
+    // Guard source arrays while we read cached data
+    std::shared_lock<std::shared_mutex> lock(sourceMutex);
+
     if (viewWidth <= 0 || viewHeight <= 0 || audioLength <= 0.0 || sourceWidth <= 0) {
         return;
     }
@@ -206,7 +213,10 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         playheadSec = playheadRel * audioLength;
     }
 
-    const double displayCenterSec = (viewMode == ViewMode::BeatLocked) ? (playheadSec / safeTempo) : playheadSec;
+    // Shift display center by output latency so visual center matches what you hear
+    const double displayCenterSec = (viewMode == ViewMode::BeatLocked)
+        ? ((playheadSec + renderLatencySec) / safeTempo)
+        : (playheadSec + renderLatencySec);
     const double bufferSec = std::max(0.05, 0.5 / std::max(1.0, zoomFactor));
     const double halfViewportTime = static_cast<double>(viewWidth) / (2.0 * pixelsPerSecond);
     
@@ -261,21 +271,29 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     // Align start: when near or before track start (including preroll), keep audioSec=0 centered.
     // Use a tolerance of ~0.75 pixel in time to avoid jitter from tiny positive playhead values.
     const double secondsPerPixel = (pixelsPerSecond > 1e-6) ? (1.0 / pixelsPerSecond) : 0.0;
-    const double alignSnapSec = secondsPerPixel * 0.75; // tolerance band
-    double alignShiftSec = 0.0;
-    if (playheadSec <= alignSnapSec) {
-        // Shift display space so that audioSec=0 maps to the visual center
-        alignShiftSec = displayCenterSec;
+    const double alignSnapSec = secondsPerPixel * 0.75; // tolerance band (about 0.75px)
+    // Hysteresis around zero to avoid toggling and micro-jitter when hovering near start
+    const double enterPadSec = secondsPerPixel * 2.0; // enter latch within ~2px
+    const double exitPadSec  = secondsPerPixel * 6.0; // release latch after ~6px past threshold
+    if (!alignZeroLatchActive && playheadSec <= alignSnapSec + enterPadSec) {
+        alignZeroLatchActive = true;
+        alignZeroShiftSec = displayCenterSec; // capture current center so track start stays centered
+    } else if (alignZeroLatchActive && playheadSec >= alignSnapSec + exitPadSec) {
+        alignZeroLatchActive = false;
     }
+    double alignShiftSec = alignZeroLatchActive ? alignZeroShiftSec : 0.0;
     geometryCache.alignShiftSec = alignShiftSec;
     upperPoints.reserve(pixelWidth + 2);
     lowerPoints.reserve(pixelWidth + 2);
-    missingSegments.reserve(4);
+    if (missingSegmentsOverlayEnabled) {
+        missingSegments.reserve(4);
+    }
 
     // Prepare per-pixel buffers using logical pixel width
     if (static_cast<int>(pixelUpperScratch.size()) != pixelWidth) pixelUpperScratch.assign(pixelWidth, 0.0f); else std::fill(pixelUpperScratch.begin(), pixelUpperScratch.end(), 0.0f);
     if (static_cast<int>(pixelLowerScratch.size()) != pixelWidth) pixelLowerScratch.assign(pixelWidth, 0.0f); else std::fill(pixelLowerScratch.begin(), pixelLowerScratch.end(), 0.0f);
     if (static_cast<int>(pixelCoverageScratch.size()) != pixelWidth) pixelCoverageScratch.assign(pixelWidth, 0); else std::fill(pixelCoverageScratch.begin(), pixelCoverageScratch.end(), 0);
+    if (static_cast<int>(pixelColorScratch.size()) != pixelWidth * 3) pixelColorScratch.assign(pixelWidth * 3, 0.0f); else std::fill(pixelColorScratch.begin(), pixelColorScratch.end(), 0.0f);
 
     const double pixelHeight = static_cast<double>(viewHeight);
     const float waveformHeightScale = 0.42f;
@@ -283,21 +301,36 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     // Exact per-pixel aggregation in AUDIO domain mapped from DISPLAY
     const double secondsPerPixelDisplay = (timeRange > 0.0) ? (timeRange / static_cast<double>(pixelWidth)) : 0.0;
     const double audioWidthPerPixel = secondsPerPixelDisplay * safeTempo; // BeatLocked: dAudio = safeTempo * dDisplay
+    
+    // Fine alignment: nudge waveform sampling so visuals line up with audio and beat grid.
+    double dpiX = static_cast<double>(logicalDpiX());
+    if (dpiX <= 1.0) dpiX = 96.0; // sensible fallback
+    const double pixelsPerCentimeter = dpiX / 2.54; // 1 inch = 2.54 cm
+    const double waveformNudgePx = 0.75 - (pixelsPerCentimeter * 0.5); // subtract 0.5cm to shift LEFT
 
     // Streaming-aware local bin window
     const int totalLocalBins = static_cast<int>(sourceMaxBins.size());
     const auto clampLocal = [&](int idx) { return std::clamp(idx, 0, std::max(0, totalLocalBins - 1)); };
 
     int currentMissingStart = -1;
+    // Keep color continuous in missing regions by reusing the last valid color
+    float prevR = 0.43f, prevG = 0.74f, prevB = 1.0f;
 
     for (int x = 0; x < pixelWidth; ++x) {
-        const double displayCenterXSec = leftSecond + (static_cast<double>(x) + 0.5) * secondsPerPixelDisplay;
+        const double displayCenterXSec = leftSecond + (static_cast<double>(x) + 0.5 + waveformNudgePx) * secondsPerPixelDisplay;
         const double audioCenterSec = mapDisplayToAudio(displayCenterXSec);
         double audioStart = audioCenterSec - 0.5 * audioWidthPerPixel;
         double audioEnd   = audioCenterSec + 0.5 * audioWidthPerPixel;
         if (audioEnd <= 0.0 || audioStart >= audioLength) {
-            // Out of track range
+            // Out of track range: render a flat baseline here to avoid geometry gaps
             if (currentMissingStart < 0) currentMissingStart = x;
+            pixelUpperScratch[x] = 0.0f;
+            pixelLowerScratch[x] = 0.0f;
+            pixelCoverageScratch[x] = 1;
+            // fallback: reuse last valid color to avoid a moving tinted edge
+            pixelColorScratch[x * 3 + 0] = prevR;
+            pixelColorScratch[x * 3 + 1] = prevG;
+            pixelColorScratch[x * 3 + 2] = prevB;
             continue;
         }
         audioStart = std::max(0.0, audioStart);
@@ -311,8 +344,14 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         int li1 = gb1 - availableStartBin;
 
         if (li1 <= 0 || li0 >= totalLocalBins) {
-            // No data cached here
-            if (currentMissingStart < 0) currentMissingStart = x;
+            // No data cached here: draw baseline to keep strip continuous
+            if (missingSegmentsOverlayEnabled) { if (currentMissingStart < 0) currentMissingStart = x; }
+            pixelUpperScratch[x] = 0.0f;
+            pixelLowerScratch[x] = 0.0f;
+            pixelCoverageScratch[x] = 1;
+            pixelColorScratch[x * 3 + 0] = prevR;
+            pixelColorScratch[x * 3 + 1] = prevG;
+            pixelColorScratch[x * 3 + 2] = prevB;
             continue;
         }
 
@@ -320,7 +359,9 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         li1 = std::min(std::max(li0 + 1, li1), totalLocalBins);
 
         float minVal = 0.0f, maxVal = 0.0f;
+        float sumLow = 0.0f, sumMid = 0.0f, sumHigh = 0.0f;
         bool have = false;
+        int count = 0;
         for (int i = li0; i < li1; ++i) {
             float vmin = sourceMinBins[i];
             float vmax = sourceMaxBins[i];
@@ -330,17 +371,37 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
                 minVal = std::min(minVal, vmin);
                 maxVal = std::max(maxVal, vmax);
             }
+            // Aggregate band energies if available
+            if (i >= 0 && i < static_cast<int>(sourceLowBins.size())) {
+                sumLow  += std::max(0.0f, sourceLowBins[i]);
+                ++count;
+            }
+            if (i >= 0 && i < static_cast<int>(sourceMidBins.size())) {
+                sumMid  += std::max(0.0f, sourceMidBins[i]);
+            }
+            if (i >= 0 && i < static_cast<int>(sourceHighBins.size())) {
+                sumHigh += std::max(0.0f, sourceHighBins[i]);
+            }
         }
 
         if (!have) {
-            if (currentMissingStart < 0) currentMissingStart = x;
+            // Aggregation yielded no values (should be rare) - keep baseline to avoid gaps
+            if (missingSegmentsOverlayEnabled) { if (currentMissingStart < 0) currentMissingStart = x; }
+            pixelUpperScratch[x] = 0.0f;
+            pixelLowerScratch[x] = 0.0f;
+            pixelCoverageScratch[x] = 1;
+            pixelColorScratch[x * 3 + 0] = prevR;
+            pixelColorScratch[x * 3 + 1] = prevG;
+            pixelColorScratch[x * 3 + 2] = prevB;
             continue;
         }
 
-        if (currentMissingStart >= 0) {
-            // Flush previous missing segment
-            missingSegments.emplace_back(currentMissingStart, x);
-            currentMissingStart = -1;
+        if (missingSegmentsOverlayEnabled) {
+            if (currentMissingStart >= 0) {
+                // Flush previous missing segment
+                missingSegments.emplace_back(currentMissingStart, x);
+                currentMissingStart = -1;
+            }
         }
 
         // Normalize & clamp
@@ -353,10 +414,36 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         pixelUpperScratch[x] = maxVal;
         pixelLowerScratch[x] = minVal;
         pixelCoverageScratch[x] = 1;
+
+        // Compute per-pixel RGB from band energies (normalize to sum)
+        if (count > 0) {
+            float lowAvg  = sumLow  / std::max(1, count);
+            float midAvg  = sumMid  / std::max(1, count);
+            float highAvg = sumHigh / std::max(1, count);
+            // Simple soft normalization
+            const float sum = std::max(1e-6f, lowAvg + midAvg + highAvg);
+            float r = std::min(1.0f, lowAvg  / sum);  // Bass -> Red
+            float g = std::min(1.0f, midAvg  / sum);  // Mids -> Green
+            float b = std::min(1.0f, highAvg / sum);  // Treble -> Blue
+            // Slight gamma to boost vividness
+            auto gamma = [](float v){ return std::pow(std::clamp(v, 0.0f, 1.0f), 0.8f); };
+            r = gamma(r); g = gamma(g); b = gamma(b);
+            pixelColorScratch[x * 3 + 0] = r;
+            pixelColorScratch[x * 3 + 1] = g;
+            pixelColorScratch[x * 3 + 2] = b;
+            prevR = r; prevG = g; prevB = b;
+        } else {
+            // Fallback: reuse last valid color for stability
+            pixelColorScratch[x * 3 + 0] = prevR;
+            pixelColorScratch[x * 3 + 1] = prevG;
+            pixelColorScratch[x * 3 + 2] = prevB;
+        }
     }
 
-    if (currentMissingStart >= 0) {
-        missingSegments.emplace_back(currentMissingStart, pixelWidth);
+    if (missingSegmentsOverlayEnabled) {
+        if (currentMissingStart >= 0) {
+            missingSegments.emplace_back(currentMissingStart, pixelWidth);
+        }
     }
 
     for (int x = 0; x < pixelWidth; ++x) {
@@ -387,15 +474,24 @@ bool WaveformDisplay::geometryNeedsUpdate(int viewWidth, int viewHeight, double 
     if (renderCache.lastWidth != viewWidth || renderCache.lastHeight != viewHeight) return true;
     if (std::abs(renderCache.lastZoomFactor - zoomFactor) >= 0.01) return true; // Less sensitive to zoom changes
     if (std::abs(renderCache.lastTempoFactor - tempoFactor) >= 0.001) return true;
-    
-    // More relaxed playhead threshold to reduce rebuilds during playback
-    const double playheadThreshold = isInSeekMode ? 0.00001 : 0.0001;
-    if (std::abs(renderCache.lastPlayheadPos - renderPlayhead) >= playheadThreshold) return true;
-    
+
+    // Playhead threshold: rebuild only when visual motion exceeds ~0.5 pixel
+    double basePps = 0.0;
+    if (useFixedPixelsPerSecond) basePps = std::max(10.0, localPixelsPerSecond);
+    else if (audioLength > 0.0) basePps = static_cast<double>(viewWidth) / std::max(audioLength, 1e-3);
+    if (basePps <= 0.0) basePps = std::max(10.0, localPixelsPerSecond);
+    const double pps = std::max(1.0, basePps * zoomFactor);
+    const double secondsPerHalfPixel = 0.5 / pps;
+    const double totalLen = (audioLength > 0.0) ? audioLength : trackLengthSec;
+    double thresholdRel = (totalLen > 0.0) ? (secondsPerHalfPixel / totalLen) : 0.0001;
+    if (isInSeekMode) thresholdRel *= 0.5; // tighter sync while seeking
+    thresholdRel = std::clamp(thresholdRel, 1e-6, 5e-4);
+    if (std::abs(renderCache.lastPlayheadPos - renderPlayhead) >= thresholdRel) return true;
+
     // Check if streaming window changed
     if (renderCache.lastAvailableStartBin != availableStartBin ||
         renderCache.lastAvailableEndBin != availableEndBin) return true;
-    
+
     return false;
 }
 
@@ -428,7 +524,7 @@ void WaveformDisplay::paintGL()
         buildWaveformGeometry(widgetWidth, widgetHeight, zoomFactor, renderPlayhead);
         updateWaveformVertexBuffers(widgetWidth, widgetHeight);
 
-        const bool geometryReady = geometryCache.valid && glResources.fillVertexCount >= 4;
+        const bool geometryReady = geometryCache.valid && glResources.fillVertexCountFront >= 4;
         renderCache.geometryValid = geometryReady;
         renderCache.needsFullRedraw = !geometryReady;
         renderCache.lastWidth = widgetWidth;
@@ -440,11 +536,17 @@ void WaveformDisplay::paintGL()
         renderCache.lastAvailableEndBin = availableEndBin;
     }
 
-    const bool readyToDraw = renderCache.geometryValid && glResources.fillVertexCount >= 4;
-    if (readyToDraw) {
+    const bool haveBuffers = glResources.fillVertexCountFront >= 4;
+    const bool readyToDraw = renderCache.geometryValid && haveBuffers;
+    
+    // Always draw if we have valid buffer data to prevent glitching/flickering
+    if (haveBuffers) {
         drawWaveformGl();
-        renderCache.needsFullRedraw = false;
+        if (readyToDraw) {
+            renderCache.needsFullRedraw = false;
+        }
     } else {
+        // No buffers available - mark for full redraw
         renderCache.geometryValid = false;
         renderCache.needsFullRedraw = true;
     }
@@ -523,9 +625,9 @@ void WaveformDisplay::ensureGlResources()
         }
     }
 
-    glGenBuffers(1, &glResources.fillVbo);
-    glGenBuffers(1, &glResources.topLineVbo);
-    glGenBuffers(1, &glResources.bottomLineVbo);
+    glGenBuffers(2, glResources.fillVbo);
+    glGenBuffers(2, glResources.topLineVbo);
+    glGenBuffers(2, glResources.bottomLineVbo);
     glResources.initialized = true;
 }
 
@@ -549,47 +651,37 @@ void WaveformDisplay::destroyGlResources()
     }
 
     if (QOpenGLContext::currentContext()) {
-        if (glResources.fillVbo) {
-        glDeleteBuffers(1, &glResources.fillVbo);
-        glResources.fillVbo = 0;
+        if (glResources.fillVbo[0] || glResources.fillVbo[1]) {
+            glDeleteBuffers(2, glResources.fillVbo);
+            glResources.fillVbo[0] = glResources.fillVbo[1] = 0;
         }
-        if (glResources.topLineVbo) {
-        glDeleteBuffers(1, &glResources.topLineVbo);
-        glResources.topLineVbo = 0;
+        if (glResources.topLineVbo[0] || glResources.topLineVbo[1]) {
+            glDeleteBuffers(2, glResources.topLineVbo);
+            glResources.topLineVbo[0] = glResources.topLineVbo[1] = 0;
         }
-        if (glResources.bottomLineVbo) {
-        glDeleteBuffers(1, &glResources.bottomLineVbo);
-        glResources.bottomLineVbo = 0;
+        if (glResources.bottomLineVbo[0] || glResources.bottomLineVbo[1]) {
+            glDeleteBuffers(2, glResources.bottomLineVbo);
+            glResources.bottomLineVbo[0] = glResources.bottomLineVbo[1] = 0;
         }
     }
 
     glResources.initialized = false;
-    glResources.fillVertexCount = 0;
-    glResources.topLineVertexCount = 0;
-    glResources.bottomLineVertexCount = 0;
+    glResources.fillVertexCountFront = 0;
+    glResources.topLineVertexCountFront = 0;
+    glResources.bottomLineVertexCountFront = 0;
 }
 
 void WaveformDisplay::updateWaveformVertexBuffers(int viewWidth, int viewHeight)
 {
+    // Atomic update: keep previous GPU buffers/counts if we can't produce a new valid upload
     if (!glResources.initialized || viewWidth <= 0 || viewHeight <= 0) {
-        glResources.fillVertexCount = 0;
-        glResources.topLineVertexCount = 0;
-        glResources.bottomLineVertexCount = 0;
         return;
     }
 
-    if (glResources.fillVbo == 0 || glResources.topLineVbo == 0 || glResources.bottomLineVbo == 0) {
-        glResources.fillVertexCount = 0;
-        glResources.topLineVertexCount = 0;
-        glResources.bottomLineVertexCount = 0;
-        return;
-    }
+    // VBOs are created in ensureGlResources; proceed to upload into the back buffer
 
     const size_t pointCount = std::min(upperPointBuffer.size(), lowerPointBuffer.size());
     if (pointCount < 2) {
-        glResources.fillVertexCount = 0;
-        glResources.topLineVertexCount = 0;
-        glResources.bottomLineVertexCount = 0;
         return;
     }
 
@@ -597,7 +689,8 @@ void WaveformDisplay::updateWaveformVertexBuffers(int viewWidth, int viewHeight)
     topLineVertexData.clear();
     bottomLineVertexData.clear();
 
-    fillVertexData.reserve(pointCount * 4);
+    // Each vertex: 2 floats position + 3 floats color
+    fillVertexData.reserve(pointCount * 10);
     topLineVertexData.reserve(pointCount * 2);
     bottomLineVertexData.reserve(pointCount * 2);
 
@@ -615,11 +708,27 @@ void WaveformDisplay::updateWaveformVertexBuffers(int viewWidth, int viewHeight)
     for (size_t i = 0; i < pointCount; ++i) {
         const auto upper = toNdc(upperPointBuffer[i]);
         const auto lower = toNdc(lowerPointBuffer[i]);
+        // Determine color for this x (from pixelColorScratch)
+        int xIndex = std::clamp(static_cast<int>(std::round(upperPointBuffer[i].x() - 0.5)), 0, viewWidth - 1);
+        float r = 0.43f, g = 0.74f, b = 1.0f; // fallback cyan-ish
+        if (static_cast<int>(pixelColorScratch.size()) >= (xIndex * 3 + 3)) {
+            r = pixelColorScratch[xIndex * 3 + 0];
+            g = pixelColorScratch[xIndex * 3 + 1];
+            b = pixelColorScratch[xIndex * 3 + 2];
+        }
 
+        // Upper vertex (pos + color)
         fillVertexData.push_back(upper.first);
         fillVertexData.push_back(upper.second);
+        fillVertexData.push_back(r);
+        fillVertexData.push_back(g);
+        fillVertexData.push_back(b);
+        // Lower vertex (pos + color - same color per column)
         fillVertexData.push_back(lower.first);
         fillVertexData.push_back(lower.second);
+        fillVertexData.push_back(r);
+        fillVertexData.push_back(g);
+        fillVertexData.push_back(b);
 
         topLineVertexData.push_back(upper.first);
         topLineVertexData.push_back(upper.second);
@@ -627,28 +736,35 @@ void WaveformDisplay::updateWaveformVertexBuffers(int viewWidth, int viewHeight)
         bottomLineVertexData.push_back(lower.second);
     }
 
-    auto upload = [this](GLuint vbo, const std::vector<float>& data) {
+    const int back = 1 - glResources.frontIndex;
+
+    auto orphanAndUpload = [this](GLuint vbo, const std::vector<float>& data) {
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER,
-                     static_cast<GLsizeiptr>(data.size() * sizeof(float)),
-                     data.data(),
-                     GL_DYNAMIC_DRAW);
+        const GLsizeiptr size = static_cast<GLsizeiptr>(data.size() * sizeof(float));
+        // Orphan the buffer to avoid driver stalls, then upload
+        glBufferData(GL_ARRAY_BUFFER, size, nullptr, GL_DYNAMIC_DRAW);
+        if (size > 0) glBufferSubData(GL_ARRAY_BUFFER, 0, size, data.data());
     };
 
-    upload(glResources.fillVbo,      fillVertexData);
-    upload(glResources.topLineVbo,   topLineVertexData);
-    upload(glResources.bottomLineVbo,bottomLineVertexData);
-
+    orphanAndUpload(glResources.fillVbo[back],       fillVertexData);
+    orphanAndUpload(glResources.topLineVbo[back],    topLineVertexData);
+    orphanAndUpload(glResources.bottomLineVbo[back], bottomLineVertexData);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    glResources.fillVertexCount = static_cast<int>(fillVertexData.size() / 2);
-    glResources.topLineVertexCount = static_cast<int>(topLineVertexData.size() / 2);
-    glResources.bottomLineVertexCount = static_cast<int>(bottomLineVertexData.size() / 2);
+    // Publish counts atomically with front/back swap
+    const int newFillCount   = static_cast<int>(fillVertexData.size() / 5);
+    const int newTopCount    = static_cast<int>(topLineVertexData.size() / 2);
+    const int newBottomCount = static_cast<int>(bottomLineVertexData.size() / 2);
+
+    glResources.frontIndex = back;
+    glResources.fillVertexCountFront    = newFillCount;
+    glResources.topLineVertexCountFront = newTopCount;
+    glResources.bottomLineVertexCountFront = newBottomCount;
 }
 
 void WaveformDisplay::drawWaveformGl()
 {
-    if (!glResources.initialized || glResources.fillVertexCount < 4) return;
+    if (!glResources.initialized || glResources.fillVertexCountFront < 4) return;
 
     if (!glResources.vao.isCreated()) {
         if (!glResources.vao.create()) {
@@ -659,23 +775,19 @@ void WaveformDisplay::drawWaveformGl()
 
     QOpenGLVertexArrayObject::Binder vaoBinder(&glResources.vao);
 
-    glBindBuffer(GL_ARRAY_BUFFER, glResources.fillVbo);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(float) * 2), nullptr);
+    const int front = glResources.frontIndex;
+    glBindBuffer(GL_ARRAY_BUFFER, glResources.fillVbo[front]);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(float) * 5), reinterpret_cast<const void*>(0));
     glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, static_cast<GLsizei>(sizeof(float) * 5), reinterpret_cast<const void*>(sizeof(float) * 2));
+    glEnableVertexAttribArray(1);
 
     auto& fillProgram = glResources.fillProgram;
     fillProgram.bind();
-    static const QVector4D topColor(110.0f/255.0f, 190.0f/255.0f, 255.0f/255.0f, 0.62f);
-    static const QVector4D midColor(60.0f/255.0f, 140.0f/255.0f, 220.0f/255.0f, 0.40f);
-    static const QVector4D bottomColor(110.0f/255.0f, 190.0f/255.0f, 255.0f/255.0f, 0.62f);
-    fillProgram.setUniformValue("uColorTop", topColor);
-    fillProgram.setUniformValue("uColorMid", midColor);
-    fillProgram.setUniformValue("uColorBottom", bottomColor);
-    fillProgram.setUniformValue("uMidStrength", 0.75f);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, glResources.fillVertexCount);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, glResources.fillVertexCountFront);
     fillProgram.release();
 
-    if (glResources.topLineVertexCount >= 2) {
+    if (glResources.topLineVertexCountFront >= 2) {
         auto& lineProgram = glResources.lineProgram;
         lineProgram.bind();
 
@@ -701,24 +813,26 @@ void WaveformDisplay::drawWaveformGl()
 
         glLineWidth(glowWidth);
         lineProgram.setUniformValue("uColor", glowColor);
-        drawStrip(glResources.topLineVbo, glResources.topLineVertexCount);
-        drawStrip(glResources.bottomLineVbo, glResources.bottomLineVertexCount);
+        drawStrip(glResources.topLineVbo[front], glResources.topLineVertexCountFront);
+        drawStrip(glResources.bottomLineVbo[front], glResources.bottomLineVertexCountFront);
 
         glLineWidth(outlineWidth);
         lineProgram.setUniformValue("uColor", lineColor);
-        drawStrip(glResources.topLineVbo, glResources.topLineVertexCount);
-        drawStrip(glResources.bottomLineVbo, glResources.bottomLineVertexCount);
+        drawStrip(glResources.topLineVbo[front], glResources.topLineVertexCountFront);
+        drawStrip(glResources.bottomLineVbo[front], glResources.bottomLineVertexCountFront);
 
         lineProgram.release();
         glLineWidth(1.0f);
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(0);
 }
 
 void WaveformDisplay::drawMissingSegments(QPainter& painter, int viewWidth, int viewHeight) const
 {
-    if (missingSegmentBuffer.empty()) {
+    // Safety: only draw if overlay is enabled and we actually have segments
+    if (!missingSegmentsOverlayEnabled || missingSegmentBuffer.empty()) {
         return;
     }
 
@@ -746,7 +860,7 @@ void WaveformDisplay::drawMissingSegments(QPainter& painter, int viewWidth, int 
 void WaveformDisplay::drawWaveformOverlays(QPainter& painter, int viewWidth, int viewHeight, double zoomFactor)
 {
     if (geometryCache.valid && geometryCache.timeRange > 0.0) {
-        if (streamingMode && !streamingComplete) {
+        if (streamingMode && !streamingComplete && missingSegmentsOverlayEnabled) {
             drawMissingSegments(painter, viewWidth, viewHeight);
         }
 
@@ -769,15 +883,36 @@ void WaveformDisplay::drawWaveformOverlays(QPainter& painter, int viewWidth, int
             drawCuePoints(painter, audioTimeLeftSec, audioTimeRightSec, audioTimeRange);
         }
 
-        if (ghostLoopEnabled && audioLength > 0.0 && ghostLoopEndSec > ghostLoopStartSec) {
+        if (ghostLoopOverlayEnabled && ghostLoopEnabled && audioLength > 0.0 && ghostLoopEndSec > ghostLoopStartSec) {
             drawGhostLoopRegion(painter, geometryCache.leftSecond, geometryCache.rightSecond, geometryCache.timeRange);
         }
 
-        if (prerollEnabled && geometryCache.leftSecond < 0.0) {
-            drawPrerollRegion(painter, geometryCache.leftSecond, geometryCache.rightSecond, geometryCache.timeRange);
+        // Preroll overlay (disabled by default). Keep behavior but stop drawing unless explicitly enabled.
+        if (prerollOverlayEnabled && prerollEnabled && audioLength > 0.0) {
+            const double showEps = std::max(0.0, prerollShowThresholdSec);
+            const double hideEps = std::max(0.0, prerollHideThresholdSec);
+            const double phAudioSec = geometryCache.playheadSec; // negative while in preroll
+
+            const bool wantShow = (phAudioSec < -showEps) && (audioTimeLeftSec < -showEps);
+            if (!prerollVisible) {
+                if (wantShow) prerollVisible = true;
+            } else {
+                const bool mustHide = (phAudioSec >= -hideEps) || (audioTimeLeftSec >= -hideEps);
+                if (mustHide) prerollVisible = false;
+            }
+
+            if (prerollVisible) {
+                drawPrerollRegion(painter, geometryCache.leftSecond, geometryCache.rightSecond, geometryCache.timeRange);
+            } else {
+                lastPrerollEdgeX = -1; // reset cached edge when hidden
+            }
+        } else {
+            // Ensure no residual state causes artifacts when overlay is disabled
+            prerollVisible = false;
+            lastPrerollEdgeX = -1;
         }
 
-        if (loopEnabled && loopEndSec > loopStartSec && audioLength > 0.0) {
+        if (loopOverlayEnabled && loopEnabled && loopEndSec > loopStartSec && audioLength > 0.0) {
             drawLoopRegion(painter, geometryCache.leftSecond, geometryCache.rightSecond, geometryCache.timeRange);
         }
     }
@@ -839,10 +974,14 @@ void WaveformDisplay::setSourceBins(const std::vector<float>& maxBins,
         return;
     }
 
+    std::unique_lock<std::shared_mutex> lock(sourceMutex);
     resetStreamingState();
 
     sourceMaxBins = maxBins;
     sourceMinBins = minBins;
+    sourceLowBins.clear();
+    sourceMidBins.clear();
+    sourceHighBins.clear();
     sourceWidth = static_cast<int>(maxBins.size());
     streamingTotalBins = sourceWidth;
     availableStartBin = 0;
@@ -864,6 +1003,7 @@ void WaveformDisplay::beginStreaming(int totalBinCount,
                                      int preloadBins,
                                      int maxCachedBins)
 {
+    std::unique_lock<std::shared_mutex> lock(sourceMutex);
     resetStreamingState();
 
     streamingMode = true;
@@ -881,6 +1021,9 @@ void WaveformDisplay::beginStreaming(int totalBinCount,
 
     sourceMaxBins.clear();
     sourceMinBins.clear();
+    sourceLowBins.clear();
+    sourceMidBins.clear();
+    sourceHighBins.clear();
 
     postSourceConfigured();
 }
@@ -894,6 +1037,8 @@ void WaveformDisplay::appendStreamBins(int startBin,
         qWarning() << "WaveformDisplay::appendStreamBins - invalid data sizes";
         return;
     }
+
+    std::unique_lock<std::shared_mutex> lock(sourceMutex);
 
     if (!streamingMode) {
         setSourceBins(maxBins, minBins, audioStartOffset, audioLength);
@@ -921,6 +1066,9 @@ void WaveformDisplay::appendStreamBins(int startBin,
             const int prepend = availableStartBin - newStart;
             sourceMaxBins.insert(sourceMaxBins.begin(), prepend, 0.0f);
             sourceMinBins.insert(sourceMinBins.begin(), prepend, 0.0f);
+            if (!sourceLowBins.empty()) sourceLowBins.insert(sourceLowBins.begin(), prepend, 0.0f);
+            if (!sourceMidBins.empty()) sourceMidBins.insert(sourceMidBins.begin(), prepend, 0.0f);
+            if (!sourceHighBins.empty()) sourceHighBins.insert(sourceHighBins.begin(), prepend, 0.0f);
             availableStartBin = newStart;
         }
 
@@ -928,6 +1076,9 @@ void WaveformDisplay::appendStreamBins(int startBin,
             const int append = newEnd - availableEndBin;
             sourceMaxBins.insert(sourceMaxBins.end(), append, 0.0f);
             sourceMinBins.insert(sourceMinBins.end(), append, 0.0f);
+            if (!sourceLowBins.empty()) sourceLowBins.insert(sourceLowBins.end(), append, 0.0f);
+            if (!sourceMidBins.empty()) sourceMidBins.insert(sourceMidBins.end(), append, 0.0f);
+            if (!sourceHighBins.empty()) sourceHighBins.insert(sourceHighBins.end(), append, 0.0f);
             availableEndBin = newEnd;
         }
 
@@ -962,6 +1113,9 @@ void WaveformDisplay::appendStreamBins(int startBin,
                 trimFront = std::min(trimFront, availableEndBin - availableStartBin);
                 sourceMaxBins.erase(sourceMaxBins.begin(), sourceMaxBins.begin() + trimFront);
                 sourceMinBins.erase(sourceMinBins.begin(), sourceMinBins.begin() + trimFront);
+                if (!sourceLowBins.empty()) sourceLowBins.erase(sourceLowBins.begin(), sourceLowBins.begin() + trimFront);
+                if (!sourceMidBins.empty()) sourceMidBins.erase(sourceMidBins.begin(), sourceMidBins.begin() + trimFront);
+                if (!sourceHighBins.empty()) sourceHighBins.erase(sourceHighBins.begin(), sourceHighBins.begin() + trimFront);
                 availableStartBin += trimFront;
             }
 
@@ -969,6 +1123,127 @@ void WaveformDisplay::appendStreamBins(int startBin,
                 trimBack = std::min(trimBack, availableEndBin - availableStartBin);
                 sourceMaxBins.erase(sourceMaxBins.end() - trimBack, sourceMaxBins.end());
                 sourceMinBins.erase(sourceMinBins.end() - trimBack, sourceMinBins.end());
+                if (!sourceLowBins.empty()) sourceLowBins.erase(sourceLowBins.end() - trimBack, sourceLowBins.end());
+                if (!sourceMidBins.empty()) sourceMidBins.erase(sourceMidBins.end() - trimBack, sourceMidBins.end());
+                if (!sourceHighBins.empty()) sourceHighBins.erase(sourceHighBins.end() - trimBack, sourceHighBins.end());
+                availableEndBin -= trimBack;
+            }
+        }
+        cachedBins = availableEndBin - availableStartBin;
+    }
+
+    streamingExpectedNextBin = availableEndBin;
+    streamingComplete = streamingComplete || isFinalChunk;
+
+    if (hasPendingRegionRequest) {
+        if (pendingRequestStartBin >= availableStartBin && pendingRequestEndBin <= availableEndBin) {
+            hasPendingRegionRequest = false;
+        }
+    }
+
+    markDirtyAndSchedule();
+}
+
+void WaveformDisplay::appendStreamBins(int startBin,
+                                       const std::vector<float>& maxBins,
+                                       const std::vector<float>& minBins,
+                                       const std::vector<float>& lowBins,
+                                       const std::vector<float>& midBins,
+                                       const std::vector<float>& highBins,
+                                       bool isFinalChunk)
+{
+    if (maxBins.size() != minBins.size() || maxBins.size() != lowBins.size() || maxBins.size() != midBins.size() || maxBins.size() != highBins.size()) {
+        // Fallback to non-colored append
+        appendStreamBins(startBin, maxBins, minBins, isFinalChunk);
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(sourceMutex);
+
+    // Ensure band arrays exist and aligned; reuse base append logic by first ensuring base arrays updated, then copy bands into band arrays in the same positions
+    const int chunkSize = static_cast<int>(maxBins.size());
+    const int chunkEnd = startBin + chunkSize;
+
+    const bool hadData = !sourceMaxBins.empty();
+    if (!hadData) {
+        sourceMaxBins = maxBins;
+        sourceMinBins = minBins;
+        sourceLowBins = lowBins;
+        sourceMidBins = midBins;
+        sourceHighBins = highBins;
+        availableStartBin = startBin;
+        availableEndBin = chunkEnd;
+    } else {
+        int newStart = std::min(availableStartBin, startBin);
+        int newEnd = std::max(availableEndBin, chunkEnd);
+
+        if (newStart < availableStartBin) {
+            const int prepend = availableStartBin - newStart;
+            sourceMaxBins.insert(sourceMaxBins.begin(), prepend, 0.0f);
+            sourceMinBins.insert(sourceMinBins.begin(), prepend, 0.0f);
+            sourceLowBins.insert(sourceLowBins.begin(), prepend, 0.0f);
+            sourceMidBins.insert(sourceMidBins.begin(), prepend, 0.0f);
+            sourceHighBins.insert(sourceHighBins.begin(), prepend, 0.0f);
+            availableStartBin = newStart;
+        }
+
+        if (newEnd > availableEndBin) {
+            const int append = newEnd - availableEndBin;
+            sourceMaxBins.insert(sourceMaxBins.end(), append, 0.0f);
+            sourceMinBins.insert(sourceMinBins.end(), append, 0.0f);
+            sourceLowBins.insert(sourceLowBins.end(), append, 0.0f);
+            sourceMidBins.insert(sourceMidBins.end(), append, 0.0f);
+            sourceHighBins.insert(sourceHighBins.end(), append, 0.0f);
+            availableEndBin = newEnd;
+        }
+
+        const int offset = startBin - availableStartBin;
+        if (offset >= 0 && offset + chunkSize <= static_cast<int>(sourceMaxBins.size())) {
+            std::copy(maxBins.begin(), maxBins.end(), sourceMaxBins.begin() + offset);
+            std::copy(minBins.begin(), minBins.end(), sourceMinBins.begin() + offset);
+            std::copy(lowBins.begin(), lowBins.end(), sourceLowBins.begin() + offset);
+            std::copy(midBins.begin(), midBins.end(), sourceMidBins.begin() + offset);
+            std::copy(highBins.begin(), highBins.end(), sourceHighBins.begin() + offset);
+        }
+    }
+
+    int cachedBins = availableEndBin - availableStartBin;
+    if (streamingMaxCacheBins > 0 && cachedBins > streamingMaxCacheBins) {
+        int trimNeeded = cachedBins - streamingMaxCacheBins;
+        trimNeeded = std::min(trimNeeded, cachedBins);
+        if (trimNeeded > 0) {
+            bool extendedForward = chunkEnd > availableEndBin;
+            bool extendedBackward = startBin < availableStartBin;
+
+            int trimFront = 0;
+            int trimBack = 0;
+
+            if (extendedForward && !extendedBackward) {
+                trimFront = trimNeeded;
+            } else if (extendedBackward && !extendedForward) {
+                trimBack = trimNeeded;
+            } else {
+                trimFront = trimNeeded / 2;
+                trimBack = trimNeeded - trimFront;
+            }
+
+            if (trimFront > 0) {
+                trimFront = std::min(trimFront, availableEndBin - availableStartBin);
+                sourceMaxBins.erase(sourceMaxBins.begin(), sourceMaxBins.begin() + trimFront);
+                sourceMinBins.erase(sourceMinBins.begin(), sourceMinBins.begin() + trimFront);
+                sourceLowBins.erase(sourceLowBins.begin(), sourceLowBins.begin() + trimFront);
+                sourceMidBins.erase(sourceMidBins.begin(), sourceMidBins.begin() + trimFront);
+                sourceHighBins.erase(sourceHighBins.begin(), sourceHighBins.begin() + trimFront);
+                availableStartBin += trimFront;
+            }
+
+            if (trimBack > 0) {
+                trimBack = std::min(trimBack, availableEndBin - availableStartBin);
+                sourceMaxBins.erase(sourceMaxBins.end() - trimBack, sourceMaxBins.end());
+                sourceMinBins.erase(sourceMinBins.end() - trimBack, sourceMinBins.end());
+                sourceLowBins.erase(sourceLowBins.end() - trimBack, sourceLowBins.end());
+                sourceMidBins.erase(sourceMidBins.end() - trimBack, sourceMidBins.end());
+                sourceHighBins.erase(sourceHighBins.end() - trimBack, sourceHighBins.end());
                 availableEndBin -= trimBack;
             }
         }
@@ -1019,20 +1294,29 @@ void WaveformDisplay::setPlayhead(double relative)
         lastSeekTime = std::chrono::steady_clock::now();
         treatedAsSeek = true;
         
-        // Immediately request a large region around the jump position
+        // Immediately focus streaming on the jump position
         if (streamingMode && sourceWidth > 0) {
             double binPerSecond = static_cast<double>(sourceWidth) / audioLength;
             double seekSeconds = relative * audioLength;
             int seekBin = static_cast<int>(seekSeconds * binPerSecond);
             
-            // Request a much larger window for smooth playback after jumping
+            // Compute large window for smooth playback after jumping
             int windowSize = streamingPreloadBins * 6; // 6x larger for jumps
             int startBin = std::max(0, seekBin - windowSize);
             int endBin = std::min(sourceWidth, seekBin + windowSize);
-            
-            // Force immediate request by clearing pending state
-            hasPendingRegionRequest = false;
+
+            // Keep current cached geometry visible while streaming catches up.
+            // Just force immediate requests; don't clear buffers here to avoid a blank frame.
+            hasPendingRegionRequest = false; // allow immediate new requests
+            streamingExpectedNextBin = startBin;
+            // Request a small micro-window centered at the seek point for instant on-screen data
+            const int microSize = 1024;
+            const int microStart = std::clamp(seekBin - microSize / 2, 0, std::max(0, sourceWidth - microSize));
+            requestStreamingWindowIfNeeded(microStart, microStart + microSize, binPerSecond);
+            // And request the larger window to quickly fill around
             requestStreamingWindowIfNeeded(startBin, endBin, binPerSecond);
+            // Nudge a repaint so the playhead moves immediately
+            update();
         }
         
         // Invalidate geometry cache to force immediate rebuild at new position
@@ -1140,6 +1424,8 @@ void WaveformDisplay::rebuildChunkCacheIfNeeded() {
         return;
     }
 
+    std::shared_lock<std::shared_mutex> lock(sourceMutex);
+
     chunkCacheDirty = false;
     chunkCache.clear();
     chunkNormalizationFactor = 1.0f;
@@ -1170,21 +1456,37 @@ void WaveformDisplay::rebuildChunkCacheIfNeeded() {
 
     secondsPerBin = 1.0 / binPerSecond;
 
-    const int stride = std::max(1, totalBins / 1000);
-    double sumSq = 0.0;
-    int sampleCount = 0;
-    for (int i = 0; i < totalBins; i += stride) {
-        float maxVal = sourceMaxBins[i];
-        float minVal = sourceMinBins[i];
-        float peak = std::max(std::abs(minVal), std::abs(maxVal));
-        sumSq += peak * peak;
-        ++sampleCount;
-    }
+    // Robust normalization: use a high percentile of per-bin peaks across the available data
+    // to avoid inflating very quiet parts. Never amplify above 1.0.
+    {
+        const int stride = std::max(1, totalBins / 1000);
+        std::vector<float> sampledPeaks;
+        sampledPeaks.reserve(std::min(totalBins / stride + 1, 2000));
+        float maxPeak = 0.0f;
+        for (int i = 0; i < totalBins; i += stride) {
+            const float peak = std::max(std::abs(sourceMinBins[i]), std::abs(sourceMaxBins[i]));
+            sampledPeaks.push_back(peak);
+            if (peak > maxPeak) maxPeak = peak;
+        }
 
-    if (sampleCount > 0) {
-        double rms = std::sqrt(sumSq / sampleCount);
-        if (rms > 0.05) {
-            chunkNormalizationFactor = static_cast<float>(0.8 / rms);
+        float robustPeak = maxPeak;
+        if (sampledPeaks.size() >= 16) {
+            // 98th percentile via nth_element (approximate robust peak)
+            size_t idx = static_cast<size_t>(std::floor(0.98 * (sampledPeaks.size() - 1)));
+            std::nth_element(sampledPeaks.begin(), sampledPeaks.begin() + idx, sampledPeaks.end());
+            robustPeak = std::max(0.0f, sampledPeaks[idx]);
+        }
+
+        // Aim for ~90% of vertical space at robust peak, but do not amplify
+        const float targetPeak = 0.9f;
+        if (robustPeak > 1e-6f) {
+            float factor = targetPeak / robustPeak;
+            // Never amplify; keep within a sensible attenuation range
+            factor = std::clamp(factor, 0.3f, 1.0f);
+            chunkNormalizationFactor = factor;
+        } else {
+            // No meaningful signal yet; avoid amplification
+            chunkNormalizationFactor = 1.0f;
         }
     }
 
@@ -1247,8 +1549,14 @@ void WaveformDisplay::rebuildChunkCacheIfNeeded() {
                 maxVal = 0.0f;
             }
 
+            // Apply normalization and a small noise gate to avoid drawing near-silence as large shapes
             minVal *= chunkNormalizationFactor;
             maxVal *= chunkNormalizationFactor;
+            const float noiseGate = 0.01f; // ~1% of full scale
+            if (std::max(std::abs(minVal), std::abs(maxVal)) < noiseGate) {
+                minVal = 0.0f;
+                maxVal = 0.0f;
+            }
             const float peakLimit = 1.0f;
             minVal = std::max(-peakLimit, std::min(0.0f, minVal));
             maxVal = std::min(peakLimit, std::max(0.0f, maxVal));
@@ -1386,9 +1694,10 @@ bool WaveformDisplay::computeViewportMetrics(ViewportMetrics& metrics) const {
     if (visualRel < 0.0 && prerollEnabled) playheadSeconds = visualRel * prerollTimeSec;
     else if (totalLength > 0.0) playheadSeconds = std::clamp(visualRel, 0.0, 1.0) * totalLength;
 
+    // Shift display center by output latency so overlays match perceived audio
     const double displayCenterSeconds = (viewMode == ViewMode::BeatLocked)
-        ? (playheadSeconds / safeTempo)
-        : playheadSeconds;
+        ? ((playheadSeconds + renderLatencySec) / safeTempo)
+        : (playheadSeconds + renderLatencySec);
 
     const double bufferSec = std::max(0.05, 0.5 / std::max(1.0, zoomFactor));
     const double halfViewportTime = static_cast<double>(viewportWidth) / (2.0 * pixelsPerSecond);
@@ -1473,7 +1782,11 @@ void WaveformDisplay::requestStreamingWindowIfNeeded(int neededStartBin, int nee
     const auto now = std::chrono::steady_clock::now();
     
     // Immediate request on position jumps (seek mode)
-    const bool isJump = std::abs(neededStartBin - availableEndBin) > streamingPreloadBins * 2;
+    const bool outsideCurrentWindow = (neededEndBin < availableStartBin) || (neededStartBin > availableEndBin);
+    const bool farFromEitherEdge = (availableEndBin > availableStartBin)
+        ? (std::min(std::abs(neededStartBin - availableStartBin), std::abs(neededEndBin - availableEndBin)) > streamingPreloadBins * 2)
+        : true;
+    const bool isJump = outsideCurrentWindow || farFromEitherEdge;
     
     if (hasPendingRegionRequest && !isJump) {
         const bool coversPending = desiredStart >= pendingRequestStartBin && desiredEnd <= pendingRequestEndBin;
@@ -1866,45 +2179,81 @@ void WaveformDisplay::drawRangeOverlay(QPainter& p,
 
 // NEW: Draw preroll region for DJ-style cueing
 void WaveformDisplay::drawPrerollRegion(QPainter& p, double leftSecond, double rightSecond, double timeRange) {
-    if (rightSecond <= 0.0) {
-        double screenStartX = 0;
-        double screenEndX = width();
-        
+    // Convert the display-time edges to AUDIO-time to make decisions robust in all view modes
+    const double audioLeftSec = mapDisplayToAudio(leftSecond);
+    const double audioRightSec = mapDisplayToAudio(rightSecond);
+
+    // Nothing to draw if the entire window is after track start
+    if (audioLeftSec >= 0.0) return;
+
+    const int w = width();
+    const int h = height();
+
+    // Entire viewport is preroll (audioRightSec <= 0)
+    if (audioRightSec <= 0.0) {
         QColor prerollColor(30, 50, 80, 120);
-        p.fillRect(QRect(screenStartX, 0, screenEndX - screenStartX, height()), prerollColor);
-        
+        p.fillRect(QRect(0, 0, w, h), prerollColor);
+
         p.setPen(QPen(QColor(60, 100, 160), 1));
-        for (int x = screenStartX; x < screenEndX; x += 20) {
-            p.drawLine(x, 0, x + 10, height());
+        for (int x = 0; x < w; x += 20) {
+            p.drawLine(x, 0, x + 10, h);
         }
-        
+
         p.setFont(QFont("Arial", 10, QFont::Bold));
         p.setPen(QPen(QColor(120, 180, 255), 1));
-        p.drawText(width()/2 - 30, height()/2, "PREROLL");
-        
-    } else if (leftSecond < 0.0) {
-        double prerollRatio = -leftSecond / timeRange;
-        int screenEndX = (int)(prerollRatio * width());
-        
-        QColor prerollColor(30, 50, 80, 120);
-        p.fillRect(QRect(0, 0, screenEndX, height()), prerollColor);
-        
-        p.setPen(QPen(QColor(60, 100, 160), 1));
-        for (int x = 0; x < screenEndX; x += 15) {
-            p.drawLine(x, 0, x + 8, height());
+        p.drawText(w/2 - 30, h/2, "PREROLL");
+        return;
+    }
+
+    // Partial preroll: shade from left edge up to the exact pixel where audio time 0.0 appears
+    const double startDisplaySec = mapAudioToDisplay(0.0);
+    const double range = std::max(geometryCache.timeRange, 1e-9);
+    const double trackStartRatio = (startDisplaySec - geometryCache.leftSecond) / range;
+    // Use floor with a tiny bias and clamp to stabilize at pixel boundaries and avoid +/-1 px toggling
+    int trackStartX = static_cast<int>(std::floor(trackStartRatio * w + 0.001));
+    trackStartX = std::clamp(trackStartX, 0, w);
+
+    // Apply a small screen-edge dead zone to avoid flicker when the edge is at the very first/last pixel
+    const int leftDead = 1;
+    const int rightDead = 1;
+
+    if (trackStartX <= leftDead) {
+        lastPrerollEdgeX = trackStartX;
+        return; // nothing visible beyond a hairline at the very left
+    }
+    if (trackStartX >= w - rightDead) {
+        lastPrerollEdgeX = trackStartX;
+        return; // skip drawing when start is effectively beyond the right edge to prevent late flashes
+    }
+
+    // Remember last edge to further reduce tiny oscillations (+/-1 px). Prefer the edge that moves inward.
+    if (lastPrerollEdgeX >= 0) {
+        // If the new edge is within 1px of the previous, keep the previous to avoid shimmer
+        if (std::abs(trackStartX - lastPrerollEdgeX) <= 1) {
+            trackStartX = lastPrerollEdgeX;
+        } else {
+            lastPrerollEdgeX = trackStartX;
         }
-        
-        const double startDisplaySec = mapAudioToDisplay(0.0);
-        const double trackStartRatio = (startDisplaySec - geometryCache.leftSecond) / geometryCache.timeRange;
-        const int trackStartX = (int)std::round(trackStartRatio * width());
-        p.setPen(QPen(QColor(255, 255, 255), 2));
-        p.drawLine(trackStartX, 0, trackStartX, height());
-        
-        // Label
-        p.setFont(QFont("Arial", 8, QFont::Bold));
-        p.setPen(QPen(QColor(120, 180, 255), 1));
-        if (screenEndX > 60) {
-            p.drawText(10, 20, "PREROLL");
-        }
+    } else {
+        lastPrerollEdgeX = trackStartX;
+    }
+
+    QColor prerollColor(30, 50, 80, 120);
+    p.fillRect(QRect(0, 0, trackStartX, h), prerollColor);
+
+    p.setPen(QPen(QColor(60, 100, 160), 1));
+    for (int x = 0; x < trackStartX; x += 15) {
+        p.drawLine(x, 0, x + 8, h);
+    }
+
+    // Draw the track start line
+    p.setPen(QPen(QColor(255, 255, 255), 2));
+    p.drawLine(trackStartX, 0, trackStartX, h);
+
+    // Label
+    p.setFont(QFont("Arial", 8, QFont::Bold));
+    p.setPen(QPen(QColor(120, 180, 255), 1));
+    if (trackStartX > 60) {
+        p.drawText(10, 20, "PREROLL");
     }
 }

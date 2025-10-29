@@ -14,6 +14,7 @@
 #include <chrono>
 #include <utility>
 #include <cstdint>
+#include <shared_mutex>
 #include "ScratchEngine.h"
 
 class WaveformDisplay : public QOpenGLWidget, protected QOpenGLFunctions
@@ -66,6 +67,15 @@ public:
                           const std::vector<float>& minBins,
                           bool isFinalChunk = false);
 
+    // Extended streaming method with 3-band energy for colorful rendering
+    void appendStreamBins(int startBin,
+                          const std::vector<float>& maxBins,
+                          const std::vector<float>& minBins,
+                          const std::vector<float>& lowBins,
+                          const std::vector<float>& midBins,
+                          const std::vector<float>& highBins,
+                          bool isFinalChunk = false);
+
     std::pair<int, int> getCachedBinRange() const;
     
     void setBeatInfo(double bpm, double firstBeatOffset, double totalLength) {
@@ -81,6 +91,9 @@ public:
     void setPrerollEnabled(bool enabled) { prerollEnabled = enabled; update(); }
     void setPrerollTime(double seconds) { prerollTimeSec = seconds; update(); }
     bool isPrerollEnabled() const { return prerollEnabled; }
+    // Control whether the visual preroll shading is drawn (does not affect preroll behavior)
+    void setPrerollOverlayEnabled(bool enabled) { prerollOverlayEnabled = enabled; update(); }
+    bool isPrerollOverlayEnabled() const { return prerollOverlayEnabled; }
 
     void setTempoFactor(double factor) { 
         tempoFactor = factor; 
@@ -103,8 +116,12 @@ public:
     
     void setLoopRegion(bool enabled, double startSec = 0.0, double endSec = 0.0);
     void clearLoop();
+    void setLoopOverlayEnabled(bool enabled) { loopOverlayEnabled = enabled; update(); }
+    bool isLoopOverlayEnabled() const { return loopOverlayEnabled; }
     
     void setGhostLoopRegion(bool enabled, double startSec = 0.0, double endSec = 0.0);
+    void setGhostLoopOverlayEnabled(bool enabled) { ghostLoopOverlayEnabled = enabled; update(); }
+    bool isGhostLoopOverlayEnabled() const { return ghostLoopOverlayEnabled; }
 
     void clearDisplay();
 
@@ -136,6 +153,10 @@ public:
     void setViewMode(ViewMode m) { viewMode = m; update(); }
     ViewMode getViewMode() const { return viewMode; }
     void setVisualLatencyComp(double seconds) { visualLatencyComp = std::clamp(seconds, -0.25, 0.25); }
+    // Compensate for audio output latency so the visual center matches what you hear.
+    // Positive values shift the waveform/grid to the right.
+    void setOutputLatencyComp(double seconds) { renderLatencySec = std::clamp(seconds, -0.25, 0.25); update(); }
+    double getOutputLatencyComp() const { return renderLatencySec; }
 
     void setAnalysisActive(bool active) {
         analysisActive = active;
@@ -175,9 +196,13 @@ protected:
         if (glResources.vao.isCreated()) {
             glResources.vao.destroy();
         }
-        glResources.fillVbo = 0;
-        glResources.topLineVbo = 0;
-        glResources.bottomLineVbo = 0;
+        glResources.fillVbo[0] = glResources.fillVbo[1] = 0;
+        glResources.topLineVbo[0] = glResources.topLineVbo[1] = 0;
+        glResources.bottomLineVbo[0] = glResources.bottomLineVbo[1] = 0;
+        glResources.frontIndex = 0;
+        glResources.fillVertexCountFront = 0;
+        glResources.topLineVertexCountFront = 0;
+        glResources.bottomLineVertexCountFront = 0;
         glResources.usingGles = context() ? context()->isOpenGLES() : false;
         renderCache.geometryValid = false;
         renderCache.needsFullRedraw = true;
@@ -247,6 +272,11 @@ private:
     
     std::vector<float> sourceMaxBins;
     std::vector<float> sourceMinBins;
+    // Optional per-bin 3-band RMS energies (low/mid/high) aligned with source bins
+    std::vector<float> sourceLowBins;
+    std::vector<float> sourceMidBins;
+    std::vector<float> sourceHighBins;
+    mutable std::shared_mutex sourceMutex;
     int sourceWidth{0};
     double audioLength{0.0};
     int availableStartBin{0};
@@ -268,10 +298,12 @@ private:
     bool loopEnabled{false};
     double loopStartSec{0.0};
     double loopEndSec{0.0};
+    bool loopOverlayEnabled{true};
     
     bool ghostLoopEnabled{false};
     double ghostLoopStartSec{0.0};
     double ghostLoopEndSec{0.0};
+    bool ghostLoopOverlayEnabled{true};
 
     ScratchEngine* scratchEngine{nullptr};
     std::vector<QMetaObject::Connection> scratchEngineConnections;
@@ -315,16 +347,21 @@ private:
         double alignShiftSec{0.0};
     } geometryCache;
 
+    // Hysteresis latch to stabilize alignment near track start (prevents tiny oscillations)
+    bool alignZeroLatchActive{false};
+    double alignZeroShiftSec{0.0};
+
     struct GlResources {
         bool initialized{false};
         bool usingGles{false};
         QOpenGLVertexArrayObject vao;
-        GLuint fillVbo{0};
-        GLuint topLineVbo{0};
-        GLuint bottomLineVbo{0};
-        int fillVertexCount{0};
-        int topLineVertexCount{0};
-        int bottomLineVertexCount{0};
+        GLuint fillVbo[2]{0,0};
+        GLuint topLineVbo[2]{0,0};
+        GLuint bottomLineVbo[2]{0,0};
+        int frontIndex{0};
+        int fillVertexCountFront{0};
+        int topLineVertexCountFront{0};
+        int bottomLineVertexCountFront{0};
         QOpenGLShaderProgram fillProgram;
         QOpenGLShaderProgram lineProgram;
     } glResources;
@@ -343,6 +380,8 @@ private:
     mutable std::vector<float> pixelUpperScratch;
     mutable std::vector<float> pixelLowerScratch;
     mutable std::vector<std::uint8_t> pixelCoverageScratch;
+    // Per-pixel color (R,G,B) computed from band energies
+    mutable std::vector<float> pixelColorScratch;
 
     struct WaveformChunk {
         int startBin{0};
@@ -371,6 +410,8 @@ private:
     bool useFixedPixelsPerSecond{true};
     ViewMode viewMode{ViewMode::BeatLocked};
     double visualLatencyComp{0.0};
+    // Static audio output latency compensation (seconds). Shifts display center relative to playhead.
+    double renderLatencySec{0.03};
 
     bool analysisActive{false};
     double analysisProgress{0.0};
@@ -398,6 +439,24 @@ private:
     
     bool prerollEnabled{true};
     double prerollTimeSec{8.0};
+
+    // Preroll overlay state to avoid edge flicker: simple Schmitt trigger + last edge cache
+    bool prerollVisible{false};
+    // Show overlay when strictly below this negative-time threshold; hide when above hide threshold
+    double prerollShowThresholdSec{0.06}; // 60 ms
+    double prerollHideThresholdSec{0.02}; // 20 ms
+    int lastPrerollEdgeX{-1};
+
+    // Global toggle for drawing the preroll overlay; keep behavior but hide visuals by default
+    bool prerollOverlayEnabled{false};
+
+    // Optional: overlay for streaming gaps (blue loading stripes) – disabled by default
+public:
+    void setMissingSegmentsOverlayEnabled(bool enabled) { missingSegmentsOverlayEnabled = enabled; update(); }
+    bool isMissingSegmentsOverlayEnabled() const { return missingSegmentsOverlayEnabled; }
+
+private:
+    bool missingSegmentsOverlayEnabled{false};
     
     void loadAndRenderWaveform();
     void generateDefaultGrid();

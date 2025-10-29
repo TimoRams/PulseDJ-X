@@ -487,24 +487,36 @@ void TopWaveformDisplayTask::run() {
         const double lengthSeconds = std::max(metadata.lengthSeconds, 0.001);
         int totalBins = static_cast<int>(std::ceil(lengthSeconds * binsPerSecondTarget));
         totalBins = std::clamp(totalBins, 4096, 240000);
-        const int chunkBinSize = 4096;
+    const int chunkBinSize = 1024; // smaller chunks for faster first paint on seek
         const int firstChunkBins = std::min(chunkBinSize, totalBins);
 
-        std::shared_ptr<std::vector<float>> firstMaxPtr;
-        std::shared_ptr<std::vector<float>> firstMinPtr;
+    std::shared_ptr<std::vector<float>> firstMaxPtr;
+    std::shared_ptr<std::vector<float>> firstMinPtr;
+    std::shared_ptr<std::vector<float>> firstLowPtr;
+    std::shared_ptr<std::vector<float>> firstMidPtr;
+    std::shared_ptr<std::vector<float>> firstHighPtr;
 
         if (firstChunkBins > 0) {
             std::vector<float> maxBins;
             std::vector<float> minBins;
+            std::vector<float> lowBins;
+            std::vector<float> midBins;
+            std::vector<float> highBins;
             if (generator.renderBinWindow(juce::File(path.toStdString()),
                                           metadata,
                                           totalBins,
                                           0,
                                           firstChunkBins,
                                           maxBins,
-                                          minBins)) {
+                                          minBins,
+                                          lowBins,
+                                          midBins,
+                                          highBins)) {
                 firstMaxPtr = std::make_shared<std::vector<float>>(std::move(maxBins));
                 firstMinPtr = std::make_shared<std::vector<float>>(std::move(minBins));
+                firstLowPtr = std::make_shared<std::vector<float>>(std::move(lowBins));
+                firstMidPtr = std::make_shared<std::vector<float>>(std::move(midBins));
+                firstHighPtr = std::make_shared<std::vector<float>>(std::move(highBins));
             }
         }
 
@@ -515,7 +527,7 @@ void TopWaveformDisplayTask::run() {
         session.lengthSeconds = metadata.lengthSeconds;
         session.binsPerSecond = static_cast<double>(totalBins) / lengthSeconds;
         session.chunkBinSize = chunkBinSize;
-    session.cacheCapacityBins = session.chunkBinSize * 6;
+        session.cacheCapacityBins = session.chunkBinSize * 6;
         session.valid = true;
         session.cachedStartBin = 0;
         session.cachedEndBin = 0;
@@ -539,7 +551,10 @@ void TopWaveformDisplayTask::run() {
                                        session,
                                        firstMaxPtr,
                                        firstMinPtr,
-                                       coverage]() {
+                                                    coverage,
+                                                    firstLowPtr,
+                                                    firstMidPtr,
+                                                    firstHighPtr]() {
                                           if (auto windowPtr = w.data()) {
                                               QtDeckWidget* deck = deckIsA ? windowPtr->deckA : windowPtr->deckB;
                                               if (!deck || deck->getCurrentFilePath() != path) {
@@ -559,7 +574,11 @@ void TopWaveformDisplayTask::run() {
                                                                      session.chunkBinSize * 6);
 
                                                   if (session.hasCache && firstMaxPtr && firstMinPtr) {
-                                                      wf->appendStreamBins(0, *firstMaxPtr, *firstMinPtr, false);
+                                                      if (firstLowPtr && firstMidPtr && firstHighPtr) {
+                                                          wf->appendStreamBins(0, *firstMaxPtr, *firstMinPtr, *firstLowPtr, *firstMidPtr, *firstHighPtr, false);
+                                                      } else {
+                                                          wf->appendStreamBins(0, *firstMaxPtr, *firstMinPtr, false);
+                                                      }
                                                       wf->setAnalysisActive(false);
                                                       wf->setAnalysisProgress(std::clamp(coverage, 0.0, 1.0));
                                                   } else {
@@ -620,22 +639,34 @@ void WaveformStreamChunkTask::run() {
         QThread::currentThread()->setPriority(QThread::LowestPriority);
         WaveformGenerator generator;
 
-        std::shared_ptr<std::vector<float>> maxPtr;
-        std::shared_ptr<std::vector<float>> minPtr;
+    std::shared_ptr<std::vector<float>> maxPtr;
+    std::shared_ptr<std::vector<float>> minPtr;
+    std::shared_ptr<std::vector<float>> lowPtr;
+    std::shared_ptr<std::vector<float>> midPtr;
+    std::shared_ptr<std::vector<float>> highPtr;
 
-        std::vector<float> maxBins;
-        std::vector<float> minBins;
-        const bool success = generator.renderBinWindow(juce::File(filePath.toStdString()),
-                                                       metadata,
-                                                       totalBins,
-                                                       startBin,
-                                                       binCount,
-                                                       maxBins,
-                                                       minBins);
+    std::vector<float> maxBins;
+    std::vector<float> minBins;
+    std::vector<float> lowBins;
+    std::vector<float> midBins;
+    std::vector<float> highBins;
+    const bool success = generator.renderBinWindow(juce::File(filePath.toStdString()),
+                               metadata,
+                               totalBins,
+                               startBin,
+                               binCount,
+                               maxBins,
+                               minBins,
+                               lowBins,
+                               midBins,
+                               highBins);
 
         if (success) {
             maxPtr = std::make_shared<std::vector<float>>(std::move(maxBins));
             minPtr = std::make_shared<std::vector<float>>(std::move(minBins));
+            lowPtr = std::make_shared<std::vector<float>>(std::move(lowBins));
+            midPtr = std::make_shared<std::vector<float>>(std::move(midBins));
+            highPtr = std::make_shared<std::vector<float>>(std::move(highBins));
         }
 
         if (auto* windowRaw = windowGuard.data()) {
@@ -646,14 +677,20 @@ void WaveformStreamChunkTask::run() {
                                        start = startBin,
                                        maxPtr,
                                        minPtr,
-                                       success]() {
+                                       success,
+                                       lowPtr,
+                                       midPtr,
+                                       highPtr]() {
                                           if (auto windowPtr = w.data()) {
                                               windowPtr->handleWaveformChunkResult(deckIsA,
                                                                                    path,
                                                                                    start,
                                                                                    maxPtr,
                                                                                    minPtr,
-                                                                                   success);
+                                                                                   success,
+                                                                                   lowPtr,
+                                                                                   midPtr,
+                                                                                   highPtr);
                                           }
                                       },
                                       Qt::QueuedConnection);
@@ -666,7 +703,7 @@ void WaveformStreamChunkTask::run() {
                                        path = filePath,
                                        start = startBin]() {
                                           if (auto windowPtr = w.data()) {
-                                              windowPtr->handleWaveformChunkResult(deckIsA, path, start, {}, {}, false);
+                                              windowPtr->handleWaveformChunkResult(deckIsA, path, start, {}, {}, false, {}, {}, {});
                                           }
                                       },
                                       Qt::QueuedConnection);
