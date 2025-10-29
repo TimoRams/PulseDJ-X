@@ -2,6 +2,7 @@
 #include "DJAudioPlayer.h"
 #include "WaveformGenerator.h"
 #include "ScratchEngine.h"
+#include "FrameTiming.h"
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QFileDialog>
@@ -310,7 +311,7 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     // Poll player position and update waveform playhead at ~60 FPS for smooth visuals
     QTimer* t = new QTimer(this);
     t->setTimerType(Qt::PreciseTimer);
-    t->setInterval(16);
+    t->setInterval(FrameTiming::kFrameIntervalMs);
     connect(t, &QTimer::timeout, [this]() {
         if (!player) return;
         // Always reflect current position, even when paused, to keep displays in sync
@@ -446,6 +447,9 @@ void QtDeckWidget::setTrackInfoDisplay(const QString& text, const QString& style
 
 // NEW: Handle completion of threaded file loading
 void QtDeckWidget::onFileLoadingComplete(const QString& filePath) {
+    qDebug() << "QtDeckWidget::onFileLoadingComplete called for" << filePath 
+             << "current:" << currentFilePath << "player:" << (player != nullptr);
+    
     if (player && currentFilePath == filePath) {
         // Re-enable controls after loading is complete
         playPauseBtn->setText("Play");
@@ -454,6 +458,7 @@ void QtDeckWidget::onFileLoadingComplete(const QString& filePath) {
         loadBtn->setEnabled(true);
         if (unloadBtn) unloadBtn->setEnabled(true);
         
+        qDebug() << "QtDeckWidget::onFileLoadingComplete - emitting fileLoaded() signal";
         // Emit the file loaded signal for other components (BPM analysis, etc.)
         emit fileLoaded();
     }

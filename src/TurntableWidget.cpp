@@ -1,4 +1,5 @@
 #include "TurntableWidget.h"
+#include "FrameTiming.h"
 
 #include <QCursor>
 #include <QMouseEvent>
@@ -15,7 +16,7 @@ constexpr double kSecondsPerFrame(int intervalMs) {
 
 QtTurntableWidget::QtTurntableWidget(QWidget* parent) : QWidget(parent) {
     connect(&timer, &QTimer::timeout, this, &QtTurntableWidget::tick);
-    timer.setInterval(16); // ~60 FPS for smooth animation
+    timer.setInterval(FrameTiming::kFrameIntervalMs);
     setMinimumSize(100, 100);
     setMouseTracking(true);
 }

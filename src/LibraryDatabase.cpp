@@ -19,7 +19,7 @@
 namespace
 {
 constexpr auto kConnectionPrefix = "LibraryConnection";
-constexpr int kSchemaVersion = 4;
+constexpr int kSchemaVersion = 5; // Bumped to 5 for waveform caching
 
 bool execOrLog(QSqlQuery& query, const char* context)
 {
@@ -136,6 +136,28 @@ std::array<double, 8> deserializeCuePoints(const QString& text)
     return cues;
 }
 
+// WAVEFORM CACHING: Serialize/deserialize waveform bins to/from BLOB
+QByteArray serializeWaveformBins(const std::vector<float>& bins)
+{
+    if (bins.empty())
+        return QByteArray();
+    
+    QByteArray data(reinterpret_cast<const char*>(bins.data()), 
+                    static_cast<int>(bins.size() * sizeof(float)));
+    return data;
+}
+
+std::vector<float> deserializeWaveformBins(const QByteArray& data)
+{
+    std::vector<float> bins;
+    if (data.isEmpty() || (data.size() % sizeof(float)) != 0)
+        return bins;
+    
+    bins.resize(data.size() / sizeof(float));
+    std::memcpy(bins.data(), data.constData(), data.size());
+    return bins;
+}
+
 bool ensurePlaylistTables(QSqlDatabase& db)
 {
     const char* statements[] = {
@@ -243,7 +265,8 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
     QSqlQuery query(db);
     if (!query.exec(QStringLiteral(
         "SELECT file_path, title, artist, album, genre, year, duration, bpm, file_size, comment, track_key, file_modified, added_at, updated_at, "
-        "analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points "
+        "analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points, "
+        "waveform_max_bins, waveform_min_bins, waveform_audio_start_offset, waveform_analyzed_at "
         "FROM tracks ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE")))
     {
     std::cerr << "LibraryDatabase loadAllTracks failed: "
@@ -275,6 +298,10 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
     const int idxBeatGrid = record.indexOf("beat_grid");
     const int idxAnalysisFailed = record.indexOf("analysis_failed");
     const int idxCuePoints = record.indexOf("cue_points");
+    const int idxWaveformMaxBins = record.indexOf("waveform_max_bins");
+    const int idxWaveformMinBins = record.indexOf("waveform_min_bins");
+    const int idxWaveformAudioStartOffset = record.indexOf("waveform_audio_start_offset");
+    const int idxWaveformAnalyzedAt = record.indexOf("waveform_analyzed_at");
 
     while (query.next())
     {
@@ -309,6 +336,12 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
                 break;
             }
         }
+        // WAVEFORM CACHING: Load waveform bins if available
+        track.waveformMaxBins = deserializeWaveformBins(query.value(idxWaveformMaxBins).toByteArray());
+        track.waveformMinBins = deserializeWaveformBins(query.value(idxWaveformMinBins).toByteArray());
+        track.waveformAudioStartOffset = query.value(idxWaveformAudioStartOffset).toDouble();
+        track.waveformAnalyzedAt = query.value(idxWaveformAnalyzedAt).toLongLong();
+        
         if (track.trackLengthSeconds <= 0.0)
             track.trackLengthSeconds = track.duration;
         if (track.duration <= 0.0 && track.trackLengthSeconds > 0.0)
@@ -1103,6 +1136,33 @@ bool LibraryDatabase::ensureSchema()
                 continue;
             }
 
+            if (version == 4)
+            {
+                // Add waveform caching support
+                const char* migrations[] = {
+                    "ALTER TABLE tracks ADD COLUMN waveform_max_bins BLOB",
+                    "ALTER TABLE tracks ADD COLUMN waveform_min_bins BLOB",
+                    "ALTER TABLE tracks ADD COLUMN waveform_audio_start_offset REAL DEFAULT 0",
+                    "ALTER TABLE tracks ADD COLUMN waveform_analyzed_at INTEGER DEFAULT 0"
+                };
+
+                for (const char* sql : migrations)
+                {
+                    QSqlQuery migrate(db);
+                    if (!migrate.exec(QString::fromUtf8(sql)))
+                    {
+                        std::cerr << "LibraryDatabase: waveform migration failed: "
+                                  << migrate.lastError().text().toStdString() << std::endl;
+                        return false;
+                    }
+                }
+                
+                version = 5;
+                needsVersionUpdate = true;
+                std::cout << "LibraryDatabase: migrated to schema v5 (waveform caching)" << std::endl;
+                continue;
+            }
+
             std::cerr << "LibraryDatabase: unsupported schema upgrade path from version "
                       << version << std::endl;
             return false;
@@ -1162,7 +1222,11 @@ bool LibraryDatabase::createSchema()
             "analysis_failed INTEGER DEFAULT 0,"
             "cue_points TEXT,"
             "rating INTEGER DEFAULT 0,"
-            "play_count INTEGER DEFAULT 0"
+            "play_count INTEGER DEFAULT 0,"
+            "waveform_max_bins BLOB,"
+            "waveform_min_bins BLOB,"
+            "waveform_audio_start_offset REAL DEFAULT 0,"
+            "waveform_analyzed_at INTEGER DEFAULT 0"
             ")")))
     {
     std::cerr << "LibraryDatabase: failed to create tracks table: "

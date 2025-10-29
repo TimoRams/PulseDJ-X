@@ -18,6 +18,7 @@
 #include <exception>
 #include <memory>
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -390,53 +391,285 @@ TopWaveformDisplayTask::TopWaveformDisplayTask(QtMainWindow* mainWindow, QString
 }
 
 void TopWaveformDisplayTask::run() {
-    if (!window) {
+    QPointer<QtMainWindow> windowGuard = window;
+    if (!windowGuard) {
+        qDebug() << "TopWaveformDisplayTask::run - window guard invalid!";
+        return;
+    }
+
+    qDebug() << "TopWaveformDisplayTask::run - starting for" << filePath << "deck:" << (isDeckA ? "A" : "B");
+
+    const bool deckIsA = isDeckA;
+    const QString path = filePath;
+
+    if (auto* windowRaw = windowGuard.data()) {
+        QMetaObject::invokeMethod(windowRaw,
+                                  [w = windowGuard, deckIsA, path]() {
+                                      if (auto windowPtr = w.data()) {
+                                          QtDeckWidget* deck = deckIsA ? windowPtr->deckA : windowPtr->deckB;
+                                          if (!deck || deck->getCurrentFilePath() != path) {
+                                              return;
+                                          }
+
+                                          WaveformDisplay* wf = deckIsA ? windowPtr->overviewTopA : windowPtr->overviewTopB;
+                                          if (wf) {
+                                              wf->setAnalysisFailed(false);
+                                              wf->setAnalysisActive(true);
+                                              wf->setAnalysisProgress(0.0);
+                                          }
+
+                                          if (deckIsA) {
+                                              windowPtr->analysisActiveA = true;
+                                              windowPtr->analysisFailedA = false;
+                                              windowPtr->analysisProgressA = 0.0;
+                                          } else {
+                                              windowPtr->analysisActiveB = true;
+                                              windowPtr->analysisFailedB = false;
+                                              windowPtr->analysisProgressB = 0.0;
+                                          }
+
+                                          auto& session = deckIsA ? windowPtr->streamSessionA : windowPtr->streamSessionB;
+                                          session = {};
+                                          session.valid = false;
+
+                                          windowPtr->updateOverviewLabel(deckIsA);
+                                      }
+                                  },
+                                  Qt::QueuedConnection);
+    }
+
+    auto dispatchFailure = [windowGuard, deckIsA, path]() {
+        if (auto* windowRaw = windowGuard.data()) {
+            QMetaObject::invokeMethod(windowRaw,
+                                      [w = windowGuard, deckIsA, path]() {
+                                          if (auto windowPtr = w.data()) {
+                                              QtDeckWidget* deck = deckIsA ? windowPtr->deckA : windowPtr->deckB;
+                                              if (!deck || deck->getCurrentFilePath() != path) {
+                                                  return;
+                                              }
+
+                                              WaveformDisplay* wf = deckIsA ? windowPtr->overviewTopA : windowPtr->overviewTopB;
+                                              if (wf) {
+                                                  wf->setAnalysisActive(false);
+                                                  wf->setAnalysisFailed(true);
+                                              }
+
+                                              if (deckIsA) {
+                                                  windowPtr->analysisActiveA = false;
+                                                  windowPtr->analysisFailedA = true;
+                                              } else {
+                                                  windowPtr->analysisActiveB = false;
+                                                  windowPtr->analysisFailedB = true;
+                                              }
+
+                                              auto& session = deckIsA ? windowPtr->streamSessionA : windowPtr->streamSessionB;
+                                              session = {};
+                                              session.valid = false;
+
+                                              windowPtr->updateOverviewLabel(deckIsA);
+                                          }
+                                      },
+                                      Qt::QueuedConnection);
+        }
+    };
+
+    try {
+        QThread::currentThread()->setPriority(QThread::LowestPriority);
+        WaveformGenerator generator;
+
+        WaveformGenerator::AnalysisMetadata metadata;
+        if (!generator.analyzeFile(juce::File(path.toStdString()), metadata)) {
+            dispatchFailure();
+            return;
+        }
+
+        const double binsPerSecondTarget = 480.0;
+        const double lengthSeconds = std::max(metadata.lengthSeconds, 0.001);
+        int totalBins = static_cast<int>(std::ceil(lengthSeconds * binsPerSecondTarget));
+        totalBins = std::clamp(totalBins, 4096, 240000);
+        const int chunkBinSize = 4096;
+        const int firstChunkBins = std::min(chunkBinSize, totalBins);
+
+        std::shared_ptr<std::vector<float>> firstMaxPtr;
+        std::shared_ptr<std::vector<float>> firstMinPtr;
+
+        if (firstChunkBins > 0) {
+            std::vector<float> maxBins;
+            std::vector<float> minBins;
+            if (generator.renderBinWindow(juce::File(path.toStdString()),
+                                          metadata,
+                                          totalBins,
+                                          0,
+                                          firstChunkBins,
+                                          maxBins,
+                                          minBins)) {
+                firstMaxPtr = std::make_shared<std::vector<float>>(std::move(maxBins));
+                firstMinPtr = std::make_shared<std::vector<float>>(std::move(minBins));
+            }
+        }
+
+        QtMainWindow::WaveformStreamSession session;
+        session.filePath = path;
+        session.metadata = metadata;
+        session.totalBins = totalBins;
+        session.lengthSeconds = metadata.lengthSeconds;
+        session.binsPerSecond = static_cast<double>(totalBins) / lengthSeconds;
+        session.chunkBinSize = chunkBinSize;
+    session.cacheCapacityBins = session.chunkBinSize * 6;
+        session.valid = true;
+        session.cachedStartBin = 0;
+        session.cachedEndBin = 0;
+
+        const bool hasInitialChunk = firstMaxPtr && firstMinPtr && !firstMaxPtr->empty();
+        if (hasInitialChunk) {
+            session.hasCache = true;
+            session.cachedStartBin = 0;
+            session.cachedEndBin = std::min(totalBins, static_cast<int>(firstMaxPtr->size()));
+        }
+
+        const double coverage = session.hasCache
+            ? static_cast<double>(session.cachedEndBin - session.cachedStartBin) / std::max(1, session.totalBins)
+            : 0.0;
+
+        if (auto* windowRaw = windowGuard.data()) {
+            QMetaObject::invokeMethod(windowRaw,
+                                      [w = windowGuard,
+                                       deckIsA,
+                                       path,
+                                       session,
+                                       firstMaxPtr,
+                                       firstMinPtr,
+                                       coverage]() {
+                                          if (auto windowPtr = w.data()) {
+                                              QtDeckWidget* deck = deckIsA ? windowPtr->deckA : windowPtr->deckB;
+                                              if (!deck || deck->getCurrentFilePath() != path) {
+                                                  return;
+                                              }
+
+                                              auto& deckSession = deckIsA ? windowPtr->streamSessionA : windowPtr->streamSessionB;
+                                              deckSession = session;
+                                              deckSession.pendingChunks.clear();
+
+                                              WaveformDisplay* wf = deckIsA ? windowPtr->overviewTopA : windowPtr->overviewTopB;
+                                              if (wf) {
+                                                  wf->beginStreaming(session.totalBins,
+                                                                     session.metadata.audioStartOffsetSec,
+                                                                     session.lengthSeconds,
+                                                                     session.chunkBinSize,
+                                                                     session.chunkBinSize * 6);
+
+                                                  if (session.hasCache && firstMaxPtr && firstMinPtr) {
+                                                      wf->appendStreamBins(0, *firstMaxPtr, *firstMinPtr, false);
+                                                      wf->setAnalysisActive(false);
+                                                      wf->setAnalysisProgress(std::clamp(coverage, 0.0, 1.0));
+                                                  } else {
+                                                      wf->setAnalysisActive(true);
+                                                      wf->setAnalysisProgress(0.0);
+                                                  }
+                                                  wf->setAnalysisFailed(false);
+                                              }
+
+                                              if (deckIsA) {
+                                                  windowPtr->analysisActiveA = !session.hasCache;
+                                                  windowPtr->analysisFailedA = false;
+                                                  windowPtr->analysisProgressA = std::clamp(coverage, 0.0, 1.0);
+                                              } else {
+                                                  windowPtr->analysisActiveB = !session.hasCache;
+                                                  windowPtr->analysisFailedB = false;
+                                                  windowPtr->analysisProgressB = std::clamp(coverage, 0.0, 1.0);
+                                              }
+
+                                              if (session.hasCache) {
+                                                  windowPtr->reapplyStoredDeckMetadata(deckIsA);
+                                              }
+
+                                              windowPtr->updateOverviewLabel(deckIsA);
+                                          }
+                                      },
+                                      Qt::QueuedConnection);
+        }
+    } catch (...) {
+        dispatchFailure();
+    }
+}
+
+WaveformStreamChunkTask::WaveformStreamChunkTask(QtMainWindow* mainWindow,
+                                                 QString filePath,
+                                                 bool isDeckA,
+                                                 WaveformGenerator::AnalysisMetadata metadata,
+                                                 int totalBins,
+                                                 int startBin,
+                                                 int binCount)
+    : window(mainWindow),
+      filePath(std::move(filePath)),
+      isDeckA(isDeckA),
+      metadata(std::move(metadata)),
+      totalBins(totalBins),
+      startBin(startBin),
+      binCount(binCount) {
+    setAutoDelete(true);
+}
+
+void WaveformStreamChunkTask::run() {
+    QPointer<QtMainWindow> windowGuard = window;
+    if (!windowGuard) {
         return;
     }
 
     try {
         QThread::currentThread()->setPriority(QThread::LowestPriority);
-        WaveformGenerator gen;
-        WaveformGenerator::Result res;
-        const int binCount = 16000;
-        if (!gen.generate(juce::File(filePath.toStdString()), binCount, res)) {
-            return;
+        WaveformGenerator generator;
+
+        std::shared_ptr<std::vector<float>> maxPtr;
+        std::shared_ptr<std::vector<float>> minPtr;
+
+        std::vector<float> maxBins;
+        std::vector<float> minBins;
+        const bool success = generator.renderBinWindow(juce::File(filePath.toStdString()),
+                                                       metadata,
+                                                       totalBins,
+                                                       startBin,
+                                                       binCount,
+                                                       maxBins,
+                                                       minBins);
+
+        if (success) {
+            maxPtr = std::make_shared<std::vector<float>>(std::move(maxBins));
+            minPtr = std::make_shared<std::vector<float>>(std::move(minBins));
         }
 
-        auto maxBins = std::make_shared<std::vector<float>>(res.maxBins);
-        auto minBins = std::make_shared<std::vector<float>>(res.minBins);
-
-        const double audioStart = res.audioStartOffsetSec;
-        const double lengthSec = res.lengthSeconds;
-
-        const bool onDeckA = isDeckA;
-        QMetaObject::invokeMethod(window,
-                                  [w = window,
-                                   maxBins,
-                                   minBins,
-                                   audioStart,
-                                   lengthSec,
-                                   onDeckA,
-                                   filePath = this->filePath]() {
-                                      if (!w) {
-                                          return;
-                                      }
-
-                                      QtDeckWidget* deck = onDeckA ? w->deckA : w->deckB;
-                                      if (!deck) {
-                                          return;
-                                      }
-                                      if (deck->getCurrentFilePath() != filePath) {
-                                          return;
-                                      }
-                                      WaveformDisplay* wf = onDeckA ? w->overviewTopA : w->overviewTopB;
-                                      if (wf) {
-                                          wf->setSourceBins(*maxBins, *minBins, audioStart, lengthSec);
-                                          w->reapplyStoredDeckMetadata(onDeckA);
-                                      }
-                                  },
-                                  Qt::QueuedConnection);
+        if (auto* windowRaw = windowGuard.data()) {
+            QMetaObject::invokeMethod(windowRaw,
+                                      [w = windowGuard,
+                                       deckIsA = isDeckA,
+                                       path = filePath,
+                                       start = startBin,
+                                       maxPtr,
+                                       minPtr,
+                                       success]() {
+                                          if (auto windowPtr = w.data()) {
+                                              windowPtr->handleWaveformChunkResult(deckIsA,
+                                                                                   path,
+                                                                                   start,
+                                                                                   maxPtr,
+                                                                                   minPtr,
+                                                                                   success);
+                                          }
+                                      },
+                                      Qt::QueuedConnection);
+        }
     } catch (...) {
-        // Non-critical task; ignore failures.
+        if (auto* windowRaw = windowGuard.data()) {
+            QMetaObject::invokeMethod(windowRaw,
+                                      [w = windowGuard,
+                                       deckIsA = isDeckA,
+                                       path = filePath,
+                                       start = startBin]() {
+                                          if (auto windowPtr = w.data()) {
+                                              windowPtr->handleWaveformChunkResult(deckIsA, path, start, {}, {}, false);
+                                          }
+                                      },
+                                      Qt::QueuedConnection);
+        }
     }
 }

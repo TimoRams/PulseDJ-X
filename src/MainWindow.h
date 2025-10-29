@@ -15,6 +15,8 @@
 #include <ctime>
 #include <chrono>
 #include <memory>
+#include <QSet>
+#include "WaveformGenerator.h"
 #include "DeckWidget.h"
 #include "BeatIndicator.h"
 #include "MenuBar.h"
@@ -34,6 +36,7 @@ class QtMainWindow : public QWidget {
     // Forward declaration and friend class for threaded BPM analysis
     friend class BpmAnalysisTask;
     friend class TopWaveformDisplayTask;
+    friend class WaveformStreamChunkTask;
     
 public:
     explicit QtMainWindow(QWidget* parent = nullptr);
@@ -96,6 +99,21 @@ public:
     std::unique_ptr<ScratchEngine> scratchEngineB;
 
 private:
+    struct WaveformStreamSession {
+        QString filePath;
+        WaveformGenerator::AnalysisMetadata metadata;
+        int totalBins{0};
+        double lengthSeconds{0.0};
+        double binsPerSecond{0.0};
+        int chunkBinSize{4096};
+        int cacheCapacityBins{0};
+        bool valid{false};
+        bool hasCache{false};
+        int cachedStartBin{0};
+        int cachedEndBin{0};
+        QSet<int> pendingChunks;
+    };
+
     // Analysis status for overview labels
     bool analysisActiveA{false};
     bool analysisActiveB{false};
@@ -164,6 +182,9 @@ private:
     // Prevent sync feedback loops
     bool syncUpdateInProgress{false};
 
+    WaveformStreamSession streamSessionA;
+    WaveformStreamSession streamSessionB;
+
     // Optional per-deck visual sync trim (seconds), positive adds extra visual delay.
     // Useful for tiny per-system calibration without changing core logic.
     double userVisualTrimA{0.0};
@@ -195,6 +216,16 @@ private:
 
     bool shouldAnalyzeTrackOnLoad(const QString& filePath) const;
     void startDeckAnalysisIfNeeded(const QString& filePath, bool isDeckA);
+    void handleWaveformRegionRequestDeckA(double startSec, double endSec);
+    void handleWaveformRegionRequestDeckB(double startSec, double endSec);
+    void handleWaveformRegionRequest(bool deckIsA, double startSec, double endSec);
+    void scheduleWaveformChunk(bool deckIsA, int startBin, int binCount);
+    void handleWaveformChunkResult(bool deckIsA,
+                                   const QString& filePath,
+                                   int startBin,
+                                   std::shared_ptr<std::vector<float>> maxBins,
+                                   std::shared_ptr<std::vector<float>> minBins,
+                                   bool success);
     
 protected:
     void closeEvent(QCloseEvent* event) override;

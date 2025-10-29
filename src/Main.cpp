@@ -1,21 +1,47 @@
 #include "MainWindow.h"
 #include "AppConfig.h"
+#include "FrameTiming.h"
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QDebug>
 #include <QtCore/QEventLoop>
 #include <QtWidgets/QDialog>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QProgressBar>
 #include <QtWidgets/QVBoxLayout>
+#include <QSurfaceFormat>
 
 #include <memory>
+#include <expected>
+#include <print>
 
 namespace
 {
 constexpr QSize kDefaultWindowSize{1400, 900};
+constexpr bool kEnableGpuAcceleration = true;
 
-void processUiEvents()
+void configureSurfaceDefaults() noexcept
+{
+    QCoreApplication::setAttribute(Qt::AA_UseDesktopOpenGL, kEnableGpuAcceleration);
+    QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL, !kEnableGpuAcceleration);
+    QCoreApplication::setAttribute(Qt::AA_UseOpenGLES, false);
+
+    auto fmt = QSurfaceFormat::defaultFormat();
+    if (kEnableGpuAcceleration) {
+        fmt.setRenderableType(QSurfaceFormat::OpenGL);
+        fmt.setProfile(QSurfaceFormat::CoreProfile);
+        fmt.setVersion(4, 1);
+    } else {
+        fmt.setRenderableType(QSurfaceFormat::DefaultRenderableType);
+        fmt.setProfile(QSurfaceFormat::NoProfile);
+    }
+    fmt.setSwapBehavior(QSurfaceFormat::DoubleBuffer);
+    fmt.setSwapInterval(FrameTiming::kVSyncSwapInterval);
+    QSurfaceFormat::setDefaultFormat(fmt);
+}
+
+inline void processUiEvents() noexcept
 {
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 }
@@ -77,60 +103,62 @@ public:
         );
     }
 
-    void updateStatus(int value, QString text)
+    void updateStatus(int value, QString text) noexcept
     {
         progressBar->setValue(value);
         statusLabel->setText(std::move(text));
     }
 
 private:
-    QLabel* titleLabel{nullptr};
-    QLabel* statusLabel{nullptr};
-    QProgressBar* progressBar{nullptr};
+    QLabel* titleLabel{};
+    QLabel* statusLabel{};
+    QProgressBar* progressBar{};
 };
 
 int main(int argc, char** argv)
 {
+    configureSurfaceDefaults();
     QApplication app(argc, argv);
 
-        auto splash = std::make_unique<LoadingDialog>();
-        splash->show();
-        splash->raise();
-        splash->activateWindow();
+    auto splash = std::make_unique<LoadingDialog>();
+    splash->show();
+    splash->raise();
+    splash->activateWindow();
+    processUiEvents();
+
+    const auto updateSplash = [&splash](int value, QString status) noexcept {
+        splash->updateStatus(value, std::move(status));
         processUiEvents();
+    };
 
-        const auto updateSplash = [&](int value, QString status) {
-            splash->updateStatus(value, std::move(status));
-            processUiEvents();
-        };
+    updateSplash(5, QObject::tr("Initialisiere System..."));
 
-        updateSplash(5, QObject::tr("Initialisiere System..."));
+    const auto& config = AppConfig::instance();
+    qDebug() << "=== BetaPulseX DJ Software Starting ===";
+    qDebug() << "Build Type:" << (config.isDebugBuild() ? "DEBUG/DEVELOPMENT" : "RELEASE");
+    qDebug() << "Data Directory:" << config.getAppDataDirectory();
+    qDebug() << "Config Directory:" << config.getConfigDirectory();
+    qDebug() << "Library Database:" << config.getLibraryDatabasePath();
+    qDebug() << "GPU Acceleration:" << (kEnableGpuAcceleration ? "ENABLED" : "DISABLED");
 
-        const auto& config = AppConfig::instance();
-        qDebug() << "=== BetaPulseX DJ Software Starting ===";
-        qDebug() << "Build Type:" << (config.isDebugBuild() ? "DEBUG/DEVELOPMENT" : "RELEASE");
-        qDebug() << "Data Directory:" << config.getAppDataDirectory();
-        qDebug() << "Config Directory:" << config.getConfigDirectory();
-        qDebug() << "Library Database:" << config.getLibraryDatabasePath();
+    updateSplash(25, QObject::tr("Prüfe Datenordner und Einstellungen..."));
 
-        updateSplash(25, QObject::tr("Prüfe Datenordner und Einstellungen..."));
+    if (!config.createDirectories()) [[unlikely]] {
+        qWarning() << "Failed to create app directories - some features may not work!";
+    }
 
-        if (!config.createDirectories()) {
-            qWarning() << "Failed to create app directories - some features may not work!";
-        }
+    updateSplash(55, QObject::tr("Initialisiere Benutzeroberfläche..."));
 
-        updateSplash(55, QObject::tr("Initialisiere Benutzeroberfläche..."));
+    QtMainWindow mainWindow;
+    mainWindow.resize(kDefaultWindowSize);
+    mainWindow.setMinimumSize(kDefaultWindowSize);
 
-        QtMainWindow mainWindow;
-        mainWindow.resize(kDefaultWindowSize);
-        mainWindow.setMinimumSize(kDefaultWindowSize);
+    updateSplash(80, QObject::tr("Starte Audio- und UI-Komponenten..."));
 
-        updateSplash(80, QObject::tr("Starte Audio- und UI-Komponenten..."));
+    mainWindow.show();
 
-        mainWindow.show();
+    updateSplash(100, QObject::tr("Bereit zum Durchstarten!"));
+    splash->close();
 
-        updateSplash(100, QObject::tr("Bereit zum Durchstarten!"));
-        splash->close();
-
-        return app.exec();
+    return app.exec();
 }

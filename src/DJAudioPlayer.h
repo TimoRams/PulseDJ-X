@@ -28,7 +28,7 @@ public:
     void applyLoadedSource(std::unique_ptr<AudioFormatReaderSource> source, double sampleRate);
     void setGain(double gain);
     void setSpeed(double ratio);
-    void setPitchBendRatio(double ratio);
+    void setPitchBendRatio(double ratio) noexcept;
     double getPitchBendRatio() const { return pitchBendRatio; }
     void setPositionRelative(double pos);
     double getPositionRelative();
@@ -54,27 +54,27 @@ public:
     // Scratch control - sets playback speed based on scratch velocity
     void setScratchVelocity(double velocity);
     void enableScratch(bool enable);
-    void setScratchPlaybackContext(bool wasPlaying);
+    void setScratchPlaybackContext(bool wasPlaying) noexcept;
     bool isScratchMode() const { return scratchMode.load(); }
-    bool isSoftPaused() const;
-    bool isAudible() const;
+    [[nodiscard]] bool isSoftPaused() const noexcept;
+    [[nodiscard]] bool isAudible() const noexcept;
     void ensureScratchAudible();
 
     // Simple loop control (seconds)
     void enableLoop(double startSec, double lengthSec);
-    void disableLoop();
+    void disableLoop() noexcept;
     bool isLoopEnabled() const { return loopEnabled; }
     double getLoopStart() const { return loopStartSec; }
     double getLoopEnd() const { return loopEndSec; }
     
     // Simple EQ/filter control stubs (values: -1.0 .. +1.0)
-    void setHighGain(double v);
-    void setMidGain(double v);
-    void setLowGain(double v);
-    void setFilterCutoff(double v);
+    void setHighGain(double v) noexcept;
+    void setMidGain(double v) noexcept;
+    void setLowGain(double v) noexcept;
+    void setFilterCutoff(double v) noexcept;
     
     // Keylock (pitch lock) - maintains original pitch when speed changes
-    void setKeylockEnabled(bool enabled);
+    void setKeylockEnabled(bool enabled) noexcept;
     bool isKeylockEnabled() const { return keylockEnabled; }
     // Runtime keylock quality profile
     enum class KeylockQuality { Fast, Balanced, Quality };
@@ -82,10 +82,10 @@ public:
     KeylockQuality getKeylockQuality() const { return rbQuality; }
     
     // Quantize control - snaps cues and loops to nearest beat
-    void setQuantizeEnabled(bool enabled);
+    void setQuantizeEnabled(bool enabled) noexcept;
     bool isQuantizeEnabled() const { return quantizeEnabled; }
-    void setBeatInfo(double bpm, double firstBeatOffset, double trackLength);
-    double quantizePosition(double positionSec) const;
+    void setBeatInfo(double bpm, double firstBeatOffset, double trackLength) noexcept;
+    double quantizePosition(double positionSec) const noexcept;
     // Beat info getters
     double getTrackBpm() const { return trackBpm; }
     double getFirstBeatOffset() const { return trackFirstBeatOffset; }
@@ -145,8 +145,8 @@ private:
     double currentSpeed{1.0};
     double pitchBendRatio{1.0};
     double pitchShiftRatio{1.0};
-    double effectiveSpeed() const;
-    void updateResampleRatio();
+    double effectiveSpeed() const noexcept;
+    void updateResampleRatio() noexcept;
 
 #if defined(RUBBERBAND_FOUND)
     // High-quality Rubber Band time-stretcher (required for keylock functionality)

@@ -6,6 +6,8 @@
 #include <QString>
 #include <vector>
 
+#include "WaveformGenerator.h"
+
 class QtMainWindow;
 
 class AudioFileLoadTask : public QRunnable {
@@ -17,6 +19,27 @@ private:
     QPointer<QtMainWindow> window;
     QString filePath;
     bool isDeckA{false};
+};
+
+class WaveformStreamChunkTask : public QRunnable {
+public:
+    WaveformStreamChunkTask(QtMainWindow* mainWindow,
+                            QString filePath,
+                            bool isDeckA,
+                            WaveformGenerator::AnalysisMetadata metadata,
+                            int totalBins,
+                            int startBin,
+                            int binCount);
+    void run() override;
+
+private:
+    QPointer<QtMainWindow> window;
+    QString filePath;
+    bool isDeckA{false};
+    WaveformGenerator::AnalysisMetadata metadata;
+    int totalBins{0};
+    int startBin{0};
+    int binCount{0};
 };
 
 class BpmAnalysisTask : public QRunnable {

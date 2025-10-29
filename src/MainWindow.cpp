@@ -7,54 +7,34 @@
 #include "ScratchEngine.h"
 #include "StereoAudioCallback.h"
 #include "MainWindowTasks.h"
-#include <iostream>
+#include "AppConfig.h"
+#include "DeckSettings.h"
 #include <QApplication>
 #include <QMessageBox>
-#include <QDesktopServices>
-#include <QUrl>
 #include <QFileDialog>
-#include <QFileInfo>
-#include <QStandardPaths>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonValue>
-#include <QJsonParseError>
-#include <QRegularExpression>
-#include <QVector>
 #include <QProgressDialog>
 #include <QMenu>
-#include <QDebug>
-#include <array>
-#include <algorithm>
-#include <cmath>
-#include <memory>
-#include <QCursor>
-#include <limits>
-#include <QHoverEvent>
-#include <QWindow>
-
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QDir>
-#include <QListWidgetItem>
-#include <QStringList>
 #include <QPushButton>
 #include <QLineEdit>
 #include <QTextEdit>
 #include <QPlainTextEdit>
 #include <QThreadPool>
 #include <QSettings>
-#include <QMenuBar>
-#include <QAction>
-#include <QFile>
-#include <QTextStream>
 #include <QTimer>
-#include "AppConfig.h"
-#include "DeckSettings.h"
+#include <QCursor>
+#include <iostream>
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <limits>
 
-// Static members for shared format manager
 std::shared_ptr<juce::AudioFormatManager> QtMainWindow::sharedFormatManager = {};
+
 QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 {
     setWindowTitle("BetaPulseX - Professional DJ Software");
@@ -148,25 +128,26 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         }
     });
 
-    connect(overviewTopA, &WaveformDisplay::pitchBendRequested, this, [this](double ratio) {
-        if (playerA) {
-            playerA->setPitchBendRatio(ratio);
+    connect(overviewTopA, &WaveformDisplay::tempoDragRequested, this, [this](double factor) {
+        if (deckA) {
+            deckA->setTempoFactor(factor);
+        } else if (playerA) {
+            playerA->setSpeed(factor);
         }
     });
-    connect(overviewTopA, &WaveformDisplay::pitchBendEnded, this, [this]() {
-        if (playerA) {
-            playerA->setPitchBendRatio(1.0);
+    connect(overviewTopB, &WaveformDisplay::tempoDragRequested, this, [this](double factor) {
+        if (deckB) {
+            deckB->setTempoFactor(factor);
+        } else if (playerB) {
+            playerB->setSpeed(factor);
         }
     });
-    connect(overviewTopB, &WaveformDisplay::pitchBendRequested, this, [this](double ratio) {
-        if (playerB) {
-            playerB->setPitchBendRatio(ratio);
-        }
+
+    connect(overviewTopA, &WaveformDisplay::waveformRegionNeeded, this, [this](double startSec, double endSec) {
+        handleWaveformRegionRequestDeckA(startSec, endSec);
     });
-    connect(overviewTopB, &WaveformDisplay::pitchBendEnded, this, [this]() {
-        if (playerB) {
-            playerB->setPitchBendRatio(1.0);
-        }
+    connect(overviewTopB, &WaveformDisplay::waveformRegionNeeded, this, [this](double startSec, double endSec) {
+        handleWaveformRegionRequestDeckB(startSec, endSec);
     });
 
     // Beat indicator for showing current beat position
@@ -220,14 +201,10 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     connect(deckA, &QtDeckWidget::fileLoaded, [this]() {
-        if (playerA) {
-            playerA->setPitchBendRatio(1.0);
-        }
-        QString filePath = deckA->getCurrentFilePath();
-        if (!filePath.isEmpty()) {
+        if (playerA) [[likely]] playerA->setPitchBendRatio(1.0);
+        const QString filePath = deckA->getCurrentFilePath();
+        if (!filePath.isEmpty()) [[likely]] {
             bpmThreadPool->start(new TopWaveformDisplayTask(this, filePath, true));
-            
-            // Start BPM analysis only if stored metadata isn't usable
             startDeckAnalysisIfNeeded(filePath, true);
         }
     });
@@ -243,19 +220,13 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     connect(deckB, &QtDeckWidget::fileLoaded, [this]() {
-        if (playerB) {
-            playerB->setPitchBendRatio(1.0);
-        }
-        QString filePath = deckB->getCurrentFilePath();
-        if (!filePath.isEmpty()) {
+        if (playerB) [[likely]] playerB->setPitchBendRatio(1.0);
+        const QString filePath = deckB->getCurrentFilePath();
+        if (!filePath.isEmpty()) [[likely]] {
             bpmThreadPool->start(new TopWaveformDisplayTask(this, filePath, false));
-
-            // Start BPM analysis only if stored metadata isn't usable
             startDeckAnalysisIfNeeded(filePath, false);
         }
-    });
-
-    connect(deckB, &QtDeckWidget::fileLoaded, this, [this]() {
+    });    connect(deckB, &QtDeckWidget::fileLoaded, this, [this]() {
         applyStoredCuePoints(deckB, false);
         applyStoredBeatGrid(deckB, false);
     });
@@ -331,38 +302,29 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
     connect(deckB, &QtDeckWidget::playheadUpdated, this, [this](double relative) {
         double deviceLatencySec = 0.0;
-        if (auto* dev = deviceManager.getCurrentAudioDevice()) {
+        if (auto* dev = deviceManager.getCurrentAudioDevice()) [[likely]] {
             const double sr = dev->getCurrentSampleRate();
-            if (sr > 0.0) {
+            if (sr > 0.0) [[likely]] {
                 const int buf = dev->getCurrentBufferSizeSamples();
                 const int outLat = dev->getOutputLatencyInSamples();
-                if (outLat > 0) deviceLatencySec = outLat / sr; else deviceLatencySec = (buf > 0 ? (1.5 * buf) / sr : 0.0);
+                deviceLatencySec = (outLat > 0) ? outLat / sr : ((buf > 0) ? (1.5 * buf) / sr : 0.0);
             }
         }
-        double pipelineLatencySec = playerB ? playerB->getPipelineLatencySeconds() : 0.0;
-    double visualDelay = std::clamp(pipelineLatencySec + deviceLatencySec, 0.0, 0.25);
-    constexpr double uiFudgeSec = 0.012; // ~12 ms safety (display/vsync)
-    double totalDelay = visualDelay + uiFudgeSec + std::clamp(userVisualTrimB, -0.05, 0.05);
-        if (playerB) {
+        const double pipelineLatencySec = playerB ? playerB->getPipelineLatencySeconds() : 0.0;
+        constexpr double uiFudgeSec = 0.012;
+        const double totalDelay = std::clamp(pipelineLatencySec + deviceLatencySec, 0.0, 0.25) + uiFudgeSec + std::clamp(userVisualTrimB, -0.05, 0.05);
+        if (playerB) [[likely]] {
             double displayRel = relative;
-            if (relative >= 0.0) {
-                double len = playerB->getLengthInSeconds();
-                if (len > 1e-6) {
-                    displayRel = relative - (totalDelay / len);
-                }
-                displayRel = std::clamp(displayRel, 0.0, 1.0);
+            if (relative >= 0.0) [[likely]] {
+                const double len = playerB->getLengthInSeconds();
+                if (len > 1e-6) [[likely]] displayRel = std::clamp(relative - (totalDelay / len), 0.0, 1.0);
             }
             overviewTopB->setPlayhead(displayRel);
-            if (deckB && deckB->getWaveform()) deckB->getWaveform()->setPlayhead(displayRel);
+            if (deckB && deckB->getWaveform()) [[likely]] deckB->getWaveform()->setPlayhead(displayRel);
+            beatIndicator->setTrackPositionDeckB(playerB->getCurrentPositionSeconds() - totalDelay);
         } else {
             overviewTopB->setPlayhead(relative);
             if (deckB && deckB->getWaveform()) deckB->getWaveform()->setPlayhead(relative);
-        }
-        // Update beat indicator with audible time in seconds (support preroll)
-        if (playerB) {
-            double curSec = playerB->getCurrentPositionSeconds();
-            double audibleTimeSec = curSec - totalDelay; // do not clamp; may be negative in preroll
-            beatIndicator->setTrackPositionDeckB(audibleTimeSec);
         }
     });
 
@@ -492,22 +454,18 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     auto doSync = [this](QtDeckWidget* requester){
-        if (!requester || !deckA || !deckB || !playerA || !playerB) return;
-        // Determine master and target
+        if (!requester || !deckA || !deckB || !playerA || !playerB) [[unlikely]] return;
         QtDeckWidget* masterDeck = (requester == deckA) ? deckB : deckA;
         QtDeckWidget* targetDeck = requester;
-    DJAudioPlayer* masterPlayer = (requester == deckA) ? playerB.get() : playerA.get();
-    DJAudioPlayer* targetPlayer = (requester == deckA) ? playerA.get() : playerB.get();
+        DJAudioPlayer* masterPlayer = (requester == deckA) ? playerB.get() : playerA.get();
+        DJAudioPlayer* targetPlayer = (requester == deckA) ? playerA.get() : playerB.get();
 
-        // Compute target tempo factor so target effective BPM equals master's effective BPM
-        double masterBpm = masterDeck->getDetectedBpm();
-        double masterFactor = masterDeck->getTempoFactor();
-        double targetBpm = targetDeck->getDetectedBpm();
-        if (masterBpm <= 0.0 || targetBpm <= 0.0) return; // need BPM info on both
-        double masterEffective = masterBpm * masterFactor;
-        double desiredFactor = masterEffective / targetBpm;
+        const double masterBpm = masterDeck->getDetectedBpm();
+        const double targetBpm = targetDeck->getDetectedBpm();
+        if (masterBpm <= 0.0 || targetBpm <= 0.0) [[unlikely]] return;
+        const double masterFactor = masterDeck->getTempoFactor();
+        const double desiredFactor = (masterBpm * masterFactor) / targetBpm;
         
-        // Apply tempo precisely (not limited by slider quantization)
         targetDeck->setTempoFactor(desiredFactor);
 
         if (requester == deckA && overviewTopA) {
@@ -563,14 +521,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     // Update overview labels to show only original analyzed BPM (not speed-scaled)
-    connect(deckA, &QtDeckWidget::displayedBpmChanged, this, [this](double displayed){
-    Q_UNUSED(displayed);
-    updateOverviewLabel(true);
-    });
-    connect(deckB, &QtDeckWidget::displayedBpmChanged, this, [this](double displayed){
-    Q_UNUSED(displayed);
-    updateOverviewLabel(false);
-    });
+    connect(deckA, &QtDeckWidget::displayedBpmChanged, this, [this](double){ updateOverviewLabel(true); });
+    connect(deckB, &QtDeckWidget::displayedBpmChanged, this, [this](double){ updateOverviewLabel(false); });
 
     // Defer audio device initialization until after Qt setup
     QTimer::singleShot(100, this, [this]() {
@@ -851,26 +803,19 @@ void QtMainWindow::initializeAudio()
         deviceManager.removeAudioCallback(&masterLevelMonitor);
 
         juce::String audioError = deviceManager.initialiseWithDefaultDevices(0, 2);
-        if (audioError.isNotEmpty()) {
-            std::cerr << "Audio initialization failed: " << audioError.toRawUTF8() << std::endl;
+        if (audioError.isNotEmpty()) [[unlikely]] {
             return;
         }
 
         auto* currentDevice = deviceManager.getCurrentAudioDevice();
-        if (!currentDevice) {
-            std::cerr << "No audio device available" << std::endl;
+        if (!currentDevice) [[unlikely]] {
             return;
         }
 
-        int availableChannels = currentDevice->getActiveOutputChannels().toInteger();
-        if (availableChannels < 2) {
-            std::cerr << "Audio device provides limited output channels: " << availableChannels << std::endl;
-        }
-
-        if (playerA) {
+        if (playerA) [[likely]] {
             playerA->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
         }
-        if (playerB) {
+        if (playerB) [[likely]] {
             playerB->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
         }
 
@@ -878,20 +823,15 @@ void QtMainWindow::initializeAudio()
         deviceManager.addAudioCallback(stereoCallback.get());
         deviceManager.addAudioCallback(&masterLevelMonitor);
 
-        if (crossfader) {
+        if (crossfader) [[likely]] {
             onCrossfader(crossfader->value());
         }
 
-    } catch (const std::exception& e) {
-        std::cerr << "Audio initialization threw: " << e.what() << std::endl;
-    } catch (...) {
-        std::cerr << "Audio initialization threw unknown exception" << std::endl;
-    }
+    } catch (...) {}
 }
 
 QtMainWindow::~QtMainWindow()
 {
-    std::cout << "QtMainWindow destructor called" << std::endl;
     if (qApp)
         qApp->removeEventFilter(this);
     if (cursorOverridden) {
@@ -899,7 +839,6 @@ QtMainWindow::~QtMainWindow()
         cursorOverridden = false;
         currentCursorShape = Qt::ArrowCursor;
     }
-    // Only clean up if closeEvent hasn't already done it
     if (!cleanupCompleted) {
         performCleanup();
     }
@@ -907,65 +846,34 @@ QtMainWindow::~QtMainWindow()
 
 void QtMainWindow::performCleanup()
 {
-    if (cleanupCompleted) return; // Prevent double cleanup
+    if (cleanupCompleted) [[unlikely]] return;
     
-    std::cout << "Performing cleanup..." << std::endl;
     try {
-        // 1. Stop all audio players
-        if (playerA) {
-            playerA->stop();
-            std::cout << "Player A stopped" << std::endl;
-        }
-        if (playerB) {
-            playerB->stop();
-            std::cout << "Player B stopped" << std::endl;
-        }
+        if (playerA) playerA->stop();
+        if (playerB) playerB->stop();
         
-        // 2. Remove audio callbacks before closing device
-        // deviceManager.removeAudioCallback(&mixer); // Removed - no longer using mixer
         if (stereoCallback) {
             deviceManager.removeAudioCallback(stereoCallback.get());
         }
         deviceManager.removeAudioCallback(&masterLevelMonitor);
-        std::cout << "Audio callbacks removed" << std::endl;
         
-        // 4. No sources to disconnect (using custom callback now)
-        std::cout << "No sources to disconnect (using stereo callback)" << std::endl;
-        
-        // 5. Close audio device
         deviceManager.closeAudioDevice();
-        std::cout << "Audio device closed" << std::endl;
         
-        // 6. Wait for any pending BPM analysis
         if (bpmThreadPool) {
-            bpmThreadPool->waitForDone(1000); // Reduced timeout
-            std::cout << "BPM thread pool finished" << std::endl;
+            bpmThreadPool->waitForDone(1000);
         }
         
-        // 7. Delete players safely
-    playerA.reset();
-    std::cout << "Player A deleted" << std::endl;
-
-    playerB.reset();
-    std::cout << "Player B deleted" << std::endl;
+        playerA.reset();
+        playerB.reset();
+        bpmAnalyzer.reset();
         
-    bpmAnalyzer.reset();
-    std::cout << "BPM analyzer deleted" << std::endl;
-        
-        // 8. Handle shared format manager cleanup
         if (sharedFormatManager && sharedFormatManager.use_count() == 1) {
             sharedFormatManager.reset();
-            std::cout << "Format manager cleaned up" << std::endl;
         }
         
         cleanupCompleted = true;
-        std::cout << "Cleanup complete" << std::endl;
         
-    } catch (const std::exception& e) {
-        std::cout << "Exception during cleanup: " << e.what() << std::endl;
-        cleanupCompleted = true; // Mark as completed even if there was an error
     } catch (...) {
-        std::cout << "Unknown exception during cleanup" << std::endl;
         cleanupCompleted = true;
     }
 }
@@ -1004,18 +912,11 @@ void QtMainWindow::closeEvent(QCloseEvent* event)
     shutdownProgress.show();
     QApplication::processEvents();
 
-    std::cout << "QtMainWindow::closeEvent called - shutting down..." << std::endl;
-
-    // BetaPulseX: Speichere alle Deck-Einstellungen
     try {
-        DeckSettings::instance().setVisualTrim(0, userVisualTrimA);  // Deck A
-        DeckSettings::instance().setVisualTrim(1, userVisualTrimB);  // Deck B
-
+        DeckSettings::instance().setVisualTrim(0, userVisualTrimA);
+        DeckSettings::instance().setVisualTrim(1, userVisualTrimB);
         DeckSettings::instance().saveSettings();
-        qDebug() << "BetaPulseX: All deck settings saved successfully";
-    } catch (...) {
-        qWarning() << "Failed to save deck settings";
-    }
+    } catch (...) {}
 
     shutdownProgress.setLabelText(tr("Decks werden deaktiviert..."));
     QApplication::processEvents();
@@ -1032,300 +933,159 @@ void QtMainWindow::closeEvent(QCloseEvent* event)
     QApplication::processEvents();
     shutdownProgress.close();
 
-    std::cout << "Accepting close event and quitting application" << std::endl;
     event->accept();
     QApplication::quit();
 }
 
 void QtMainWindow::onCrossfader(int v) {
-    std::cout << "Crossfader changed to: " << v << std::endl;
-    // v: 0 => full A (left), 50 => center, 100 => full B (right)
-    // Convert to -1.0f (full A) to +1.0f (full B)
-    float crossPos = (float(v) - 50.0f) / 50.0f;  // -1.0 to +1.0
-    if (stereoCallback) {
-        stereoCallback->setCrossfader(crossPos);
+    if (stereoCallback) [[likely]] {
+        stereoCallback->setCrossfader((static_cast<float>(v) - 50.0f) * 0.02f);
     }
 }
 
-// MIDI control access method
 void QtMainWindow::setCrossfaderPosition(float normalizedValue) {
-    // normalizedValue: 0.0 = full A, 1.0 = full B
-    // Convert to slider range: 0-100
-    int sliderValue = static_cast<int>(normalizedValue * 100.0f);
-    sliderValue = std::max(0, std::min(100, sliderValue));
-    
-    if (crossfader) {
-        crossfader->setValue(sliderValue);
-        // This will trigger onCrossfader automatically through the signal connection
-        std::cout << "MIDI: Crossfader set to " << sliderValue << " (normalized: " << normalizedValue << ")" << std::endl;
+    if (crossfader) [[likely]] {
+        crossfader->setValue(std::clamp(static_cast<int>(normalizedValue * 100.0f), 0, 100));
     }
 }
 
-// MIDI control access methods for Play/Pause
 void QtMainWindow::setDeckAPlayPause(bool shouldPlay) {
-    if (deckA) {
-        // The onPlayPause() method handles both play and pause - it toggles the state
-        // For MIDI, we can trigger it when shouldPlay changes the current state
-        deckA->onPlayPause();
-        std::cout << "MIDI: Deck A Play/Pause triggered (target state: " << (shouldPlay ? "PLAY" : "PAUSE") << ")" << std::endl;
-    }
+    if (deckA) [[likely]] { deckA->onPlayPause(); }
 }
 
 void QtMainWindow::setDeckBPlayPause(bool shouldPlay) {
-    if (deckB) {
-        // The onPlayPause() method handles both play and pause - it toggles the state  
-        // For MIDI, we can trigger it when shouldPlay changes the current state
-        deckB->onPlayPause();
-        std::cout << "MIDI: Deck B Play/Pause triggered (target state: " << (shouldPlay ? "PLAY" : "PAUSE") << ")" << std::endl;
-    }
+    if (deckB) [[likely]] { deckB->onPlayPause(); }
 }
 
-// MIDI control access methods for Tempo/Pitch
 void QtMainWindow::setDeckATempo(float normalizedValue) {
-    if (playerA && deckA) {
-        // Get the current tempo range from the deck widget
-        double minTempo = deckA->getMinTempoFactor();
-        double maxTempo = deckA->getMaxTempoFactor();
-        
-        // Convert 0.0-1.0 MIDI range to the actual tempo range of the deck
-        // 0.0 = minimum tempo, 0.5 = normal (1.0), 1.0 = maximum tempo
-        double pitchValue;
-        if (normalizedValue <= 0.5f) {
-            // Scale from min to 1.0
-            pitchValue = minTempo + (normalizedValue * 2.0f) * (1.0 - minTempo);
-        } else {
-            // Scale from 1.0 to max
-            pitchValue = 1.0 + ((normalizedValue - 0.5f) * 2.0f) * (maxTempo - 1.0);
-        }
-        
-        // Clamp to the deck's actual range
-        pitchValue = std::max(minTempo, std::min(maxTempo, pitchValue));
-        
-        // Update both the player and the UI via deck widget
-        deckA->setTempoFactor(pitchValue);
-        std::cout << "MIDI: Deck A Tempo set to " << pitchValue << " (normalized: " << normalizedValue 
-                  << ", range: " << minTempo << " - " << maxTempo << ")" << std::endl;
+    if (playerA && deckA) [[likely]] {
+        const double minTempo = deckA->getMinTempoFactor();
+        const double maxTempo = deckA->getMaxTempoFactor();
+        const double pitchValue = (normalizedValue <= 0.5f) 
+            ? minTempo + (normalizedValue * 2.0) * (1.0 - minTempo)
+            : 1.0 + ((normalizedValue - 0.5) * 2.0) * (maxTempo - 1.0);
+        deckA->setTempoFactor(std::clamp(pitchValue, minTempo, maxTempo));
     }
 }
 
 void QtMainWindow::setDeckBTempo(float normalizedValue) {
-    if (playerB && deckB) {
-        // Get the current tempo range from the deck widget
-        double minTempo = deckB->getMinTempoFactor();
-        double maxTempo = deckB->getMaxTempoFactor();
-        
-        // Convert 0.0-1.0 MIDI range to the actual tempo range of the deck
-        // 0.0 = minimum tempo, 0.5 = normal (1.0), 1.0 = maximum tempo
-        double pitchValue;
-        if (normalizedValue <= 0.5f) {
-            // Scale from min to 1.0
-            pitchValue = minTempo + (normalizedValue * 2.0f) * (1.0 - minTempo);
-        } else {
-            // Scale from 1.0 to max
-            pitchValue = 1.0 + ((normalizedValue - 0.5f) * 2.0f) * (maxTempo - 1.0);
-        }
-        
-        // Clamp to the deck's actual range
-        pitchValue = std::max(minTempo, std::min(maxTempo, pitchValue));
-        
-        // Update both the player and the UI via deck widget
-        deckB->setTempoFactor(pitchValue);
-        std::cout << "MIDI: Deck B Tempo set to " << pitchValue << " (normalized: " << normalizedValue 
-                  << ", range: " << minTempo << " - " << maxTempo << ")" << std::endl;
+    if (playerB && deckB) [[likely]] {
+        const double minTempo = deckB->getMinTempoFactor();
+        const double maxTempo = deckB->getMaxTempoFactor();
+        const double pitchValue = (normalizedValue <= 0.5f) 
+            ? minTempo + (normalizedValue * 2.0) * (1.0 - minTempo)
+            : 1.0 + ((normalizedValue - 0.5) * 2.0) * (maxTempo - 1.0);
+        deckB->setTempoFactor(std::clamp(pitchValue, minTempo, maxTempo));
     }
 }
 
-// MIDI control access methods for Volume
 void QtMainWindow::setDeckAVolume(float normalizedValue) {
-    if (playerA && stereoCallback) {
-        // Convert 0.0-1.0 to volume range: 0.0 = mute, 1.0 = full volume
-        float volumeValue = std::max(0.0f, std::min(1.0f, normalizedValue));
-        
-        // Update the mixer volume for Deck A
-        stereoCallback->setVolumeA(volumeValue);
-        std::cout << "MIDI: Deck A Volume set to " << volumeValue << " (normalized: " << normalizedValue << ")" << std::endl;
+    if (stereoCallback) [[likely]] {
+        stereoCallback->setVolumeA(std::clamp(normalizedValue, 0.0f, 1.0f));
     }
 }
 
 void QtMainWindow::setDeckBVolume(float normalizedValue) {
-    if (playerB && stereoCallback) {
-        // Convert 0.0-1.0 to volume range: 0.0 = mute, 1.0 = full volume
-        float volumeValue = std::max(0.0f, std::min(1.0f, normalizedValue));
-        
-        // Update the mixer volume for Deck B
-        stereoCallback->setVolumeB(volumeValue);
-        std::cout << "MIDI: Deck B Volume set to " << volumeValue << " (normalized: " << normalizedValue << ")" << std::endl;
+    if (stereoCallback) [[likely]] {
+        stereoCallback->setVolumeB(std::clamp(normalizedValue, 0.0f, 1.0f));
     }
 }
 
-// EQ/filter slot implementations
 void QtMainWindow::onLeftHighChanged(int v) {
-    std::cout << "onLeftHighChanged called with value: " << v << std::endl;
-    // map -100..100 to -1.0..1.0
-    double val = v / 100.0;
-    if (playerA) {
-        std::cout << "  Calling playerA->setHighGain(" << val << ")" << std::endl;
-        playerA->setHighGain(val);
-    } else {
-        std::cout << "  ERROR: playerA is null!" << std::endl;
-    }
+    if (playerA) [[likely]] { playerA->setHighGain(v * 0.01); }
 }
 
 void QtMainWindow::onLeftMidChanged(int v) {
-    std::cout << "onLeftMidChanged called with value: " << v << std::endl;
-    double val = v / 100.0;
-    if (playerA) {
-        std::cout << "  Calling playerA->setMidGain(" << val << ")" << std::endl;
-        playerA->setMidGain(val);
-    } else {
-        std::cout << "  ERROR: playerA is null!" << std::endl;
-    }
+    if (playerA) [[likely]] { playerA->setMidGain(v * 0.01); }
 }
 
 void QtMainWindow::onLeftLowChanged(int v) {
-    std::cout << "onLeftLowChanged called with value: " << v << std::endl;
-    double val = v / 100.0;
-    if (playerA) playerA->setLowGain(val);
+    if (playerA) [[likely]] { playerA->setLowGain(v * 0.01); }
 }
 
 void QtMainWindow::onLeftFilterChanged(int v) {
-    std::cout << "onLeftFilterChanged called with value: " << v << std::endl;
-    // map -100..100 to -1..1 (center 0 = bypass)
-    double norm = v / 100.0;
-    if (playerA) {
-        std::cout << "  Calling playerA->setFilterCutoff(" << norm << ")" << std::endl;
-        playerA->setFilterCutoff(norm);
-    } else {
-        std::cout << "  ERROR: playerA is null!" << std::endl;
-    }
+    if (playerA) [[likely]] { playerA->setFilterCutoff(v * 0.01); }
 }
 
 void QtMainWindow::onRightHighChanged(int v) {
-    std::cout << "onRightHighChanged called with value: " << v << std::endl;
-    double val = v / 100.0;
-    if (playerB) playerB->setHighGain(val);
+    if (playerB) [[likely]] { playerB->setHighGain(v * 0.01); }
 }
 
 void QtMainWindow::onRightMidChanged(int v) {
-    std::cout << "onRightMidChanged called with value: " << v << std::endl;
-    double val = v / 100.0;
-    if (playerB) playerB->setMidGain(val);
+    if (playerB) [[likely]] { playerB->setMidGain(v * 0.01); }
 }
 
 void QtMainWindow::onRightLowChanged(int v) {
-    std::cout << "onRightLowChanged called with value: " << v << std::endl;
-    double val = v / 100.0;
-    if (playerB) playerB->setLowGain(val);
+    if (playerB) [[likely]] { playerB->setLowGain(v * 0.01); }
 }
 
 void QtMainWindow::onRightFilterChanged(int v) {
-    // map -100..100 to -1..1 (center 0 = bypass)
-    double norm = v / 100.0;
-    if (playerB) playerB->setFilterCutoff(norm);
+    if (playerB) [[likely]] { playerB->setFilterCutoff(v * 0.01); }
 }
 
 void QtMainWindow::onLeftVolumeChanged(int v) {
-    std::cout << "Left volume changed to: " << v << std::endl;
-    if (stereoCallback) {
-        float volume = juce::jlimit(0.0f, 1.0f, (float)v / 100.0f);
-        stereoCallback->setVolumeA(volume);
+    if (stereoCallback) [[likely]] {
+        stereoCallback->setVolumeA(juce::jlimit(0.0f, 1.0f, v * 0.01f));
     }
 }
 
 void QtMainWindow::onRightVolumeChanged(int v) {
-    std::cout << "Right volume changed to: " << v << std::endl;
-    if (stereoCallback) {
-        float volume = juce::jlimit(0.0f, 1.0f, (float)v / 100.0f);
-        stereoCallback->setVolumeB(volume);
+    if (stereoCallback) [[likely]] {
+        stereoCallback->setVolumeB(juce::jlimit(0.0f, 1.0f, v * 0.01f));
     }
 }
 
 void QtMainWindow::keyPressEvent(QKeyEvent* event) {
-    // Check if focus is on a line edit or text widget to avoid interfering with text input
-    QWidget* focusWidget = QApplication::focusWidget();
-    if (focusWidget && (qobject_cast<QLineEdit*>(focusWidget) || 
-                       qobject_cast<QTextEdit*>(focusWidget) ||
-                       qobject_cast<QPlainTextEdit*>(focusWidget))) {
-        // Let the focused text widget handle the key event
-        QWidget::keyPressEvent(event);
-        return;
+    if (QWidget* focusWidget = QApplication::focusWidget()) [[unlikely]] {
+        if (qobject_cast<QLineEdit*>(focusWidget) || qobject_cast<QTextEdit*>(focusWidget) || qobject_cast<QPlainTextEdit*>(focusWidget)) {
+            QWidget::keyPressEvent(event);
+            return;
+        }
     }
 
-    // Global keyboard shortcuts for beat grid zoom
     switch (event->key()) {
-        case Qt::Key_F5: // Deck A: -1 ms
+        case Qt::Key_F5:
             userVisualTrimA = std::clamp(userVisualTrimA - 0.001, -0.05, 0.05);
             updateOverviewLabel(true);
-            {
-                QSettings settings("DJDavid", "David");
-                settings.setValue("visualTrim/deckA", userVisualTrimA);
-            }
+            QSettings("DJDavid", "David").setValue("visualTrim/deckA", userVisualTrimA);
             event->accept();
             break;
-        case Qt::Key_F6: // Deck A: +1 ms
+        case Qt::Key_F6:
             userVisualTrimA = std::clamp(userVisualTrimA + 0.001, -0.05, 0.05);
             updateOverviewLabel(true);
-            {
-                QSettings settings("DJDavid", "David");
-                settings.setValue("visualTrim/deckA", userVisualTrimA);
-            }
+            QSettings("DJDavid", "David").setValue("visualTrim/deckA", userVisualTrimA);
             event->accept();
             break;
-        case Qt::Key_F7: // Deck B: -1 ms
+        case Qt::Key_F7:
             userVisualTrimB = std::clamp(userVisualTrimB - 0.001, -0.05, 0.05);
             updateOverviewLabel(false);
-            {
-                QSettings settings("DJDavid", "David");
-                settings.setValue("visualTrim/deckB", userVisualTrimB);
-            }
+            QSettings("DJDavid", "David").setValue("visualTrim/deckB", userVisualTrimB);
             event->accept();
             break;
-        case Qt::Key_F8: // Deck B: +1 ms
+        case Qt::Key_F8:
             userVisualTrimB = std::clamp(userVisualTrimB + 0.001, -0.05, 0.05);
             updateOverviewLabel(false);
-            {
-                QSettings settings("DJDavid", "David");
-                settings.setValue("visualTrim/deckB", userVisualTrimB);
-            }
+            QSettings("DJDavid", "David").setValue("visualTrim/deckB", userVisualTrimB);
             event->accept();
             break;
         case Qt::Key_Plus:
-        case Qt::Key_Equal:  // Handle both + and = key (same physical key)
-            // Increase beat grid zoom on both waveforms
-            if (overviewTopA) {
-                overviewTopA->increaseBeatGridZoom();
-            }
-            if (overviewTopB) {
-                overviewTopB->increaseBeatGridZoom();
-            }
+        case Qt::Key_Equal:
+            if (overviewTopA) [[likely]] overviewTopA->increaseBeatGridZoom();
+            if (overviewTopB) [[likely]] overviewTopB->increaseBeatGridZoom();
             event->accept();
             break;
-            
         case Qt::Key_Minus:
-        case Qt::Key_Underscore:  // Handle both - and _ key (same physical key)
-            // Decrease beat grid zoom on both waveforms
-            if (overviewTopA) {
-                overviewTopA->decreaseBeatGridZoom();
-            }
-            if (overviewTopB) {
-                overviewTopB->decreaseBeatGridZoom();
-            }
+        case Qt::Key_Underscore:
+            if (overviewTopA) [[likely]] overviewTopA->decreaseBeatGridZoom();
+            if (overviewTopB) [[likely]] overviewTopB->decreaseBeatGridZoom();
             event->accept();
             break;
-            
         case Qt::Key_0:
-            // Reset beat grid zoom on both waveforms
-            if (overviewTopA) {
-                overviewTopA->resetBeatGridZoom();
-            }
-            if (overviewTopB) {
-                overviewTopB->resetBeatGridZoom();
-            }
+            if (overviewTopA) [[likely]] overviewTopA->resetBeatGridZoom();
+            if (overviewTopB) [[likely]] overviewTopB->resetBeatGridZoom();
             event->accept();
             break;
-            
         default:
-            // Let the base class handle other keys
             QWidget::keyPressEvent(event);
             break;
     }
@@ -1336,70 +1096,206 @@ void QtMainWindow::keyPressEvent(QKeyEvent* event) {
 
 // Event filter for double-click reset functionality and frameless resizing/dragging
 
-void QtMainWindow::updatePlaybackPositions() {
-    // Only update when not scratching to prevent interference
-    static double lastPosA = -999.0;
-    static double lastPosB = -999.0;
-    
-    qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
-    
-    bool canUpdateA = playerA && overviewTopA && !overviewTopA->isScratching() && 
-                      (currentTime - lastScratchEndA > 100); // 100ms delay after scratch end
-    
-    if (canUpdateA) {
-        double relativePos = playerA->getPositionRelative();
-        
-        bool isPlaybackUpdate = playerA->isPlaying() || relativePos < 0.0;
-        
-        double threshold = (relativePos < 0.0) ? 0.0002 : 0.008; // Preroll: 0.0002, Song: 0.008
-        
-        if (isPlaybackUpdate && std::abs(relativePos - lastPosA) > threshold) {
-            lastPosA = relativePos;
-            
-            overviewTopA->setPlayhead(relativePos);
-            if (deckA && deckA->getWaveform()) {
-                deckA->getWaveform()->setPlayhead(relativePos);
-            }
-            
-            if (beatIndicator && playerA) {
-                double lenSec = std::max(1e-9, playerA->getLengthInSeconds());
-                constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
-                double seconds = (relativePos < 0.0) ? (relativePos * prerollSec) : (relativePos * lenSec);
-                beatIndicator->setTrackPositionDeckA(seconds);
-            }
-            
+void QtMainWindow::handleWaveformRegionRequestDeckA(double startSec, double endSec)
+{
+    handleWaveformRegionRequest(true, startSec, endSec);
+}
+
+void QtMainWindow::handleWaveformRegionRequestDeckB(double startSec, double endSec)
+{
+    handleWaveformRegionRequest(false, startSec, endSec);
+}
+
+void QtMainWindow::handleWaveformRegionRequest(bool deckIsA, double startSec, double endSec)
+{
+    WaveformStreamSession& session = deckIsA ? streamSessionA : streamSessionB;
+    if (!session.valid || session.binsPerSecond <= 0.0) {
+        return;
+    }
+
+    QtDeckWidget* deck = deckIsA ? deckA : deckB;
+    if (!deck || deck->getCurrentFilePath() != session.filePath) {
+        return;
+    }
+
+    if (endSec <= startSec) {
+        endSec = startSec + 0.01;
+    }
+
+    const double clampedStartSec = std::max(0.0, startSec);
+    const double clampedEndSec = std::max(clampedStartSec + 0.01, endSec);
+
+    int startBin = static_cast<int>(std::floor((clampedStartSec - session.metadata.audioStartOffsetSec) * session.binsPerSecond));
+    int endBin = static_cast<int>(std::ceil((clampedEndSec - session.metadata.audioStartOffsetSec) * session.binsPerSecond));
+
+    startBin = std::max(0, startBin);
+    endBin = std::min(session.totalBins, std::max(startBin + 1, endBin));
+    if (startBin >= endBin) {
+        return;
+    }
+
+    if (!session.hasCache) {
+        const int alignedStart = std::max(0, startBin - (startBin % session.chunkBinSize));
+        if (!session.pendingChunks.contains(alignedStart)) {
+            session.pendingChunks.insert(alignedStart);
+            const int count = std::min(session.chunkBinSize, session.totalBins - alignedStart);
+            scheduleWaveformChunk(deckIsA, alignedStart, count);
         }
-    } else if (overviewTopA && overviewTopA->isScratching()) {
+        return;
+    }
+
+    if (startBin < session.cachedStartBin) {
+        const int nextStart = std::max(0, session.cachedStartBin - session.chunkBinSize);
+        if (!session.pendingChunks.contains(nextStart) && session.cachedStartBin > 0) {
+            session.pendingChunks.insert(nextStart);
+            const int count = std::min(session.chunkBinSize, session.totalBins - nextStart);
+            scheduleWaveformChunk(deckIsA, nextStart, count);
+        }
+        return;
+    }
+
+    if (endBin > session.cachedEndBin) {
+        const int nextStart = session.cachedEndBin;
+        if (nextStart < session.totalBins && !session.pendingChunks.contains(nextStart)) {
+            session.pendingChunks.insert(nextStart);
+            const int count = std::min(session.chunkBinSize, session.totalBins - nextStart);
+            scheduleWaveformChunk(deckIsA, nextStart, count);
+        }
+    }
+}
+
+void QtMainWindow::scheduleWaveformChunk(bool deckIsA, int startBin, int binCount)
+{
+    if (!bpmThreadPool || binCount <= 0) {
+        return;
+    }
+
+    const WaveformStreamSession& session = deckIsA ? streamSessionA : streamSessionB;
+    if (!session.valid) {
+        return;
+    }
+
+    QtDeckWidget* deck = deckIsA ? deckA : deckB;
+    if (!deck || deck->getCurrentFilePath() != session.filePath) {
+        return;
+    }
+
+    auto task = new WaveformStreamChunkTask(this,
+                                            session.filePath,
+                                            deckIsA,
+                                            session.metadata,
+                                            session.totalBins,
+                                            startBin,
+                                            binCount);
+    bpmThreadPool->start(task);
+}
+
+void QtMainWindow::handleWaveformChunkResult(bool deckIsA,
+                                             const QString& filePath,
+                                             int startBin,
+                                             std::shared_ptr<std::vector<float>> maxBins,
+                                             std::shared_ptr<std::vector<float>> minBins,
+                                             bool success)
+{
+    WaveformStreamSession& session = deckIsA ? streamSessionA : streamSessionB;
+    session.pendingChunks.remove(startBin);
+
+    if (!session.valid || session.filePath != filePath) {
+        return;
+    }
+
+    QtDeckWidget* deck = deckIsA ? deckA : deckB;
+    if (!deck || deck->getCurrentFilePath() != filePath) {
+        return;
+    }
+
+    WaveformDisplay* wf = deckIsA ? overviewTopA : overviewTopB;
+    if (!wf) {
+        return;
+    }
+
+    if (!success || !maxBins || !minBins || maxBins->size() != minBins->size()) {
+        wf->setAnalysisActive(false);
+        wf->setAnalysisFailed(true);
+        if (deckIsA) {
+            analysisActiveA = false;
+            analysisFailedA = true;
+        } else {
+            analysisActiveB = false;
+            analysisFailedB = true;
+        }
+        updateOverviewLabel(deckIsA);
+        return;
+    }
+
+    const bool wasEmpty = !session.hasCache;
+    const int chunkSize = static_cast<int>(maxBins->size());
+
+    wf->appendStreamBins(startBin, *maxBins, *minBins, false);
+    wf->setAnalysisFailed(false);
+
+    const auto range = wf->getCachedBinRange();
+    session.cachedStartBin = std::max(0, range.first);
+    session.cachedEndBin = std::clamp(range.second, 0, session.totalBins);
+    session.hasCache = session.cachedEndBin > session.cachedStartBin;
+
+    const double coverage = session.hasCache
+        ? static_cast<double>(session.cachedEndBin - session.cachedStartBin) /
+              std::max(1, session.totalBins)
+        : 0.0;
+
+    const bool fullyCovered = session.hasCache && session.cachedStartBin <= 0 && session.cachedEndBin >= session.totalBins;
+    wf->setAnalysisActive(!fullyCovered);
+    wf->setAnalysisProgress(std::clamp(coverage, 0.0, 1.0));
+
+    if (deckIsA) {
+        analysisActiveA = !fullyCovered;
+        analysisFailedA = false;
+        analysisProgressA = std::max(analysisProgressA, coverage);
+    } else {
+        analysisActiveB = !fullyCovered;
+        analysisFailedB = false;
+        analysisProgressB = std::max(analysisProgressB, coverage);
+    }
+
+    if (wasEmpty) {
+        reapplyStoredDeckMetadata(deckIsA);
+    }
+
+    updateOverviewLabel(deckIsA);
+}
+
+void QtMainWindow::updatePlaybackPositions() {
+    static double lastPosA = -999.0, lastPosB = -999.0;
+    const qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    
+    if (playerA && overviewTopA && !overviewTopA->isScratching() && (currentTime - lastScratchEndA > 100)) [[likely]] {
+        const double relativePos = playerA->getPositionRelative();
+        if ((playerA->isPlaying() || relativePos < 0.0) && std::abs(relativePos - lastPosA) > ((relativePos < 0.0) ? 0.0002 : 0.008)) [[likely]] {
+            lastPosA = relativePos;
+            overviewTopA->setPlayhead(relativePos);
+            if (deckA && deckA->getWaveform()) [[likely]] deckA->getWaveform()->setPlayhead(relativePos);
+            if (beatIndicator) [[likely]] {
+                constexpr double prerollSec = 8.0;
+                beatIndicator->setTrackPositionDeckA((relativePos < 0.0) ? (relativePos * prerollSec) : (relativePos * std::max(1e-9, playerA->getLengthInSeconds())));
+            }
+        }
+    } else if (overviewTopA && overviewTopA->isScratching()) [[unlikely]] {
         lastScratchEndA = currentTime;
     }
     
-    bool canUpdateB = playerB && overviewTopB && !overviewTopB->isScratching() && 
-                      (currentTime - lastScratchEndB > 100); // 100ms delay after scratch end
-    
-    if (canUpdateB) {
-        double relativePos = playerB->getPositionRelative();
-        
-        bool isPlaybackUpdate = playerB->isPlaying() || relativePos < 0.0;
-        
-        double threshold = (relativePos < 0.0) ? 0.0002 : 0.008; // Preroll: 0.0002, Song: 0.008
-        
-        if (isPlaybackUpdate && std::abs(relativePos - lastPosB) > threshold) {
+    if (playerB && overviewTopB && !overviewTopB->isScratching() && (currentTime - lastScratchEndB > 100)) [[likely]] {
+        const double relativePos = playerB->getPositionRelative();
+        if ((playerB->isPlaying() || relativePos < 0.0) && std::abs(relativePos - lastPosB) > ((relativePos < 0.0) ? 0.0002 : 0.008)) [[likely]] {
             lastPosB = relativePos;
-            
             overviewTopB->setPlayhead(relativePos);
-            if (deckB && deckB->getWaveform()) {
-                deckB->getWaveform()->setPlayhead(relativePos);
+            if (deckB && deckB->getWaveform()) [[likely]] deckB->getWaveform()->setPlayhead(relativePos);
+            if (beatIndicator) [[likely]] {
+                constexpr double prerollSec = 8.0;
+                beatIndicator->setTrackPositionDeckB((relativePos < 0.0) ? (relativePos * prerollSec) : (relativePos * std::max(1e-9, playerB->getLengthInSeconds())));
             }
-            
-            if (beatIndicator && playerB) {
-                double lenSec = std::max(1e-9, playerB->getLengthInSeconds());
-                constexpr double prerollSec = 8.0; // Keep in sync with WaveformDisplay/DJAudioPlayer
-                double seconds = (relativePos < 0.0) ? (relativePos * prerollSec) : (relativePos * lenSec);
-                beatIndicator->setTrackPositionDeckB(seconds);
-            }
-            
         }
-    } else if (overviewTopB && overviewTopB->isScratching()) {
+    } else if (overviewTopB && overviewTopB->isScratching()) [[unlikely]] {
         lastScratchEndB = currentTime;
     }
 }

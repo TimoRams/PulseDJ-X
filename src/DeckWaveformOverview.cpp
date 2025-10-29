@@ -1,4 +1,5 @@
 #include "DeckWaveformOverview.h"
+#include "FrameTiming.h"
 #include <QOpenGLShaderProgram>
 #include <QOpenGLBuffer>
 #include "WaveformGenerator.h"
@@ -24,7 +25,7 @@ DeckWaveformOverview::DeckWaveformOverview(QWidget* parent)
     
     // Smooth playhead timer (exponential smoothing for ultra-smooth marker movement)
     smoothTimer = new QTimer(this);
-    smoothTimer->setInterval(16); // ~60 FPS
+    smoothTimer->setInterval(FrameTiming::kFrameIntervalMs);
     connect(smoothTimer, &QTimer::timeout, this, [this]() {
         // PREROLL SUPPORT: Allow animation for negative positions (preroll)
         // Initialize displayedPlayheadPos to current position if not set
@@ -249,11 +250,7 @@ void DeckWaveformOverview::paintGL()
     }
     
     // Draw active loop region
-    qDebug() << "DeckWaveformOverview::paintGL loop check: loopEnabled=" << loopEnabled 
-             << ", loopStartSec=" << loopStartSec << ", loopEndSec=" << loopEndSec 
-             << ", totalLength=" << totalLength;
     if (loopEnabled && totalLength > 0.0) {
-        qDebug() << "DeckWaveformOverview::paintGL calling drawLoopRegion";
         drawLoopRegion();
     }
     
@@ -601,7 +598,6 @@ void DeckWaveformOverview::drawCuePoints() {
     // Use QPainter over OpenGL context for simple line drawing
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
-    qDebug() << "DeckWaveformOverview::drawLoopRegion called: loopEnabled=" << loopEnabled << ", loopStartSec=" << loopStartSec << ", loopEndSec=" << loopEndSec;
     
     // Define cue point colors (same as WaveformDisplay for consistency)
     static const QColor cueColors[8] = {

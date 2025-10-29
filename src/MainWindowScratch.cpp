@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "FrameTiming.h"
 
 #include "DJAudioPlayer.h"
 #include "DeckWidget.h"
@@ -132,8 +133,8 @@ void QtMainWindow::startScratchInertia(bool isDeckA, double initialVelocity, boo
 
     if (!timer)
     {
-        timer = new QTimer(this);
-        timer->setInterval(16);
+    timer = new QTimer(this);
+    timer->setInterval(FrameTiming::kFrameIntervalMs);
         connect(timer, &QTimer::timeout, this, [this, isDeckA]() {
             handleScratchInertiaTick(isDeckA);
         });

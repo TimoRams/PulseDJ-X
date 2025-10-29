@@ -76,6 +76,12 @@ struct TrackInfo {
     std::array<double, 8> cuePoints;
     bool hasCuePoints = false;
     
+    // WAVEFORM CACHING: Store pre-analyzed waveform bins in database
+    std::vector<float> waveformMaxBins;
+    std::vector<float> waveformMinBins;
+    double waveformAudioStartOffset = 0.0;
+    qint64 waveformAnalyzedAt = 0;
+    
     TrackInfo() { cuePoints.fill(-1.0); }
     TrackInfo(const QString& path) : filePath(path) { cuePoints.fill(-1.0); }
     
@@ -120,6 +126,10 @@ struct TrackInfo {
 
     bool hasBeatGrid() const {
         return analyzedAt > 0 && !beatPositions.isEmpty();
+    }
+    
+    bool hasWaveformCache() const {
+        return waveformAnalyzedAt > 0 && !waveformMaxBins.empty() && !waveformMinBins.empty();
     }
 };
 

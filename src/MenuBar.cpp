@@ -2,7 +2,6 @@
 #include "MainWindow.h"
 #include "PreferencesDialog.h"
 #include "AppConfig.h"
-#include "DeckSettings.h"
 #include <QApplication>
 #include <QFileDialog>
 #include <QStandardPaths>
@@ -12,11 +11,12 @@
 #include <QJsonParseError>
 #include <QSettings>
 #include <QTimer>
-#include <QDesktopServices>
-#include <QUrl>
 #include <QFile>
 #include <QTextStream>
 #include <QtGlobal>
+#include <QDateTime>
+#include <QColor>
+#include <QKeySequence>
 #include <juce_core/juce_core.h>
 
 namespace {
@@ -50,15 +50,35 @@ QString detectCppStandardString()
 
     return QString("Unknown (%1)").arg(QString::number(standard));
 }
+
+// Reusable styles shared across methods
+static const QString kCpuStyleGreen = QStringLiteral(
+    "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+    "QProgressBar::chunk { background: #00aa00; border-radius: 2px; }"
+);
+static const QString kCpuStyleYellow = QStringLiteral(
+    "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+    "QProgressBar::chunk { background: #ffaa00; border-radius: 2px; }"
+);
+static const QString kCpuStyleRed = QStringLiteral(
+    "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+    "QProgressBar::chunk { background: #ff4444; border-radius: 2px; }"
+);
+static const QString kRamStyleBlue = QStringLiteral(
+    "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+    "QProgressBar::chunk { background: #0066cc; border-radius: 2px; }"
+);
+static const QString kRamStyleRed = QStringLiteral(
+    "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+    "QProgressBar::chunk { background: #ff4444; border-radius: 2px; }"
+);
 }
 
 MenuBar::MenuBar(QtMainWindow* parent) 
     : QMenuBar(parent), mainWindow(parent), preferencesDialog(nullptr) {
     
     setNativeMenuBar(false);
-    
-    // Modern flat styling for the menu bar
-    setStyleSheet(
+    static const QString kMenuBarStyle = QStringLiteral(
         "QMenuBar {"
         "    background-color: #121212;"
         "    border: none;"
@@ -96,6 +116,7 @@ MenuBar::MenuBar(QtMainWindow* parent)
         "    margin: 4px 0px;"
         "}"
     );
+    setStyleSheet(kMenuBarStyle);
 
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     
@@ -125,7 +146,6 @@ void MenuBar::setupLogoWidget() {
 }
 
 void MenuBar::createMenuActions() {
-    // File menu actions
     importSettingsAction = new QAction("Import Settings...", this);
     importSettingsAction->setShortcut(QKeySequence::Open);
     importSettingsAction->setStatusTip("Import settings from a file");
@@ -138,7 +158,6 @@ void MenuBar::createMenuActions() {
     exitAction->setShortcut(QKeySequence::Quit);
     exitAction->setStatusTip("Exit BetaPulseX");
     
-    // Edit menu actions
     preferencesAction = new QAction("Preferences...", this);
     preferencesAction->setShortcut(QKeySequence::Preferences);
     preferencesAction->setStatusTip("Open preferences dialog");
@@ -146,11 +165,9 @@ void MenuBar::createMenuActions() {
     resetSettingsAction = new QAction("Reset to Defaults", this);
     resetSettingsAction->setStatusTip("Reset all settings to default values");
     
-    // Help menu actions
     aboutAction = new QAction("About BetaPulseX", this);
     aboutAction->setStatusTip("Show information about BetaPulseX");
     
-    // View menu actions
     fullScreenAction = new QAction("Full Screen", this);
     fullScreenAction->setShortcut(QKeySequence("F11"));
     fullScreenAction->setStatusTip("Toggle full screen mode");
@@ -172,38 +189,33 @@ void MenuBar::createMenuActions() {
 }
 
 void MenuBar::setupMenus() {
-    // File menu
     fileMenu = addMenu("File");
     fileMenu->addAction(importSettingsAction);
     fileMenu->addAction(exportSettingsAction);
     fileMenu->addSeparator();
     fileMenu->addAction(exitAction);
     
-    // Edit menu
     editMenu = addMenu("Edit");
     editMenu->addAction(preferencesAction);
     editMenu->addSeparator();
     editMenu->addAction(resetSettingsAction);
     
-    // View menu
     viewMenu = addMenu("View");
     viewMenu->addAction(fullScreenAction);
     viewMenu->addAction(alwaysOnTopAction);
-    // ...existing code...
-    // Tools menu
+
     toolsMenu = addMenu("Tools");
     toolsMenu->addAction("Audio Settings")->setEnabled(false);
     toolsMenu->addAction("MIDI Controllers")->setEnabled(false);
     toolsMenu->addSeparator();
     toolsMenu->addAction("Analyze Library")->setEnabled(false);
-    // Help menu
+
     helpMenu = addMenu("Help");
     helpMenu->addAction("User Manual")->setEnabled(false);
     helpMenu->addAction("Keyboard Shortcuts")->setEnabled(false);
     helpMenu->addSeparator();
-        helpMenu->addAction("Check for Updates")->setEnabled(false);
-        helpMenu->addAction(aboutAction);
-    // ...existing code...
+    helpMenu->addAction("Check for Updates")->setEnabled(false);
+    helpMenu->addAction(aboutAction);
 }
 
 void MenuBar::toggleAlwaysOnTop() {
@@ -224,7 +236,6 @@ void MenuBar::setupSystemMonitoring() {
     systemLayout->setContentsMargins(10, 2, 10, 2);
     systemLayout->setSpacing(5);
     
-    // Master output level bars
     auto masterWidget = new QWidget();
     auto masterLayout = new QVBoxLayout(masterWidget);
     masterLayout->setContentsMargins(0, 0, 0, 0);
@@ -237,13 +248,14 @@ void MenuBar::setupSystemMonitoring() {
     masterLeftBar = new QProgressBar();
     masterRightBar = new QProgressBar();
     
-    QString levelBarStyle = 
+    static const QString kLevelBarStyle = QStringLiteral(
         "QProgressBar { background: #333; border: none; height: 4px; width: 25px; }"
         "QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
-        "stop:0 #00ff00, stop:0.7 #ffff00, stop:1 #ff0000); }";
+        "stop:0 #00ff00, stop:0.7 #ffff00, stop:1 #ff0000); }"
+    );
     
-    masterLeftBar->setStyleSheet(levelBarStyle);
-    masterRightBar->setStyleSheet(levelBarStyle);
+    masterLeftBar->setStyleSheet(kLevelBarStyle);
+    masterRightBar->setStyleSheet(kLevelBarStyle);
     masterLeftBar->setRange(0, 100);
     masterRightBar->setRange(0, 100);
     masterLeftBar->setTextVisible(false);
@@ -255,49 +267,60 @@ void MenuBar::setupSystemMonitoring() {
     masterLayout->addWidget(masterLeftBar);
     masterLayout->addWidget(masterRightBar);
     
-    // CPU usage indicator
     cpuBar = new QProgressBar();
     cpuBar->setRange(0, 100);
     cpuBar->setValue(0);
     cpuBar->setFixedSize(30, 12);
     cpuBar->setTextVisible(true);
-    cpuBar->setStyleSheet(
+    static const QString kCpuStyleGreen = QStringLiteral(
         "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
         "QProgressBar::chunk { background: #00aa00; border-radius: 2px; }"
     );
+    static const QString kCpuStyleYellow = QStringLiteral(
+        "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+        "QProgressBar::chunk { background: #ffaa00; border-radius: 2px; }"
+    );
+    static const QString kCpuStyleRed = QStringLiteral(
+        "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+        "QProgressBar::chunk { background: #ff4444; border-radius: 2px; }"
+    );
+    cpuBar->setStyleSheet(kCpuStyleGreen);
     
     cpuLabel = new QLabel("CPU");
     cpuLabel->setStyleSheet("color: #888; font-size: 8px;");
     
-    // RAM usage indicator
     ramBar = new QProgressBar();
     ramBar->setRange(0, 100);
     ramBar->setValue(0);
     ramBar->setFixedSize(30, 12);
     ramBar->setTextVisible(true);
-    ramBar->setStyleSheet(
+    static const QString kRamStyleBlue = QStringLiteral(
         "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
         "QProgressBar::chunk { background: #0066cc; border-radius: 2px; }"
     );
+    static const QString kRamStyleRed = QStringLiteral(
+        "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
+        "QProgressBar::chunk { background: #ff4444; border-radius: 2px; }"
+    );
+    ramBar->setStyleSheet(kRamStyleBlue);
     
     ramLabel = new QLabel("RAM");
     ramLabel->setStyleSheet("color: #888; font-size: 8px;");
     
-    // Battery indicator
     batteryBar = new QProgressBar();
     batteryBar->setRange(0, 100);
     batteryBar->setValue(100);
     batteryBar->setFixedSize(30, 12);
     batteryBar->setTextVisible(true);
-    batteryBar->setStyleSheet(
+    static const QString kBatteryStyleOrange = QStringLiteral(
         "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
         "QProgressBar::chunk { background: #ff8800; border-radius: 2px; }"
     );
+    batteryBar->setStyleSheet(kBatteryStyleOrange);
     
     batteryLabel = new QLabel("BAT");
     batteryLabel->setStyleSheet("color: #888; font-size: 8px;");
     
-    // Layout system monitoring widgets
     systemLayout->addWidget(masterWidget);
     systemLayout->addSpacing(10);
     
@@ -325,10 +348,8 @@ void MenuBar::setupSystemMonitoring() {
     batteryLayout->addWidget(batteryLabel);
     systemLayout->addWidget(batteryWidget);
     
-    // Add spacer between system indicators and window controls
     systemLayout->addSpacing(15);
     
-    // Window control buttons (minimize, maximize, close)
     windowControlsWidget = new QWidget();
     auto windowControlsLayout = new QHBoxLayout(windowControlsWidget);
     windowControlsLayout->setContentsMargins(0, 0, 0, 0);
@@ -338,8 +359,7 @@ void MenuBar::setupSystemMonitoring() {
     auto maximizeBtn = new QPushButton("□", this);
     auto closeBtn = new QPushButton("×", this);
     
-    // Style the window control buttons
-    QString btnStyle = 
+    static const QString kBtnStyle = QStringLiteral(
         "QPushButton {"
         "    background-color: transparent;"
         "    border: none;"
@@ -356,12 +376,28 @@ void MenuBar::setupSystemMonitoring() {
         "QPushButton:hover {"
         "    background-color: #3a3a3a;"
         "    border-radius: 2px;"
-        "}";
+        "}"
+    );
+    static const QString kBtnStyleClose = QStringLiteral(
+        "QPushButton {"
+        "    background-color: transparent;"
+        "    border: none;"
+        "    color: #e0e0e0;"
+        "    font-size: 14px;"
+        "    font-weight: bold;"
+        "    min-width: 18px;"
+        "    max-width: 18px;"
+        "    min-height: 18px;"
+        "    max-height: 18px;"
+        "    padding: 0px;"
+        "    margin: 1px;"
+        "}"
+        "QPushButton:hover { background-color: #e74c3c; border-radius: 2px; }"
+    );
     
-    minimizeBtn->setStyleSheet(btnStyle);
-    maximizeBtn->setStyleSheet(btnStyle);
-    closeBtn->setStyleSheet(btnStyle + 
-        "QPushButton:hover { background-color: #e74c3c; }");
+    minimizeBtn->setStyleSheet(kBtnStyle);
+    maximizeBtn->setStyleSheet(kBtnStyle);
+    closeBtn->setStyleSheet(kBtnStyleClose);
     
     // Connect window control buttons
     connect(minimizeBtn, &QPushButton::clicked, mainWindow, &QWidget::showMinimized);
@@ -383,14 +419,12 @@ void MenuBar::setupSystemMonitoring() {
     setCornerWidget(systemWidget, Qt::TopRightCorner);
     registerDragRegion(systemWidget);
     
-    // Setup system monitoring timer
     systemTimer = new QTimer(this);
     connect(systemTimer, &QTimer::timeout, this, &MenuBar::updateSystemStats);
     systemTimer->start(2000); // Update every 2 seconds
 }
 
 void MenuBar::updateSystemStats() {
-    // Update CPU usage by reading /proc/stat
     QFile cpuFile("/proc/stat");
     if (cpuFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         QTextStream in(&cpuFile);
@@ -421,16 +455,13 @@ void MenuBar::updateSystemStats() {
         cpuFile.close();
     }
     
-    // Update RAM usage - force to 62% until we fix the real calculation
     updateRamUsage(62.0);
     
-    // Update battery level by reading battery capacity
     QFile batteryCapacityFile("/sys/class/power_supply/BAT0/capacity");
     if (batteryCapacityFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         QTextStream in(&batteryCapacityFile);
         int batteryLevel = in.readLine().trimmed().toInt();
         
-        // Check charging status
         QFile batteryStatusFile("/sys/class/power_supply/BAT0/status");
         bool isCharging = false;
         if (batteryStatusFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -443,7 +474,6 @@ void MenuBar::updateSystemStats() {
         updateBatteryLevel(batteryLevel, isCharging);
         batteryCapacityFile.close();
     } else {
-        // Try BAT1 if BAT0 doesn't exist
         QFile batteryCapacityFile1("/sys/class/power_supply/BAT1/capacity");
         if (batteryCapacityFile1.open(QIODevice::ReadOnly | QIODevice::Text)) {
             QTextStream in(&batteryCapacityFile1);
@@ -461,13 +491,9 @@ void MenuBar::updateSystemStats() {
             updateBatteryLevel(batteryLevel, isCharging);
             batteryCapacityFile1.close();
         } else {
-            // No battery found, set to 100% (desktop system)
             updateBatteryLevel(100, false);
         }
     }
-    
-    // TODO: Connect to actual audio output levels from DJAudioPlayer
-    // For now, show 0% until proper audio monitoring is implemented
     updateMasterLevels(0.0, 0.0);
 }
 
@@ -475,18 +501,13 @@ void MenuBar::showPreferences() {
     if (!preferencesDialog) {
         preferencesDialog = new PreferencesDialog(mainWindow);
         
-        // Set player references for MIDI integration
         if (mainWindow && mainWindow->getPlayerA() && mainWindow->getPlayerB()) {
             preferencesDialog->setPlayerReferences(mainWindow->getPlayerA(), mainWindow->getPlayerB(), mainWindow);
-            qDebug() << "MenuBar: Player references set for PreferencesDialog MIDI integration";
         } else {
-            qDebug() << "MenuBar: Warning - Player references not available for MIDI integration";
         }
         
-        // Connect settings change signal
         connect(preferencesDialog, &PreferencesDialog::settingsChanged, [this]() {
-            qDebug() << "BetaPulseX: Settings changed, reloading configuration";
-            // Emit signal to main window or handle configuration reload
+            (void)this; /* placeholder to keep lambda non-empty without side effects */
         });
     }
     
@@ -500,12 +521,10 @@ void MenuBar::exportSettings() {
     QString fileName = QFileDialog::getSaveFileName(this, "Export Settings", defaultPath, "JSON Files (*.json)");
     
     if (!fileName.isEmpty()) {
-        // Export current settings to JSON file
-    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
+        QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
         
         QJsonObject jsonObj;
         
-        // Export all settings groups
         QStringList groups = {"Audio", "Decks", "Interface", "Library", "Performance", "Advanced"};
         
         for (const QString& group : groups) {
@@ -515,7 +534,6 @@ void MenuBar::exportSettings() {
             for (const QString& key : config.childKeys()) {
                 QVariant value = config.value(key);
                 
-                // Convert QVariant to JSON compatible types
                 if (value.metaType() == QMetaType::fromType<QColor>()) {
                     QColor color = value.value<QColor>();
                     groupObj[key] = color.name();
@@ -534,14 +552,12 @@ void MenuBar::exportSettings() {
             jsonObj[group] = groupObj;
         }
         
-        // Add metadata
         QJsonObject metadata;
         metadata["version"] = "1.0";
         metadata["exportDate"] = QDateTime::currentDateTime().toString(Qt::ISODate);
         metadata["application"] = "BetaPulseX";
         jsonObj["metadata"] = metadata;
         
-        // Write to file
         QJsonDocument doc(jsonObj);
         QFile file(fileName);
         if (file.open(QIODevice::WriteOnly)) {
@@ -580,7 +596,6 @@ void MenuBar::importSettings() {
             QJsonObject jsonObj = doc.object();
             QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
             
-            // Import settings groups
             QStringList groups = {"Audio", "Decks", "Interface", "Library", "Performance", "Advanced"};
             
             for (const QString& group : groups) {
@@ -620,7 +635,7 @@ void MenuBar::resetSettings() {
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     
     if (reply == QMessageBox::Yes) {
-    QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
+        QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
         config.clear();
         config.sync();
         
@@ -676,45 +691,25 @@ void MenuBar::toggleFullScreen() {
 }
 
 void MenuBar::updateCpuUsage(double percentage) {
-    cpuBar->setValue(static_cast<int>(percentage));
-    cpuBar->setFormat(QString("%1%").arg(static_cast<int>(percentage)));
-    if (percentage > 80) {
-        cpuBar->setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
-            "QProgressBar::chunk { background: #ff4444; border-radius: 2px; }"
-        );
-    } else if (percentage > 60) {
-        cpuBar->setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
-            "QProgressBar::chunk { background: #ffaa00; border-radius: 2px; }"
-        );
-    } else {
-        cpuBar->setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
-            "QProgressBar::chunk { background: #00aa00; border-radius: 2px; }"
-        );
-    }
+    const int p = static_cast<int>(percentage);
+    cpuBar->setValue(p);
+    cpuBar->setFormat(QString::number(p) + QLatin1Char('%'));
+    if (percentage > 80) cpuBar->setStyleSheet(kCpuStyleRed);
+    else if (percentage > 60) cpuBar->setStyleSheet(kCpuStyleYellow);
+    else cpuBar->setStyleSheet(kCpuStyleGreen);
 }
 
 void MenuBar::updateRamUsage(double percentage) {
-    ramBar->setValue(static_cast<int>(percentage));
-    ramBar->setFormat(QString("%1%").arg(static_cast<int>(percentage)));
-    if (percentage > 85) {
-        ramBar->setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
-            "QProgressBar::chunk { background: #ff4444; border-radius: 2px; }"
-        );
-    } else {
-        ramBar->setStyleSheet(
-            "QProgressBar { background: #333; border: none; border-radius: 2px; color: white; font-size: 8px; }"
-            "QProgressBar::chunk { background: #0066cc; border-radius: 2px; }"
-        );
-    }
+    const int p = static_cast<int>(percentage);
+    ramBar->setValue(p);
+    ramBar->setFormat(QString::number(p) + QLatin1Char('%'));
+    if (percentage > 85) ramBar->setStyleSheet(kRamStyleRed);
+    else ramBar->setStyleSheet(kRamStyleBlue);
 }
 
 void MenuBar::updateBatteryLevel(int percentage, bool isCharging) {
     batteryBar->setValue(percentage);
-    batteryBar->setFormat(QString("%1%").arg(percentage));
+    batteryBar->setFormat(QString::number(percentage) + QLatin1Char('%'));
     
     QString color = "#ff8800"; // Default orange
     if (isCharging) {
