@@ -497,6 +497,8 @@ void LibraryManager::setupUI()
         hh->setDefaultSectionSize(120);
         hh->setStretchLastSection(false);
         hh->setSectionResizeMode(QHeaderView::Interactive);
+        hh->setSectionResizeMode(LibraryTableModel::StatusColumn, QHeaderView::Fixed);
+        hh->resizeSection(LibraryTableModel::StatusColumn, 28);
         // Keep title column dominant
         hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
     }
@@ -1488,16 +1490,33 @@ void LibraryManager::updateStatusLabel()
         return;
     }
     
-    int filtered = model->getFilteredCount();
-    int total = model->getTotalCount();
-    
+    const int filtered = model->getFilteredCount();
+    const int total = model->getTotalCount();
+    const int missingTotal = model->getMissingCount(false);
+    const int missingFiltered = model->getMissingCount(true);
+
+    QString message;
     if (total == 0) {
-        statusLabel->setText("Library is empty. Add some music files!");
+        message = tr("Library is empty. Add some music files!");
     } else if (filtered == total) {
-        statusLabel->setText(QString("%1 tracks").arg(total));
+        message = tr("%1 tracks").arg(total);
     } else {
-        statusLabel->setText(QString("%1 of %2 tracks").arg(filtered).arg(total));
+        message = tr("%1 of %2 tracks").arg(filtered).arg(total);
     }
+
+    if (missingTotal > 0 && total > 0) {
+        if (filtered == total) {
+            message += tr(" - %1 missing").arg(missingTotal);
+        } else if (missingFiltered > 0) {
+            message += tr(" - %1 missing in view").arg(missingFiltered);
+            if (missingTotal > missingFiltered)
+                message += tr(" (%1 total missing)").arg(missingTotal);
+        } else {
+            message += tr(" - %1 missing overall").arg(missingTotal);
+        }
+    }
+
+    statusLabel->setText(message);
 }
 
 void LibraryManager::onContextMenuRequested(const QPoint& pos)
@@ -1606,6 +1625,8 @@ void LibraryManager::autoSizeColumnsInitial()
     clamp(LibraryTableModel::FileSizeColumn, 110);
 
     // Restore resize modes: Title stretches, others interactive
+    hh->setSectionResizeMode(LibraryTableModel::StatusColumn, QHeaderView::Fixed);
+    hh->resizeSection(LibraryTableModel::StatusColumn, 28);
     hh->setSectionResizeMode(LibraryTableModel::TitleColumn, QHeaderView::Stretch);
     for (int col = LibraryTableModel::ArtistColumn; col < LibraryTableModel::ColumnCount; ++col) {
         hh->setSectionResizeMode(col, QHeaderView::Interactive);

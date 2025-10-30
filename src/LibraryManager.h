@@ -131,6 +131,10 @@ struct TrackInfo {
     bool hasWaveformCache() const {
         return waveformAnalyzedAt > 0 && !waveformMaxBins.empty() && !waveformMinBins.empty();
     }
+
+    bool isFileMissing() const {
+        return filePath.isEmpty() || !QFileInfo::exists(filePath);
+    }
 };
 
 // Background thread for loading ID3 tags
@@ -165,7 +169,8 @@ class LibraryTableModel : public QAbstractTableModel {
     
 public:
     enum Column {
-        TitleColumn = 0,
+        StatusColumn = 0,
+        TitleColumn,
         ArtistColumn,
         AlbumColumn,
         DurationColumn,
@@ -175,9 +180,10 @@ public:
         FileSizeColumn,
         ColumnCount
     };
-    
+
     enum SortMode {
-        SortByTitle = 0,
+        SortByStatus = 0,
+        SortByTitle,
         SortByArtist,
         SortByAlbum,
         SortByDuration,
@@ -212,6 +218,7 @@ public:
     bool isPlaylistFilterActive() const { return playlistFilterActive; }
     int getPlaylistScopeCount() const { return playlistScopeCount; }
     std::optional<TrackInfo> findTrackByPath(const QString& filePath) const;
+    int getMissingCount(bool filteredView = true) const;
     
     // Get filtered tracks count
     int getFilteredCount() const { return filteredTracks.size(); }

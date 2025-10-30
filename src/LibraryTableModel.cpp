@@ -1,5 +1,7 @@
 #include "LibraryManager.h"
 
+#include <QBrush>
+#include <QColor>
 #include <QMimeData>
 #include <QUrl>
 
@@ -31,7 +33,11 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
     const TrackInfo* track = filteredTracks[index.row()];
     if (!track) return QVariant();
     
+    const bool missing = track->isFileMissing();
+
     if (role == Qt::DisplayRole) {
+        if (index.column() == StatusColumn)
+            return missing ? QStringLiteral("!") : QString::fromUtf8("\xE2\x9C\x94");
         switch (index.column()) {
             case TitleColumn: return track->getDisplayTitle();
             case ArtistColumn: return track->getDisplayArtist();
@@ -43,7 +49,14 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
             case FileSizeColumn: return track->getFileSizeString();
             default: return QVariant();
         }
+    } else if (role == Qt::ForegroundRole) {
+        if (index.column() == StatusColumn)
+            return QBrush(missing ? QColor(0xF3, 0x53, 0x3D) : QColor(0x5B, 0xC2, 0x71));
+        if (missing)
+            return QBrush(QColor(0xF3, 0x53, 0x3D));
     } else if (role == Qt::ToolTipRole) {
+        if (index.column() == StatusColumn)
+            return missing ? tr("File missing on disk") : tr("File available");
         QStringList tooltipLines;
         tooltipLines << QStringLiteral("Title: %1").arg(track->getDisplayTitle());
         tooltipLines << QStringLiteral("Artist: %1").arg(track->getDisplayArtist());
@@ -52,11 +65,14 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
         if (!track->year.isEmpty())       tooltipLines << QStringLiteral("Year: %1").arg(track->year);
         if (!track->key.isEmpty())        tooltipLines << QStringLiteral("Key: %1").arg(track->key);
         if (track->bpm > 0.0)             tooltipLines << QStringLiteral("BPM: %1").arg(track->getBpmString());
-        if (!track->comment.isEmpty())    tooltipLines << QStringLiteral("Comment: %1").arg(track->comment);
-        tooltipLines << QStringLiteral("Path: %1").arg(track->filePath);
+    if (!track->comment.isEmpty())    tooltipLines << QStringLiteral("Comment: %1").arg(track->comment);
+    tooltipLines << QStringLiteral("Path: %1").arg(track->filePath);
+    tooltipLines << (missing ? tr("Status: Missing (file not found)") : tr("Status: Available"));
         return tooltipLines.join(QLatin1Char('\n'));
     } else if (role == Qt::TextAlignmentRole) {
         switch (index.column()) {
+            case StatusColumn:
+                return int(Qt::AlignCenter);
             case DurationColumn:
             case BpmColumn:
             case YearColumn:
@@ -76,6 +92,7 @@ QVariant LibraryTableModel::headerData(int section, Qt::Orientation orientation,
 {
     if (orientation == Qt::Horizontal && role == Qt::DisplayRole) {
         switch (section) {
+            case StatusColumn: return QString();
             case TitleColumn: return tr("Title");
             case ArtistColumn: return tr("Artist");
             case AlbumColumn: return tr("Album");
@@ -102,7 +119,8 @@ void LibraryTableModel::sort(int column, Qt::SortOrder order)
 {
     SortMode mode = SortByTitle;
     switch (column) {
-        case TitleColumn:   mode = SortByTitle; break;
+    case StatusColumn:  mode = SortByStatus; break;
+    case TitleColumn:   mode = SortByTitle; break;
         case ArtistColumn:  mode = SortByArtist; break;
         case AlbumColumn:   mode = SortByAlbum; break;
         case DurationColumn:mode = SortByDuration; break;
@@ -189,6 +207,23 @@ std::optional<TrackInfo> LibraryTableModel::findTrackByPath(const QString& fileP
     return *it;
 }
 
+int LibraryTableModel::getMissingCount(bool filteredView) const
+{
+    int count = 0;
+    if (filteredView) {
+        for (const TrackInfo* track : filteredTracks) {
+            if (track && track->isFileMissing())
+                ++count;
+        }
+    } else {
+        for (const auto& track : allTracks) {
+            if (track.isFileMissing())
+                ++count;
+        }
+    }
+    return count;
+}
+
 void LibraryTableModel::setSortMode(SortMode mode, Qt::SortOrder order)
 {
     if (currentSortMode == mode && currentSortOrder == order)
@@ -268,6 +303,13 @@ bool LibraryTableModel::isLessThan(const TrackInfo* a, const TrackInfo* b) const
     if (!a || !b) return false;
 
     switch (currentSortMode) {
+        case SortByStatus: {
+            const bool aMissing = a->isFileMissing();
+            const bool bMissing = b->isFileMissing();
+            if (aMissing != bMissing)
+                return aMissing && !bMissing;
+            return QString::compare(a->getDisplayTitle(), b->getDisplayTitle(), Qt::CaseInsensitive) < 0;
+        }
         case SortByTitle:
             return QString::compare(a->getDisplayTitle(), b->getDisplayTitle(), Qt::CaseInsensitive) < 0;
         case SortByArtist:

@@ -241,7 +241,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     double dpiX = static_cast<double>(logicalDpiX());
     if (dpiX <= 1.0) dpiX = 96.0; // sensible fallback
     const double pixelsPerCentimeter = dpiX / 2.54; // 1 inch = 2.54 cm
-    const double waveformNudgePx = 0.75 - (pixelsPerCentimeter * 0.5); // subtract 0.5cm to shift LEFT
+    const double waveformNudgePx = 0.5 - (pixelsPerCentimeter * 0.35); // tuned nudge: small left bias to align with beat grid
 
     const double extraLeftDisplaySec = std::max(0.0, -waveformNudgePx) * secondsPerPixelDisplay;
     const double extraRightDisplaySec = std::max(0.0, waveformNudgePx) * secondsPerPixelDisplay;
@@ -325,13 +325,19 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     // Hysteresis around zero to avoid toggling and micro-jitter when hovering near start
     const double enterPadSec = secondsPerPixel * 2.0; // enter latch within ~2px
     const double exitPadSec  = secondsPerPixel * 6.0; // release latch after ~6px past threshold
-    if (!alignZeroLatchActive && playheadSec <= alignSnapSec + enterPadSec) {
-        alignZeroLatchActive = true;
-        alignZeroShiftSec = displayCenterSec; // capture current center so track start stays centered
-    } else if (alignZeroLatchActive && playheadSec >= alignSnapSec + exitPadSec) {
+    if (viewMode == ViewMode::TimeLocked) {
+        if (!alignZeroLatchActive && playheadSec <= alignSnapSec + enterPadSec) {
+            alignZeroLatchActive = true;
+        } else if (alignZeroLatchActive && playheadSec >= alignSnapSec + exitPadSec) {
+            alignZeroLatchActive = false;
+        }
+        if (alignZeroLatchActive) {
+            alignZeroShiftSec = displayCenterSec + geometryCache.waveformNudgeSec;
+        }
+    } else {
         alignZeroLatchActive = false;
     }
-    double alignShiftSec = alignZeroLatchActive ? alignZeroShiftSec : 0.0;
+    double alignShiftSec = alignZeroLatchActive ? alignZeroShiftSec : geometryCache.waveformNudgeSec;
     geometryCache.alignShiftSec = alignShiftSec;
     upperPoints.reserve(pixelWidth + 2);
     lowerPoints.reserve(pixelWidth + 2);
@@ -420,7 +426,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     auto setBaselineColumn = [&](int idx, float lastR, float lastG, float lastB) {
         pixelUpperScratch[idx] = 0.0f;
         pixelLowerScratch[idx] = 0.0f;
-        pixelCoverageScratch[idx] = 0;
+        pixelCoverageScratch[idx] = 1;
         pixelColorScratch[idx * 3 + 0] = lastR;
         pixelColorScratch[idx * 3 + 1] = lastG;
         pixelColorScratch[idx * 3 + 2] = lastB;
@@ -447,7 +453,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     };
 
     for (int x = 0; x < pixelWidth; ++x) {
-        const double displayCenterXSec = leftSecond + (static_cast<double>(x) + 0.5 + waveformNudgePx) * secondsPerPixelDisplay;
+        const double displayCenterXSec = leftSecond + (static_cast<double>(x) + 0.5) * secondsPerPixelDisplay;
         const double audioCenterSec = mapDisplayToAudio(displayCenterXSec);
         double audioStart = audioCenterSec - 0.5 * audioWidthPerPixel;
         double audioEnd   = audioCenterSec + 0.5 * audioWidthPerPixel;
