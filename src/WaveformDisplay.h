@@ -10,6 +10,8 @@
 #include <QResizeEvent>
 #include <QTimer>
 #include <JuceHeader.h>
+#include <array>
+#include <span>
 #include <vector>
 #include <chrono>
 #include <utility>
@@ -226,8 +228,11 @@ private:
         double safeTempo{1.0};
         double leftSecond{0.0};
         double rightSecond{0.0};
+        double fetchLeftSecond{0.0};
+        double fetchRightSecond{0.0};
         double displayCenterSecond{0.0};
         double timeRange{0.0};
+        double waveformNudgeSec{0.0};
         int viewportWidth{0};
     };
 
@@ -240,6 +245,14 @@ private:
     void resetStreamingState();
     void markDirtyAndSchedule();
     void postSourceConfigured();
+    void appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& lock,
+                              int startBin,
+                              std::span<const float> maxBins,
+                              std::span<const float> minBins,
+                              std::span<const float> lowBins,
+                              std::span<const float> midBins,
+                              std::span<const float> highBins,
+                              bool isFinalChunk);
     
     void buildWaveformGeometry(int viewWidth, int viewHeight, double zoomFactor, double renderPlayheadRel);
     double acquireVisualPlayhead();
@@ -342,6 +355,9 @@ private:
         double timeRange{0.0};
         double halfViewportTime{0.0};
         double bufferSec{0.0};
+        double fetchLeftSecond{0.0};
+        double fetchRightSecond{0.0};
+        double waveformNudgeSec{0.0};
         // Optional visual alignment shift (in display seconds) applied to audio->display mapping for this frame.
         // Used to ensure that at playhead==0 the very start of the track (audioSec=0) is exactly centered.
         double alignShiftSec{0.0};
@@ -382,6 +398,12 @@ private:
     mutable std::vector<std::uint8_t> pixelCoverageScratch;
     // Per-pixel color (R,G,B) computed from band energies
     mutable std::vector<float> pixelColorScratch;
+    // Per-pixel persistence so transient streaming gaps reuse the last good geometry
+    mutable std::vector<float> pixelUpperHistory;
+    mutable std::vector<float> pixelLowerHistory;
+    mutable std::vector<float> pixelColorHistory;
+    mutable std::vector<double> pixelCenterHistory;
+    mutable std::vector<std::uint8_t> pixelHistoryValid;
 
     struct WaveformChunk {
         int startBin{0};
