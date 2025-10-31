@@ -25,6 +25,7 @@
 #include <QStyle>
 #include <QHeaderView>
 #include <QDateTime>
+#include <QEvent>
 #include <optional>
 #include <algorithm>
 
@@ -552,6 +553,14 @@ void LibraryManager::setupUI()
     mainSplitter->setStretchFactor(2, 1);
     mainSplitter->setSizes({24, 220, 820});
 
+    sidebarLockHandle = mainSplitter->handle(1);
+    if (sidebarLockHandle)
+    {
+        sidebarLockHandle->setCursor(Qt::ArrowCursor);
+        sidebarLockHandle->installEventFilter(this);
+        sidebarLockHandle->setDisabled(true);
+    }
+
     mainLayout->addWidget(mainSplitter);
 
     connect(addPlaylistButton, &QToolButton::clicked, this, &LibraryManager::onAddPlaylistClicked);
@@ -570,6 +579,29 @@ void LibraryManager::setupUI()
 
     initializeNavigationState();
     updateStatusLabel();
+}
+
+bool LibraryManager::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == sidebarLockHandle)
+    {
+        switch (event->type())
+        {
+            case QEvent::Enter:
+            case QEvent::HoverEnter:
+                sidebarLockHandle->setCursor(Qt::ArrowCursor);
+                break;
+            case QEvent::MouseButtonPress:
+            case QEvent::MouseButtonRelease:
+            case QEvent::MouseButtonDblClick:
+            case QEvent::MouseMove:
+            case QEvent::HoverMove:
+                return true; // Block user interaction so the handle stays fixed
+            default:
+                break;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 QToolButton* LibraryManager::createSidebarButton(SidebarSection section, const QIcon& icon, const QString& tooltip)

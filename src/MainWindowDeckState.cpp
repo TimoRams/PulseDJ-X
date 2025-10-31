@@ -500,9 +500,16 @@ void QtMainWindow::updateOverviewLabel(bool isDeckA)
 
 		QStringList tooltipParts;
 		double clampedProgress = std::clamp(prog, 0.0, 1.0);
+		int percent = static_cast<int>(std::round(clampedProgress * 100.0));
 
-		if (active) {
-			int percent = static_cast<int>(std::round(clampedProgress * 100.0));
+		const bool showAnalysisState = active && percent < 100;
+
+		if (active && percent >= 100) {
+			// Streaming may continue in background; treat as complete for UI once at 100%
+			active = false;
+		}
+
+		if (showAnalysisState) {
 			const QString analyzingText = QStringLiteral("Analyzing %1%").arg(percent);
 			tooltipParts << analyzingText;
 			infoStyle = QStringLiteral("font-size: 11px; color: #4fb0ff; font-weight: bold; padding: 0px;");

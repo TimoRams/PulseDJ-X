@@ -2261,18 +2261,22 @@ void WaveformDisplay::drawBeatGrid(QPainter& p, double playheadSec, double displ
     int rightX = widgetWidth - 8;
     int y = 15;
     
-    if (analysisActive) {
-        int percent = static_cast<int>(std::round(analysisProgress * 100.0));
-        p.setPen(QPen(QColor(180, 200, 255), 1));
-        QString txt = QString("Analyzing %1%").arg(percent);
-        int w = p.fontMetrics().horizontalAdvance(txt);
-        p.drawText(rightX - w, y, txt);
-    } else if (analysisFailed) {
+    const bool hasBpm = originalBpm > 0.0;
+    const double cappedProgress = std::clamp(analysisProgress, 0.0, 1.0);
+    const int percent = static_cast<int>(std::floor(cappedProgress * 100.0 + 0.0001));
+    const bool showProgress = (!hasBpm) && analysisActive && percent < 100;
+
+    if (analysisFailed) {
         p.setPen(QPen(QColor(255, 120, 120), 1));
-        QString txt("Analysis failed");
+        QString txt(QStringLiteral("Analysis failed"));
         int w = p.fontMetrics().horizontalAdvance(txt);
         p.drawText(rightX - w, y, txt);
-    } else if (originalBpm > 0.0) {
+    } else if (showProgress) {
+        p.setPen(QPen(QColor(180, 200, 255), 1));
+    QString txt = QStringLiteral("Analyzing %1%").arg(percent);
+        int w = p.fontMetrics().horizontalAdvance(txt);
+        p.drawText(rightX - w, y, txt);
+    } else if (hasBpm) {
         p.setPen(QPen(QColor(150, 180, 220), 1));
         const double deckBpm = originalBpm * safeTempo;
         QString bpmText = QString("BPM: %1").arg(deckBpm, 0, 'f', 1);

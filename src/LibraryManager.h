@@ -30,6 +30,7 @@
 #include <QApplication>
 #include <QDrag>
 #include <QSplitter>
+#include <QSplitterHandle>
 #include <QTreeView>
 #include <QFileSystemModel>
 #include <QVector>
@@ -297,7 +298,10 @@ signals:
     void loadToDeck(int deckIndex, const QString& filePath); // New signal for explicit deck loading
     void analyzeTracksRequested(const QStringList& filePaths);
     void analyzeTracksAdvancedRequested(const QStringList& filePaths, double minBpm, double maxBpm);
-    
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private slots:
     void onTrackLoaded(const TrackInfo& track);
     void onLoadingProgress(int current, int total);
@@ -322,6 +326,7 @@ private slots:
 private:
     // UI components
     QSplitter* mainSplitter;
+    QSplitterHandle* sidebarLockHandle = nullptr;
     QWidget* iconSidebar = nullptr;
     QButtonGroup* sidebarButtonGroup = nullptr;
     QWidget* navigationHeader = nullptr;
