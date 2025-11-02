@@ -215,21 +215,32 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         sharedLock.lock();
     }
 
-    // Lokale Kopien der kritischen Daten erstellen um Race Conditions zu vermeiden
-    const int localSourceWidth = sourceWidth;
-    const int localAvailableStartBin = availableStartBin;
-    const int localAvailableEndBin = availableEndBin;
-    const double localAudioLength = audioLength;
+    // Lokale atomare Kopien der kritischen Daten erstellen
+    // Lock nur für die Dauer der Kopie halten, dann sofort freigeben
+    std::vector<float> localSourceMinBins;
+    std::vector<float> localSourceMaxBins;
+    std::vector<float> localSourceLowBins;
+    std::vector<float> localSourceMidBins;
+    std::vector<float> localSourceHighBins;
+    int localSourceWidth;
+    int localAvailableStartBin;
+    int localAvailableEndBin;
+    double localAudioLength;
     
-    // CRITICAL: Vektor-Kopien erstellen um Race Conditions mit Streaming-Thread zu verhindern
-    std::vector<float> localSourceMinBins = sourceMinBins;
-    std::vector<float> localSourceMaxBins = sourceMaxBins;
-    std::vector<float> localSourceLowBins = sourceLowBins;
-    std::vector<float> localSourceMidBins = sourceMidBins;
-    std::vector<float> localSourceHighBins = sourceHighBins;
+    {
+        // Atomare Kopie unter Lock - dann sofort freigeben!
+        localSourceMinBins = sourceMinBins;
+        localSourceMaxBins = sourceMaxBins;
+        localSourceLowBins = sourceLowBins;
+        localSourceMidBins = sourceMidBins;
+        localSourceHighBins = sourceHighBins;
+        localSourceWidth = sourceWidth;
+        localAvailableStartBin = availableStartBin;
+        localAvailableEndBin = availableEndBin;
+        localAudioLength = audioLength;
+    } // sharedLock wird hier automatisch durch Scope-Ende freigegeben
     
-    // Lock freigeben - ab jetzt arbeiten wir nur mit lokalen Kopien
-    sharedLock.unlock();
+    sharedLock.unlock(); // Explizit freigeben bevor wir weitermachen
     
     if (viewWidth <= 0 || viewHeight <= 0 || localAudioLength <= 0.0 || localSourceWidth <= 0) {
         return;
@@ -396,8 +407,11 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     // Fine alignment: nudge waveform sampling so visuals line up with audio and beat grid.
 
     // Streaming-aware local bin window
+    // Arbeite mit lokalen Kopien - keine Race Conditions mehr
     const int totalLocalBins = static_cast<int>(localSourceMaxBins.size());
-    const auto clampLocal = [&](int idx) { return std::clamp(idx, 0, std::max(0, totalLocalBins - 1)); };
+    const auto clampLocal = [totalLocalBins](int idx) { 
+        return std::clamp(idx, 0, std::max(0, totalLocalBins - 1)); 
+    };
 
     // Bei Seeks: History komplett invalidieren um Artefakte zu vermeiden
     if (isInSeekMode) {
@@ -502,45 +516,86 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         const int gb0 = static_cast<int>(std::floor(audioStart * binPerSecond));
         const int gb1 = std::max(gb0 + 1, static_cast<int>(std::ceil(audioEnd * binPerSecond)));
 
-        // Map to local indices within current cached window
-        int li0 = gb0 - localAvailableStartBin;
-        int li1 = gb1 - localAvailableStartBin;
-
-        if (li1 <= 0 || li0 >= totalLocalBins) {
-            reuseOrBaseline(x, audioCenterSec, prevR, prevG, prevB);
-            continue;
-        }
-
-        li0 = clampLocal(li0);
-        li1 = std::min(std::max(li0 + 1, li1), totalLocalBins);
-
         float minVal = 0.0f, maxVal = 0.0f;
         float sumLow = 0.0f, sumMid = 0.0f, sumHigh = 0.0f;
         bool have = false;
         int count = 0;
-        for (int i = li0; i < li1; ++i) {
-            // Bounds check: sicherstellen dass wir nicht out-of-bounds zugreifen
-            if (i < 0 || i >= static_cast<int>(localSourceMinBins.size()) || i >= static_cast<int>(localSourceMaxBins.size())) {
+        
+        // === ADAPTIVE CHUNK LOOKUP (Priority 1) ===
+        if (useAdaptiveChunking_) {
+            std::lock_guard<std::mutex> lock(adaptiveChunksMutex_);
+            if (!adaptiveChunks_.empty()) {
+                for (const auto& chunk : adaptiveChunks_) {
+                    // Check if chunk overlaps with required bin range
+                    if (chunk.endBin <= gb0 || chunk.startBin >= gb1) continue;
+                    
+                    // Find overlap
+                    int overlapStart = std::max(gb0, chunk.startBin);
+                    int overlapEnd = std::min(gb1, chunk.endBin);
+                    
+                    // Map to chunk-local indices
+                    int localStart = overlapStart - chunk.startBin;
+                    int localEnd = overlapEnd - chunk.startBin;
+                    
+                    for (int i = localStart; i < localEnd; ++i) {
+                        if (i < 0 || i >= static_cast<int>(chunk.maxBins.size())) continue;
+                        
+                        float vmin = chunk.minBins[i];
+                        float vmax = chunk.maxBins[i];
+                        
+                        if (!have) {
+                            minVal = vmin;
+                            maxVal = vmax;
+                            have = true;
+                        } else {
+                            minVal = std::min(minVal, vmin);
+                            maxVal = std::max(maxVal, vmax);
+                        }
+                        ++count;
+                    }
+                }
+            }
+        }
+        
+        // === LEGACY STREAMING BINS (Fallback) ===
+        if (!have) {
+            int li0 = gb0 - localAvailableStartBin;
+            int li1 = gb1 - localAvailableStartBin;
+
+            if (li1 <= 0 || li0 >= totalLocalBins) {
+                reuseOrBaseline(x, audioCenterSec, prevR, prevG, prevB);
                 continue;
             }
-            float vmin = localSourceMinBins[i];
-            float vmax = localSourceMaxBins[i];
-            if (!have) {
-                minVal = vmin; maxVal = vmax; have = true;
-            } else {
-                minVal = std::min(minVal, vmin);
-                maxVal = std::max(maxVal, vmax);
-            }
-            // Aggregate band energies if available
-            if (i >= 0 && i < static_cast<int>(localSourceLowBins.size())) {
-                sumLow  += std::max(0.0f, localSourceLowBins[i]);
-                ++count;
-            }
-            if (i >= 0 && i < static_cast<int>(localSourceMidBins.size())) {
-                sumMid  += std::max(0.0f, localSourceMidBins[i]);
-            }
-            if (i >= 0 && i < static_cast<int>(localSourceHighBins.size())) {
-                sumHigh += std::max(0.0f, localSourceHighBins[i]);
+
+            li0 = clampLocal(li0);
+            li1 = std::clamp(li1, li0 + 1, totalLocalBins);
+        
+            for (int i = li0; i < li1; ++i) {
+                // Bounds check with local copies - Thread-safe!
+                if (i < 0 || i >= static_cast<int>(localSourceMinBins.size()) || 
+                    i >= static_cast<int>(localSourceMaxBins.size())) {
+                    continue;
+                }
+                
+                float vmin = localSourceMinBins[i];
+                float vmax = localSourceMaxBins[i];
+                if (!have) {
+                    minVal = vmin; maxVal = vmax; have = true;
+                } else {
+                    minVal = std::min(minVal, vmin);
+                    maxVal = std::max(maxVal, vmax);
+                }
+                // Aggregate band energies if available
+                if (i >= 0 && i < static_cast<int>(localSourceLowBins.size())) {
+                    sumLow  += std::max(0.0f, localSourceLowBins[i]);
+                    ++count;
+                }
+                if (i >= 0 && i < static_cast<int>(localSourceMidBins.size())) {
+                    sumMid  += std::max(0.0f, localSourceMidBins[i]);
+                }
+                if (i >= 0 && i < static_cast<int>(localSourceHighBins.size())) {
+                    sumHigh += std::max(0.0f, localSourceHighBins[i]);
+                }
             }
         }
 
@@ -1490,6 +1545,73 @@ void WaveformDisplay::appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& 
 
     streamingExpectedNextBin = availableEndBin;
     streamingComplete = streamingComplete || isFinalChunk;
+
+    // === ADAPTIVE CHUNK SYSTEM ===
+    if (useAdaptiveChunking_ && !maxBins.empty()) {
+        std::lock_guard<std::mutex> lock(adaptiveChunksMutex_);
+        
+        // Determine chunk priority based on distance to playhead
+        double playheadSec = playheadPos * audioLength;
+        double binPerSec = streamingTotalBins > 0 ? (double)streamingTotalBins / audioLength : 1.0;
+        double chunkCenterSec = ((startBin + chunkEnd) / 2.0) / binPerSec;
+        double distance = std::abs(chunkCenterSec - playheadSec);
+        
+        int priority = 3; // LOW
+        if (distance <= 2.0) priority = 0;       // ULTRA (±2s)
+        else if (distance <= 10.0) priority = 1; // HIGH (±10s)
+        else if (distance <= 30.0) priority = 2; // MEDIUM (±30s)
+        
+        // Check if chunk already exists
+        bool exists = false;
+        for (auto& chunk : adaptiveChunks_) {
+            if (chunk.startBin == startBin && chunk.endBin == chunkEnd) {
+                // Update existing chunk
+                chunk.maxBins.assign(maxBins.begin(), maxBins.end());
+                chunk.minBins.assign(minBins.begin(), minBins.end());
+                chunk.lastAccessTime = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                chunk.priority = priority;
+                exists = true;
+                break;
+            }
+        }
+        
+        if (!exists) {
+            AdaptiveChunk newChunk;
+            newChunk.startBin = startBin;
+            newChunk.endBin = chunkEnd;
+            newChunk.maxBins.assign(maxBins.begin(), maxBins.end());
+            newChunk.minBins.assign(minBins.begin(), minBins.end());
+            newChunk.priority = priority;
+            newChunk.lastAccessTime = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            
+            adaptiveChunks_.push_back(newChunk);
+            
+            qDebug() << "[AdaptiveChunk] Added chunk [" << startBin << "-" << chunkEnd 
+                     << "] Priority:" << priority << "Size:" << newChunk.maxBins.size() 
+                     << "Total chunks:" << adaptiveChunks_.size();
+            
+            // LRU eviction if too many chunks
+            if (adaptiveChunks_.size() > (size_t)maxAdaptiveChunks_) {
+                // Sort by distance from playhead
+                std::sort(adaptiveChunks_.begin(), adaptiveChunks_.end(),
+                    [playheadSec, binPerSec](const AdaptiveChunk& a, const AdaptiveChunk& b) {
+                        double aCenterSec = ((a.startBin + a.endBin) / 2.0) / binPerSec;
+                        double bCenterSec = ((b.startBin + b.endBin) / 2.0) / binPerSec;
+                        double aDist = std::abs(aCenterSec - playheadSec);
+                        double bDist = std::abs(bCenterSec - playheadSec);
+                        return aDist > bDist; // Farthest first
+                    });
+                
+                // Remove farthest chunks
+                int toRemove = adaptiveChunks_.size() - maxAdaptiveChunks_;
+                adaptiveChunks_.erase(adaptiveChunks_.begin(), adaptiveChunks_.begin() + toRemove);
+                
+                qDebug() << "[AdaptiveChunk] Evicted" << toRemove << "chunks, now have" << adaptiveChunks_.size();
+            }
+        }
+    }
 
     if (hasPendingRegionRequest) {
         const int requestSpan = pendingRequestEndBin - pendingRequestStartBin;

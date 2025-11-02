@@ -17,6 +17,7 @@
 #include <utility>
 #include <cstdint>
 #include <shared_mutex>
+#include <mutex>
 #include "ScratchEngine.h"
 
 class WaveformDisplay : public QOpenGLWidget, protected QOpenGLFunctions
@@ -300,6 +301,21 @@ private:
     int streamingTotalBins{0};
     int streamingPreloadBins{4000};
     int streamingMaxCacheBins{40000};
+    
+    // === ADAPTIVE CHUNK SYSTEM ===
+    struct AdaptiveChunk {
+        int startBin{0};
+        int endBin{0};
+        std::vector<float> maxBins;
+        std::vector<float> minBins;
+        double lastAccessTime{0.0};
+        int priority{3}; // 0=ULTRA(128), 1=HIGH(512), 2=MEDIUM(2048), 3=LOW(8192)
+    };
+    std::vector<AdaptiveChunk> adaptiveChunks_;
+    mutable std::mutex adaptiveChunksMutex_; // Thread-safety for chunk access
+    int maxAdaptiveChunks_{50};
+    bool useAdaptiveChunking_{true};
+    
     int streamingExpectedNextBin{0};
     bool hasPendingRegionRequest{false};
     int pendingRequestStartBin{0};
