@@ -9,7 +9,7 @@
 # CMake's behaviour is compatible with the named version. This is a standard CMake command, so more
 # information can be found in the CMake docs.
 
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.21)
 
 project(GUI_APP_EXAMPLE VERSION 0.0.1)
 
@@ -46,18 +46,9 @@ add_subdirectory(JUCE)
 set(JUCE_RECOMMENDED_GLOBAL_OPTIONS
     "JUCE_WEB_BROWSER=0;JUCE_USE_CURL=1;JUCE_USE_XINERAMA=0;JUCE_USE_XRANDR=0;JUCE_USE_XRENDER=0;JUCE_USE_XCURSOR=0")
 
-# Frontend: prefer Qt6, fall back to Qt5 if required
-set(QT_PACKAGE "")
-find_package(Qt6 QUIET COMPONENTS Widgets OpenGLWidgets Sql)
-if(Qt6_FOUND)
-    set(QT_PACKAGE "Qt6")
-    message(STATUS "Using Qt6 with OpenGLWidgets")
-else()
-    message(STATUS "Qt6 not found; trying Qt5 fallback")
-    find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL Sql)
-    set(QT_PACKAGE "Qt5")
-    message(STATUS "Using Qt5 with OpenGL module")
-endif()
+# Frontend: require Qt6 (Qt6 is well-established; simplifies build)
+find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets Sql)
+message(STATUS "Using Qt6 with OpenGLWidgets")
 
 find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -66,17 +57,6 @@ pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
 pkg_check_modules(AUBIO QUIET aubio)
 pkg_check_modules(RUBBERBAND REQUIRED rubberband)
 
-# WebKit detection (Qt HTML widget replacement)
-set(WEBKIT2_FOUND FALSE)
-foreach(_webkit_module IN ITEMS webkit2gtk-4.1 webkit2gtk-4.0)
-    if(NOT WEBKIT2_FOUND)
-        pkg_check_modules(WEBKIT2 QUIET ${_webkit_module})
-        if(WEBKIT2_FOUND)
-            message(STATUS "Found ${_webkit_module} via pkg-config")
-        endif()
-    endif()
-endforeach()
-
 juce_add_console_app(David
     PRODUCT_NAME "David")
 
@@ -84,7 +64,13 @@ juce_generate_juce_header(David)
 
 target_compile_definitions(David PRIVATE
     JUCE_USE_MP3AUDIOFORMAT=1
-    JUCE_INCLUDE_ZLIB_CODE=1)
+    JUCE_INCLUDE_ZLIB_CODE=1
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=1
+    JUCE_USE_XINERAMA=0
+    JUCE_USE_XRANDR=0
+    JUCE_USE_XRENDER=0
+    JUCE_USE_XCURSOR=0)
 
 set(DAVID_SOURCES
     src/Main.cpp
@@ -150,12 +136,9 @@ target_link_libraries(David
         juce::juce_graphics
         juce::juce_dsp
         CURL::libcurl
-        $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Widgets>
-        $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::OpenGLWidgets>
-        $<$<STREQUAL:${QT_PACKAGE},Qt6>:Qt6::Sql>
-        $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Widgets>
-        $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::OpenGL>
-        $<$<STREQUAL:${QT_PACKAGE},Qt5>:Qt5::Sql>)
+        Qt6::Widgets
+        Qt6::OpenGLWidgets
+        Qt6::Sql)
 
 if(AUBIO_FOUND)
     message(STATUS "Aubio found: including headers and linking libs")
@@ -173,20 +156,12 @@ target_link_libraries(David PRIVATE ${RUBBERBAND_LIBRARIES})
 target_compile_options(David PRIVATE ${RUBBERBAND_CFLAGS_OTHER})
 target_compile_definitions(David PRIVATE RUBBERBAND_FOUND=1)
 
+# JUCE's juce_gui_extra on Linux expects GTK headers/libs even if Qt is used for the main UI
 target_include_directories(David PRIVATE ${GTK3_INCLUDE_DIRS})
 target_link_libraries(David PRIVATE ${GTK3_LIBRARIES})
 target_compile_options(David PRIVATE ${GTK3_CFLAGS_OTHER})
 
-if(MPG123_FOUND)
-    target_include_directories(David PRIVATE ${MPG123_INCLUDE_DIRS})
-    target_compile_options(David PRIVATE ${MPG123_CFLAGS_OTHER})
-endif()
-
-if(WEBKIT2_FOUND)
-    target_include_directories(David PRIVATE ${WEBKIT2_INCLUDE_DIRS})
-    target_link_libraries(David PRIVATE ${WEBKIT2_LIBRARIES})
-    target_compile_options(David PRIVATE ${WEBKIT2_CFLAGS_OTHER})
-endif()
+# Removed unused MPG123 and WebKit2 blocks (no references in source)
 
 set_target_properties(David PROPERTIES
     AUTOMOC ON
