@@ -260,6 +260,7 @@ private:
     void updateRenderActivity();
     void invalidateChunkCache();
     void rebuildChunkCacheIfNeeded();
+    void rebuildChunkCacheIfNeeded_Locked(std::unique_lock<std::shared_mutex>& lock);
     void ensureGlResources();
     void destroyGlResources();
     bool compileWaveformShaders();
@@ -336,6 +337,7 @@ private:
         int lastAvailableEndBin{0};
         bool geometryValid{false};
         bool needsFullRedraw{true};
+        bool needsUpdate{false}; // Merker um vorhandene Geometrie weiter zu nutzen, bis frische Daten angekommen sind
         std::chrono::steady_clock::time_point lastUpdate;
     } renderCache;
 

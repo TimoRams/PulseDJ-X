@@ -233,7 +233,7 @@ private:
     // Defer keylock toggles to audio thread: -1 none, 0 disable, 1 enable
     std::atomic<int> keylockChangePending{-1};
     // Debug logging for keylock paths
-    bool debugKeylock{true};
+    bool debugKeylock{false};
     // Short warm-up delay for keylock to ensure internal buffers are primed (~5ms)
     int keylockPrimeSamplesRemaining{0};
     double keylockPrimeMs{5.0};

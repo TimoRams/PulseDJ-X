@@ -196,10 +196,42 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     lowerPoints.clear();
     missingSegments.clear();
 
-    // Guard source arrays while we read cached data
-    std::shared_lock<std::shared_mutex> lock(sourceMutex);
+    // ATOMARER Lock: einmal nehmen und durchgehend halten
+    std::shared_lock<std::shared_mutex> sharedLock(sourceMutex);
+    
+    // Chunk-Cache prüfen (ohne Lock zu wechseln)
+    if (chunkCacheDirty) {
+        // Upgrade zu exclusive lock nur wenn wirklich nötig
+        sharedLock.unlock();
+        std::unique_lock<std::shared_mutex> exclusiveLock(sourceMutex);
+        
+        // Double-check nach Lock-Upgrade
+        if (chunkCacheDirty) {
+            rebuildChunkCacheIfNeeded_Locked(exclusiveLock);
+        }
+        
+        // Downgrade zurück zu shared
+        exclusiveLock.unlock();
+        sharedLock.lock();
+    }
 
-    if (viewWidth <= 0 || viewHeight <= 0 || audioLength <= 0.0 || sourceWidth <= 0) {
+    // Lokale Kopien der kritischen Daten erstellen um Race Conditions zu vermeiden
+    const int localSourceWidth = sourceWidth;
+    const int localAvailableStartBin = availableStartBin;
+    const int localAvailableEndBin = availableEndBin;
+    const double localAudioLength = audioLength;
+    
+    // CRITICAL: Vektor-Kopien erstellen um Race Conditions mit Streaming-Thread zu verhindern
+    std::vector<float> localSourceMinBins = sourceMinBins;
+    std::vector<float> localSourceMaxBins = sourceMaxBins;
+    std::vector<float> localSourceLowBins = sourceLowBins;
+    std::vector<float> localSourceMidBins = sourceMidBins;
+    std::vector<float> localSourceHighBins = sourceHighBins;
+    
+    // Lock freigeben - ab jetzt arbeiten wir nur mit lokalen Kopien
+    sharedLock.unlock();
+    
+    if (viewWidth <= 0 || viewHeight <= 0 || localAudioLength <= 0.0 || localSourceWidth <= 0) {
         return;
     }
 
@@ -209,7 +241,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
 
     const double basePixelsPerSecond = useFixedPixelsPerSecond
         ? localPixelsPerSecond
-        : static_cast<double>(viewWidth) / std::max(1.0, audioLength);
+        : static_cast<double>(viewWidth) / std::max(1.0, localAudioLength);
     const double safeTempo = tempoFactor > 1e-6 ? tempoFactor : 1.0;
     const double pixelsPerSecond = basePixelsPerSecond * zoomFactor;
 
@@ -219,7 +251,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         playheadSec = playheadRel * prerollTimeSec;
     } else {
         playheadRel = std::clamp(playheadRel, 0.0, 1.0);
-        playheadSec = playheadRel * audioLength;
+        playheadSec = playheadRel * localAudioLength;
     }
 
     // Shift display center by output latency so visual center matches what you hear
@@ -264,13 +296,13 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     geometryCache.lastZoomFactor = zoomFactor;
     geometryCache.lastTempoFactor = tempoFactor;
     geometryCache.lastPlayheadPos = renderPlayheadRel;
-    geometryCache.lastAvailableStartBin = availableStartBin;
-    geometryCache.lastAvailableEndBin = availableEndBin;
+    geometryCache.lastAvailableStartBin = localAvailableStartBin;
+    geometryCache.lastAvailableEndBin = localAvailableEndBin;
 
     const double leftSecond = visibleLeftSecond;
     const double rightSecond = visibleRightSecond;
 
-    const double binPerSecond = static_cast<double>(sourceWidth) / std::max(audioLength, 1e-6);
+    const double binPerSecond = static_cast<double>(localSourceWidth) / std::max(localAudioLength, 1e-6);
 
     const double audioHalfViewport = (viewMode == ViewMode::BeatLocked)
         ? (halfViewportTime * safeTempo)
@@ -291,8 +323,8 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
 
     audioFetchLeftSec = std::max(0.0, audioFetchLeftSec);
     audioFetchRightSec = std::max(audioFetchRightSec, 0.0);
-    if (audioLength > 0.0) {
-        audioFetchRightSec = std::min(audioFetchRightSec, audioLength);
+    if (localAudioLength > 0.0) {
+        audioFetchRightSec = std::min(audioFetchRightSec, localAudioLength);
     }
 
     if (audioFetchRightSec <= audioFetchLeftSec) {
@@ -301,7 +333,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
 
     // Use pure track-time (0.0 = track start) for bin selection
     int leftBin = std::max(0, static_cast<int>(std::floor(audioFetchLeftSec * binPerSecond)));
-    int rightBin = std::min(sourceWidth, static_cast<int>(std::ceil(audioFetchRightSec * binPerSecond)));
+    int rightBin = std::min(localSourceWidth, static_cast<int>(std::ceil(audioFetchRightSec * binPerSecond)));
 
     if (streamingMode && !streamingComplete && binPerSecond > 0.0) {
         const int neededStartBin = std::max(0, leftBin - streamingPreloadBins);
@@ -315,8 +347,6 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     if (leftBin >= rightBin && fetchRightSecond > 0.0) {
         return;
     }
-
-    rebuildChunkCacheIfNeeded();
 
     // Align start: when near or before track start (including preroll), keep audioSec=0 centered.
     // Use a tolerance of ~0.75 pixel in time to avoid jitter from tiny positive playhead values.
@@ -366,8 +396,13 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     // Fine alignment: nudge waveform sampling so visuals line up with audio and beat grid.
 
     // Streaming-aware local bin window
-    const int totalLocalBins = static_cast<int>(sourceMaxBins.size());
+    const int totalLocalBins = static_cast<int>(localSourceMaxBins.size());
     const auto clampLocal = [&](int idx) { return std::clamp(idx, 0, std::max(0, totalLocalBins - 1)); };
+
+    // Bei Seeks: History komplett invalidieren um Artefakte zu vermeiden
+    if (isInSeekMode) {
+        std::fill(pixelHistoryValid.begin(), pixelHistoryValid.end(), 0);
+    }
 
     int currentMissingStart = -1;
     // Keep color continuous in missing regions by reusing the last valid color
@@ -457,19 +492,19 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         const double audioCenterSec = mapDisplayToAudio(displayCenterXSec);
         double audioStart = audioCenterSec - 0.5 * audioWidthPerPixel;
         double audioEnd   = audioCenterSec + 0.5 * audioWidthPerPixel;
-        if (audioEnd <= 0.0 || audioStart >= audioLength) {
+        if (audioEnd <= 0.0 || audioStart >= localAudioLength) {
             reuseOrBaseline(x, audioCenterSec, prevR, prevG, prevB);
             continue;
         }
         audioStart = std::max(0.0, audioStart);
-        audioEnd   = std::min(audioLength, audioEnd);
+        audioEnd   = std::min(localAudioLength, audioEnd);
 
         const int gb0 = static_cast<int>(std::floor(audioStart * binPerSecond));
         const int gb1 = std::max(gb0 + 1, static_cast<int>(std::ceil(audioEnd * binPerSecond)));
 
         // Map to local indices within current cached window
-        int li0 = gb0 - availableStartBin;
-        int li1 = gb1 - availableStartBin;
+        int li0 = gb0 - localAvailableStartBin;
+        int li1 = gb1 - localAvailableStartBin;
 
         if (li1 <= 0 || li0 >= totalLocalBins) {
             reuseOrBaseline(x, audioCenterSec, prevR, prevG, prevB);
@@ -484,8 +519,12 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         bool have = false;
         int count = 0;
         for (int i = li0; i < li1; ++i) {
-            float vmin = sourceMinBins[i];
-            float vmax = sourceMaxBins[i];
+            // Bounds check: sicherstellen dass wir nicht out-of-bounds zugreifen
+            if (i < 0 || i >= static_cast<int>(localSourceMinBins.size()) || i >= static_cast<int>(localSourceMaxBins.size())) {
+                continue;
+            }
+            float vmin = localSourceMinBins[i];
+            float vmax = localSourceMaxBins[i];
             if (!have) {
                 minVal = vmin; maxVal = vmax; have = true;
             } else {
@@ -493,15 +532,15 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
                 maxVal = std::max(maxVal, vmax);
             }
             // Aggregate band energies if available
-            if (i >= 0 && i < static_cast<int>(sourceLowBins.size())) {
-                sumLow  += std::max(0.0f, sourceLowBins[i]);
+            if (i >= 0 && i < static_cast<int>(localSourceLowBins.size())) {
+                sumLow  += std::max(0.0f, localSourceLowBins[i]);
                 ++count;
             }
-            if (i >= 0 && i < static_cast<int>(sourceMidBins.size())) {
-                sumMid  += std::max(0.0f, sourceMidBins[i]);
+            if (i >= 0 && i < static_cast<int>(localSourceMidBins.size())) {
+                sumMid  += std::max(0.0f, localSourceMidBins[i]);
             }
-            if (i >= 0 && i < static_cast<int>(sourceHighBins.size())) {
-                sumHigh += std::max(0.0f, sourceHighBins[i]);
+            if (i >= 0 && i < static_cast<int>(localSourceHighBins.size())) {
+                sumHigh += std::max(0.0f, localSourceHighBins[i]);
             }
         }
 
@@ -643,8 +682,12 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
 }
 bool WaveformDisplay::geometryNeedsUpdate(int viewWidth, int viewHeight, double zoomFactor, double renderPlayhead) const
 {
-    // Only rebuild if significant changes occurred
-    if (!renderCache.geometryValid || renderCache.needsFullRedraw) return true;
+    // Priorisiert Flags: FullRedraw > Update > bestehende Gueltigkeit
+    if (renderCache.needsFullRedraw) return true;   // harte Ungueltigkeit, sofort neu aufbauen
+    if (renderCache.needsUpdate) return true;       // sanfte Ungueltigkeit, alte Geometrie bleibt bis Rebuild
+    if (!renderCache.geometryValid) return true;    // noch keine brauchbare Geometrie vorhanden
+
+    // Erst danach auf inhaltliche Aenderungen pruefen
     if (renderCache.lastWidth != viewWidth || renderCache.lastHeight != viewHeight) return true;
     if (std::abs(renderCache.lastZoomFactor - zoomFactor) >= 0.01) return true; // Less sensitive to zoom changes
     if (std::abs(renderCache.lastTempoFactor - tempoFactor) >= 0.001) return true;
@@ -655,10 +698,42 @@ bool WaveformDisplay::geometryNeedsUpdate(int viewWidth, int viewHeight, double 
     else if (audioLength > 0.0) basePps = static_cast<double>(viewWidth) / std::max(audioLength, 1e-3);
     if (basePps <= 0.0) basePps = std::max(10.0, localPixelsPerSecond);
     const double pps = std::max(1.0, basePps * zoomFactor);
-    const double secondsPerHalfPixel = 0.5 / pps;
+    // Dynamischer Threshold: nutze gemessene Rate ODER gefilterte Rate (was groesser ist)
+    const double filteredVelocity = std::abs(std::isfinite(estimatedPlaybackRate) ? estimatedPlaybackRate : 0.0);
+
+    // Direkt-Messung der aktuellen Bewegung (nicht gefiltert)
+    double instantVelocity = 0.0;
+    if (renderCache.geometryValid && std::isfinite(renderCache.lastPlayheadPos)) {
+        const double deltaPos = std::abs(renderPlayhead - renderCache.lastPlayheadPos);
+        const double totalLen = (audioLength > 0.0) ? audioLength : trackLengthSec;
+        if (totalLen > 0.0) {
+            const double deltaSec = deltaPos * totalLen;
+            const auto now = std::chrono::steady_clock::now();
+            const auto timeSinceLastUpdate = std::chrono::duration<double>(now - renderCache.lastUpdate).count();
+            if (timeSinceLastUpdate > 1e-6 && timeSinceLastUpdate < 1.0) {  // Limit to 1 second max
+                instantVelocity = std::min(deltaSec / timeSinceLastUpdate, 100.0);  // Cap at 100x speed
+            }
+        }
+    }
+
+    // Nutze das Maximum beider Messungen fuer aggressivere Updates
+    const double playbackVelocity = std::max(filteredVelocity, instantVelocity);
+
+    // Wenn beide Messungen sehr klein sind (z.B. nach Stop), nimm konservativen Threshold
+    const double minDetectableVelocity = 1e-4;
+    const bool hasMovement = playbackVelocity > minDetectableVelocity;
+
+    // Aggressiverer Threshold bei jeder Bewegung
+    const double pixelThreshold = hasMovement ? 0.25 : 0.5;
+    const double secondsPerPixelThreshold = pixelThreshold / pps;
+
     const double totalLen = (audioLength > 0.0) ? audioLength : trackLengthSec;
-    double thresholdRel = (totalLen > 0.0) ? (secondsPerHalfPixel / totalLen) : 0.0001;
-    if (isInSeekMode) thresholdRel *= 0.5; // tighter sync while seeking
+    double thresholdRel = (totalLen > 0.0) ? (secondsPerPixelThreshold / totalLen) : 0.0001;
+
+    // Noch enger im Seek-Mode UND bei schnellem Playback
+    if (isInSeekMode) thresholdRel *= 0.25;
+    else if (playbackVelocity > 2.0) thresholdRel *= 0.5;
+
     thresholdRel = std::clamp(thresholdRel, 1e-6, 5e-4);
     if (std::abs(renderCache.lastPlayheadPos - renderPlayhead) >= thresholdRel) return true;
 
@@ -694,13 +769,17 @@ void WaveformDisplay::paintGL()
     const double renderPlayhead = acquireVisualPlayhead();
     activeRenderPlayhead = renderPlayhead;
 
+    // Flag-Semantik:
+    //  - needsUpdate: Geometrie sollte zeitnah erneuert werden, bestehende Daten bleiben nutzbar.
+    //  - needsFullRedraw: Geometrie ist veraltet und darf nicht mehr verwendet werden.
+    //  - geometryValid: aktuelle Geometrie/VBOs sind zeichnungsfaehig.
+
     if (geometryNeedsUpdate(widgetWidth, widgetHeight, zoomFactor, renderPlayhead)) {
         buildWaveformGeometry(widgetWidth, widgetHeight, zoomFactor, renderPlayhead);
         updateWaveformVertexBuffers(widgetWidth, widgetHeight);
 
         const bool geometryReady = geometryCache.valid && glResources.fillVertexCountFront >= 4;
         renderCache.geometryValid = geometryReady;
-        renderCache.needsFullRedraw = !geometryReady;
         renderCache.lastWidth = widgetWidth;
         renderCache.lastHeight = widgetHeight;
         renderCache.lastZoomFactor = zoomFactor;
@@ -708,19 +787,23 @@ void WaveformDisplay::paintGL()
         renderCache.lastPlayheadPos = renderPlayhead;
         renderCache.lastAvailableStartBin = availableStartBin;
         renderCache.lastAvailableEndBin = availableEndBin;
+
+        if (geometryReady) {
+            renderCache.needsUpdate = false;
+            renderCache.needsFullRedraw = false;
+        } else {
+            renderCache.needsFullRedraw = true;
+            renderCache.needsUpdate = false;
+        }
     }
 
     const bool haveBuffers = glResources.fillVertexCountFront >= 4;
     const bool readyToDraw = renderCache.geometryValid && haveBuffers;
-    
-    // Always draw if we have valid buffer data to prevent glitching/flickering
-    if (haveBuffers) {
+
+    // Zeichnen nur mit gueltiger Geometrie, sonst Full-Redraw markieren
+    if (readyToDraw) {
         drawWaveformGl();
-        if (readyToDraw) {
-            renderCache.needsFullRedraw = false;
-        }
     } else {
-        // No buffers available - mark for full redraw
         renderCache.geometryValid = false;
         renderCache.needsFullRedraw = true;
     }
@@ -1123,8 +1206,8 @@ void WaveformDisplay::loadFile(const QString& path)
 }
 
 void WaveformDisplay::markDirtyAndSchedule() {
-    renderCache.geometryValid = false;
-    renderCache.needsFullRedraw = true;
+    renderCache.needsUpdate = true;  // Deferred-Update: alte Geometrie bleibt sichtbar bis Ersatz bereitsteht
+    renderCache.needsFullRedraw = false;
     invalidateChunkCache();
     updateRenderActivity();
     update();
@@ -1213,8 +1296,23 @@ void WaveformDisplay::appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& 
 {
     Q_UNUSED(lock);
 
+    if (startBin < 0) {
+#ifdef WAVEFORM_DEBUG
+        qDebug() << "[WaveformDisplay] Verwerfe Chunk mit negativem Start" << startBin;
+#endif
+        qWarning() << "WaveformDisplay::appendStreamBins - negative startBin" << startBin;
+        return;
+    }
+
     const auto chunkSize = static_cast<int>(maxBins.size());
-    if (chunkSize <= 0 || minBins.size() != maxBins.size()) {
+    if (chunkSize <= 0) {
+#ifdef WAVEFORM_DEBUG
+        qDebug() << "[WaveformDisplay] Verwerfe Chunk ohne Samples" << startBin;
+#endif
+        qWarning() << "WaveformDisplay::appendStreamBins - empty chunk";
+        return;
+    }
+    if (minBins.size() != maxBins.size()) {
         qWarning() << "WaveformDisplay::appendStreamBins - invalid data sizes";
         return;
     }
@@ -1224,6 +1322,20 @@ void WaveformDisplay::appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& 
     }
 
     const int chunkEnd = startBin + chunkSize;
+    if (chunkEnd <= startBin) {
+#ifdef WAVEFORM_DEBUG
+        qDebug() << "[WaveformDisplay] Verwerfe Chunk mit leerem Bereich" << startBin << chunkEnd;
+#endif
+        qWarning() << "WaveformDisplay::appendStreamBins - invalid bin range" << startBin << chunkEnd;
+        return;
+    }
+    if (streamingTotalBins > 0 && (startBin >= streamingTotalBins || chunkEnd > streamingTotalBins)) {
+#ifdef WAVEFORM_DEBUG
+    qDebug() << "[WaveformDisplay] Chunk ausserhalb des erwarteten Fensters" << startBin << chunkEnd << streamingTotalBins;
+#endif
+        qWarning() << "WaveformDisplay::appendStreamBins - chunk outside expected range" << startBin << chunkEnd;
+        return;
+    }
     const bool hasColor = !lowBins.empty();
     const bool maintainBands = hasColor || !sourceLowBins.empty() || !sourceMidBins.empty() || !sourceHighBins.empty();
     const int prevStart = availableStartBin;
@@ -1379,10 +1491,25 @@ void WaveformDisplay::appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& 
     streamingExpectedNextBin = availableEndBin;
     streamingComplete = streamingComplete || isFinalChunk;
 
-    if (hasPendingRegionRequest &&
-        pendingRequestStartBin >= availableStartBin &&
-        pendingRequestEndBin <= availableEndBin) {
-        hasPendingRegionRequest = false;
+    if (hasPendingRegionRequest) {
+        const int requestSpan = pendingRequestEndBin - pendingRequestStartBin;
+        const int overlapStart = std::max(pendingRequestStartBin, availableStartBin);
+        const int overlapEnd = std::min(pendingRequestEndBin, availableEndBin);
+        const int overlap = std::max(0, overlapEnd - overlapStart);
+        const bool requestCovered = (pendingRequestStartBin >= availableStartBin) && (pendingRequestEndBin <= availableEndBin);
+        const bool spanValid = requestSpan > 0;
+        const bool overlapSatisfies = spanValid && (overlap * 5 >= requestSpan * 4); // >=80%
+
+        if (!spanValid || overlapSatisfies || requestCovered) {
+#ifdef WAVEFORM_DEBUG
+            qDebug() << "[WaveformDisplay] Streaming-Request erfuellt" << pendingRequestStartBin << pendingRequestEndBin
+                     << "Overlap" << overlap << "Span" << requestSpan << "Covered" << requestCovered;
+#endif
+            hasPendingRegionRequest = false;
+            pendingRequestStartBin = 0;
+            pendingRequestEndBin = 0;
+            lastRegionRequestTime = {};
+        }
     }
 
     markDirtyAndSchedule();
@@ -1513,10 +1640,8 @@ void WaveformDisplay::setPlayhead(double relative)
             update();
         }
         
-        // Invalidate geometry cache to force immediate rebuild at new position
-        geometryCache.valid = false;
-        renderCache.geometryValid = false;
-        renderCache.needsFullRedraw = true;
+        // Geometrie nicht sofort verwerfen, sondern Update fuer den naechsten Frame markieren
+        renderCache.needsUpdate = true; // Alte Geometrie bleibt sichtbar, bis neue Daten eingetroffen sind
     } else {
         auto now = std::chrono::steady_clock::now();
         auto timeSinceSeek = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSeekTime).count();
@@ -1546,10 +1671,20 @@ void WaveformDisplay::setPlayhead(double relative)
             if (std::isfinite(rawRate)) {
                 rawRate = std::clamp(rawRate, -maxRate, maxRate);
                 const double rateBlend = std::clamp(dt * 8.0, 0.0, 1.0);
-                if (std::isfinite(estimatedPlaybackRate)) {
+
+                // Reset Rate wenn sie gegen 0 kollabiert (z.B. nach Stop)
+                const double minMeaningfulRate = 1e-6;
+                if (std::isfinite(estimatedPlaybackRate) && std::abs(estimatedPlaybackRate) > minMeaningfulRate) {
                     estimatedPlaybackRate += (rawRate - estimatedPlaybackRate) * rateBlend;
                 } else {
+                    // Rate ist kollabiert oder nicht initialisiert - direkt auf gemessenen Wert setzen
                     estimatedPlaybackRate = rawRate;
+                }
+
+                // Verhindere dass Rate gegen 0 driftet wenn nicht bewegt wird
+                if (std::abs(rawRate) < minMeaningfulRate && std::abs(estimatedPlaybackRate) > minMeaningfulRate) {
+                    // Langsam gegen 0 abklingen lassen statt sofort
+                    estimatedPlaybackRate *= 0.95;
                 }
             }
         }
@@ -1564,8 +1699,8 @@ void WaveformDisplay::setPlayhead(double relative)
             }
         }
 
-    adjustedRelative = std::clamp(adjustedRelative, minVisualRel, maxVisualRel);
-    playheadPos = adjustedRelative;
+        adjustedRelative = std::clamp(adjustedRelative, minVisualRel, maxVisualRel);
+        playheadPos = adjustedRelative;
         targetPlayheadPos = adjustedRelative;
         lastPlayheadUpdateTime = now;
         lastReportedPlayhead = relative;
@@ -1581,7 +1716,11 @@ void WaveformDisplay::resetVisualPlayhead(double relative) {
     visualPlayheadPos = safeRelative;
     targetPlayheadPos = safeRelative;
     lastReportedPlayhead = safeRelative;
-    estimatedPlaybackRate = 0.0;
+    // NICHT auf 0 setzen - verhindert korrekten Start
+    // estimatedPlaybackRate wird von setPlayhead() neu initialisiert
+    if (!std::isfinite(estimatedPlaybackRate)) {
+        estimatedPlaybackRate = 0.0;
+    }
     lastPlayheadUpdateTime = now;
     lastVisualUpdateTime = now;
     activeRenderPlayhead = safeRelative;
@@ -1614,11 +1753,23 @@ void WaveformDisplay::invalidateChunkCache() {
 }
 
 void WaveformDisplay::rebuildChunkCacheIfNeeded() {
+    std::shared_lock<std::shared_mutex> sharedLock(sourceMutex);
     if (!chunkCacheDirty) {
         return;
     }
 
-    std::shared_lock<std::shared_mutex> lock(sourceMutex);
+    sharedLock.unlock();
+    std::unique_lock<std::shared_mutex> exclusiveLock(sourceMutex);
+    rebuildChunkCacheIfNeeded_Locked(exclusiveLock);
+}
+
+void WaveformDisplay::rebuildChunkCacheIfNeeded_Locked(std::unique_lock<std::shared_mutex>& lock) {
+    if (!lock.owns_lock()) {
+        return;
+    }
+    if (!chunkCacheDirty) {
+        return;
+    }
 
     chunkCacheDirty = false;
     chunkCache.clear();
@@ -1649,6 +1800,10 @@ void WaveformDisplay::rebuildChunkCacheIfNeeded() {
     }
 
     secondsPerBin = 1.0 / binPerSecond;
+
+#ifdef WAVEFORM_DEBUG
+    qDebug() << "[WaveformDisplay] Chunk-Cache wird neu aufgebaut" << totalBins;
+#endif
 
     // Robust normalization: use a high percentile of per-bin peaks across the available data
     // to avoid inflating very quiet parts. Never amplify above 1.0.
@@ -1685,19 +1840,19 @@ void WaveformDisplay::rebuildChunkCacheIfNeeded() {
     }
 
     const int samplesPerChunk = chunkSampleResolution;
-    
+
     for (int base = 0; base < totalBins; base += chunkBinSize) {
         const int chunkBins = std::min(chunkBinSize, totalBins - base);
         if (chunkBins <= 0) {
             continue;
         }
 
-    WaveformChunk chunk;
-    chunk.startBin = availableStartBin + base;
-    chunk.endBin = chunk.startBin + chunkBins;
-    // Track-time (seconds) for the first sample in this chunk in pure TRACK timeline (0 = track start)
-    // Do NOT add audioStartOffset so that track start maps to display center when playheadSec==0
-    chunk.startTimeSec = static_cast<double>(chunk.startBin) * secondsPerBin;
+        WaveformChunk chunk;
+        chunk.startBin = availableStartBin + base;
+        chunk.endBin = chunk.startBin + chunkBins;
+        // Track-time (seconds) for the first sample in this chunk in pure TRACK timeline (0 = track start)
+        // Do NOT add audioStartOffset so that track start maps to display center when playheadSec==0
+        chunk.startTimeSec = static_cast<double>(chunk.startBin) * secondsPerBin;
 
         const int sampleCountPerChunk = std::max(1, std::min(chunkBins, samplesPerChunk));
         chunk.upper.resize(sampleCountPerChunk);
@@ -1968,7 +2123,7 @@ void WaveformDisplay::requestStreamingWindowIfNeeded(int neededStartBin, int nee
         return;
     }
 
-    // Larger preload buffer for better jump performance
+    // Groesseres Vorladefenster fuer stabile Spruenge
     const int largerPreload = streamingPreloadBins * 3;
     const int desiredStart = std::max(0, neededStartBin - largerPreload);
     int desiredEnd = neededEndBin + largerPreload;
@@ -1984,23 +2139,92 @@ void WaveformDisplay::requestStreamingWindowIfNeeded(int neededStartBin, int nee
         return;
     }
 
-    // Check if we already have this region
-    if (desiredStart >= availableStartBin && desiredEnd <= availableEndBin) return;
+    if (desiredStart >= availableStartBin && desiredEnd <= availableEndBin) {
+        return; // Nichts anzufordern, bereits im Cache
+    }
 
     const auto now = std::chrono::steady_clock::now();
-    
-    // Immediate request on position jumps (seek mode)
-    const bool outsideCurrentWindow = (neededEndBin < availableStartBin) || (neededStartBin > availableEndBin);
+    constexpr auto requestTimeout = std::chrono::seconds(2);
+    constexpr auto coverDebounce = std::chrono::milliseconds(100);
+    constexpr auto expandDebounce = std::chrono::milliseconds(180);
+    constexpr auto overlapDebounce = std::chrono::milliseconds(140);
+
+    const bool outsideCurrentWindow = (desiredEnd <= availableStartBin) || (desiredStart >= availableEndBin);
     const bool farFromEitherEdge = (availableEndBin > availableStartBin)
-        ? (std::min(std::abs(neededStartBin - availableStartBin), std::abs(neededEndBin - availableEndBin)) > streamingPreloadBins * 2)
+        ? (std::min(std::abs(desiredStart - availableStartBin), std::abs(desiredEnd - availableEndBin)) > streamingPreloadBins * 2)
         : true;
-    const bool isJump = outsideCurrentWindow || farFromEitherEdge;
-    
-    if (hasPendingRegionRequest && !isJump) {
+    const bool isJump = isInSeekMode || outsideCurrentWindow || farFromEitherEdge;
+
+    auto clearPendingRequest = [&]() {
+        hasPendingRegionRequest = false;
+        pendingRequestStartBin = 0;
+        pendingRequestEndBin = 0;
+        lastRegionRequestTime = {};
+    };
+
+    if (hasPendingRegionRequest) {
+        const bool neverSent = (lastRegionRequestTime == std::chrono::steady_clock::time_point{});
+        const auto sinceLast = neverSent ? std::chrono::steady_clock::duration::zero() : (now - lastRegionRequestTime);
+        const bool timedOut = !neverSent && (sinceLast >= requestTimeout);
         const bool coversPending = desiredStart >= pendingRequestStartBin && desiredEnd <= pendingRequestEndBin;
-        const auto sinceLast = now - lastRegionRequestTime;
-        // Shorter debounce for better responsiveness
-        if (coversPending && sinceLast < std::chrono::milliseconds(50)) return;
+        const bool identicalPending = coversPending && (desiredStart == pendingRequestStartBin) && (desiredEnd == pendingRequestEndBin);
+        const bool expandsLeft = desiredStart < pendingRequestStartBin;
+        const bool expandsRight = desiredEnd > pendingRequestEndBin;
+        const bool expandsPending = expandsLeft || expandsRight;
+        const bool widerRequest = (desiredEnd - desiredStart) > (pendingRequestEndBin - pendingRequestStartBin);
+
+        if (isJump) {
+#ifdef WAVEFORM_DEBUG
+            qDebug() << "[WaveformDisplay] Streaming-Request wird wegen Sprung sofort ersetzt"
+                     << desiredStart << desiredEnd;
+#endif
+            clearPendingRequest();
+        } else if (neverSent || timedOut) {
+#ifdef WAVEFORM_DEBUG
+            qDebug() << "[WaveformDisplay] Streaming-Request abgelaufen, ersetze Altanfrage"
+                     << pendingRequestStartBin << pendingRequestEndBin;
+#endif
+            clearPendingRequest();
+        } else if (coversPending) {
+            if (sinceLast < coverDebounce) {
+#ifdef WAVEFORM_DEBUG
+                qDebug() << "[WaveformDisplay] Streaming-Request gedeckt, warte noch"
+                         << desiredStart << desiredEnd;
+#endif
+                return;
+            }
+#ifdef WAVEFORM_DEBUG
+            qDebug() << "[WaveformDisplay] Streaming-Request gedeckt, ersetze nach Wartezeit"
+                     << desiredStart << desiredEnd;
+#endif
+            clearPendingRequest();
+        } else if (expandsPending || widerRequest) {
+            if (sinceLast < expandDebounce) {
+#ifdef WAVEFORM_DEBUG
+                qDebug() << "[WaveformDisplay] Groesseres Fenster angefragt, warte noch"
+                         << desiredStart << desiredEnd;
+#endif
+                return;
+            }
+#ifdef WAVEFORM_DEBUG
+            qDebug() << "[WaveformDisplay] Groesseres Fenster wird nach Wartezeit angefordert"
+                     << desiredStart << desiredEnd;
+#endif
+            clearPendingRequest();
+        } else {
+            if (sinceLast < overlapDebounce) {
+#ifdef WAVEFORM_DEBUG
+                qDebug() << "[WaveformDisplay] Streaming-Request ueberlappt, debounce aktiv"
+                         << desiredStart << desiredEnd;
+#endif
+                return;
+            }
+#ifdef WAVEFORM_DEBUG
+            qDebug() << "[WaveformDisplay] Streaming-Request ueberlappt, ersetze nach Wartezeit"
+                     << desiredStart << desiredEnd;
+#endif
+            clearPendingRequest();
+        }
     }
 
     const double startSec = audioStartOffset + (static_cast<double>(desiredStart) / binPerSecond);
@@ -2011,6 +2235,9 @@ void WaveformDisplay::requestStreamingWindowIfNeeded(int neededStartBin, int nee
     pendingRequestEndBin = desiredEnd;
     lastRegionRequestTime = now;
 
+#ifdef WAVEFORM_DEBUG
+    qDebug() << "[WaveformDisplay] Streaming-Request gesendet" << desiredStart << desiredEnd;
+#endif
     emit waveformRegionNeeded(startSec, endSec);
 }
 
@@ -2032,6 +2259,9 @@ void WaveformDisplay::resetStreamingState()
     chunkCacheDirty = true;
     chunkNormalizationFactor = 1.0f;
     secondsPerBin = 0.0;
+    renderCache.geometryValid = false;
+    renderCache.needsFullRedraw = true;
+    renderCache.needsUpdate = true; // Nach Reset komplette Geometrie neu aufbauen
     updateRenderActivity();
 }
 
