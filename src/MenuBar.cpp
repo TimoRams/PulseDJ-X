@@ -160,6 +160,19 @@ void MenuBar::createMenuActions() {
     exitAction->setShortcut(QKeySequence::Quit);
     exitAction->setStatusTip("Exit BetaPulseX");
     
+    performanceModeAction = new QAction("Performance Mode", this);
+    performanceModeAction->setCheckable(true);
+    performanceModeAction->setChecked(true);
+    performanceModeAction->setStatusTip("Optimized for live performance and mixing");
+    
+    exportModeAction = new QAction("Export Mode", this);
+    exportModeAction->setCheckable(true);
+    exportModeAction->setStatusTip("Prepare and export your mixes");
+    
+    editModeAction = new QAction("Edit Mode", this);
+    editModeAction->setCheckable(true);
+    editModeAction->setStatusTip("Edit tracks, set cue points and loops");
+    
     preferencesAction = new QAction("Preferences...", this);
     preferencesAction->setShortcut(QKeySequence::Preferences);
     preferencesAction->setStatusTip("Open preferences dialog");
@@ -179,7 +192,22 @@ void MenuBar::createMenuActions() {
     alwaysOnTopAction->setStatusTip("Keep window always on top");
     alwaysOnTopAction->setCheckable(true);
     
-    // Connect actions to slots
+    QActionGroup* modeGroup = new QActionGroup(this);
+    modeGroup->addAction(performanceModeAction);
+    modeGroup->addAction(exportModeAction);
+    modeGroup->addAction(editModeAction);
+    modeGroup->setExclusive(true);
+    
+    connect(performanceModeAction, &QAction::triggered, this, [this]() { 
+        modeMenu->setTitle("Mode: Performance"); 
+    });
+    connect(exportModeAction, &QAction::triggered, this, [this]() { 
+        modeMenu->setTitle("Mode: Export"); 
+    });
+    connect(editModeAction, &QAction::triggered, this, [this]() { 
+        modeMenu->setTitle("Mode: Edit"); 
+    });
+    
     connect(preferencesAction, &QAction::triggered, this, &MenuBar::showPreferences);
     connect(fullScreenAction, &QAction::triggered, this, &MenuBar::toggleFullScreen);
     connect(alwaysOnTopAction, &QAction::triggered, this, &MenuBar::toggleAlwaysOnTop);
@@ -218,6 +246,11 @@ void MenuBar::setupMenus() {
     helpMenu->addSeparator();
     helpMenu->addAction("Check for Updates")->setEnabled(false);
     helpMenu->addAction(aboutAction);
+    
+    modeMenu = addMenu("Mode: Performance");
+    modeMenu->addAction(performanceModeAction);
+    modeMenu->addAction(exportModeAction);
+    modeMenu->addAction(editModeAction);
 }
 
 void MenuBar::toggleAlwaysOnTop() {

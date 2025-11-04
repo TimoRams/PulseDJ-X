@@ -3,6 +3,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QActionGroup>
 #include <QLabel>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -69,6 +70,7 @@ private:
 
     // Menus
     QMenu* fileMenu;
+    QMenu* modeMenu;
     QMenu* editMenu;
     QMenu* viewMenu;
     QMenu* toolsMenu;
@@ -83,6 +85,11 @@ private:
     QAction* aboutAction;
     QAction* fullScreenAction;
     QAction* alwaysOnTopAction;
+    
+    // Mode actions
+    QAction* performanceModeAction;
+    QAction* exportModeAction;
+    QAction* editModeAction;
 
     // Logo and branding
     QWidget* logoWidget;
