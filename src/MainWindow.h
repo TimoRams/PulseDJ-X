@@ -191,6 +191,9 @@ private:
 
     WaveformStreamSession streamSessionA;
     WaveformStreamSession streamSessionB;
+    
+    // Timer for continuous waveform fill-in (loads chunks progressively)
+    QTimer* waveformFillInTimer{nullptr};
 
     // Optional per-deck visual sync trim (seconds), positive adds extra visual delay.
     // Useful for tiny per-system calibration without changing core logic.
@@ -229,6 +232,7 @@ private:
     void handleWaveformRegionRequestDeckB(double startSec, double endSec);
     void handleWaveformRegionRequest(bool deckIsA, double startSec, double endSec);
     void scheduleWaveformChunk(bool deckIsA, int startBin, int binCount);
+    void continuousWaveformFillIn(bool deckIsA); // Continuously loads chunks until complete
     void handleWaveformChunkResult(bool deckIsA,
                                    const QString& filePath,
                                    int startBin,

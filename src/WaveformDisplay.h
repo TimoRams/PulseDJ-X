@@ -308,13 +308,22 @@ private:
         int endBin{0};
         std::vector<float> maxBins;
         std::vector<float> minBins;
+        std::vector<float> lowBins;  // Band energies for spectrum coloring
+        std::vector<float> midBins;
+        std::vector<float> highBins;
         double lastAccessTime{0.0};
         int priority{3}; // 0=ULTRA(128), 1=HIGH(512), 2=MEDIUM(2048), 3=LOW(8192)
     };
     std::vector<AdaptiveChunk> adaptiveChunks_;
     mutable std::mutex adaptiveChunksMutex_; // Thread-safety for chunk access
-    int maxAdaptiveChunks_{50};
-    bool useAdaptiveChunking_{true};
+    int maxAdaptiveChunks_{500}; // Keep many chunks cached for fast seeking
+    bool useAdaptiveChunking_{true}; // Re-enabled with optimizations
+    
+    // === FULL-SONG FALLBACK WAVEFORM (low-res red baseline) ===
+    std::vector<float> fallbackMaxBins_;
+    std::vector<float> fallbackMinBins_;
+    mutable std::mutex fallbackMutex_;
+    bool fallbackComplete_{false};
     
     int streamingExpectedNextBin{0};
     bool hasPendingRegionRequest{false};

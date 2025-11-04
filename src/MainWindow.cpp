@@ -794,6 +794,15 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     positionUpdateTimer->setInterval(80);
     connect(positionUpdateTimer, &QTimer::timeout, this, &QtMainWindow::updatePlaybackPositions);
     positionUpdateTimer->start();
+    
+    // Continuous waveform fill-in timer - keeps loading chunks until complete
+    waveformFillInTimer = new QTimer(this);
+    waveformFillInTimer->setInterval(50);
+    connect(waveformFillInTimer, &QTimer::timeout, this, [this]() {
+        continuousWaveformFillIn(true);
+        continuousWaveformFillIn(false);
+    });
+    waveformFillInTimer->start();
 
     {
         AppConfig::instance().createDirectories();
@@ -1223,70 +1232,36 @@ void QtMainWindow::handleWaveformRegionRequest(bool deckIsA, double startSec, do
 
     const int alignedStart = std::max(0, startBin - (startBin % session.chunkBinSize));
     const int requestCenterBin = (startBin + endBin) / 2;
-    const int microSize = std::max(256, std::min(1024, session.chunkBinSize));
-    int microStart = std::clamp(requestCenterBin - microSize / 2, 0, std::max(0, session.totalBins - microSize));
+    
+    auto scheduleIfNeeded = [&](int chunkStart){
+        if (chunkStart < 0 || chunkStart >= session.totalBins) return;
+        if (session.pendingChunks.contains(chunkStart)) return;
+        session.pendingChunks.insert(chunkStart);
+        const int count = std::min(session.chunkBinSize, session.totalBins - chunkStart);
+        scheduleWaveformChunk(deckIsA, chunkStart, count);
+    };
 
-    // If we have no cache yet, start directly at the aligned request
     if (!session.hasCache) {
-        // Schedule a tiny center chunk first for instant paint, then the aligned chunk
-        if (!session.pendingChunks.contains(microStart)) {
-            session.pendingChunks.insert(microStart);
-            const int count = std::min(microSize, session.totalBins - microStart);
-            scheduleWaveformChunk(deckIsA, microStart, count);
-        }
-        if (!session.pendingChunks.contains(alignedStart)) {
-            session.pendingChunks.insert(alignedStart);
-            const int count = std::min(session.chunkBinSize, session.totalBins - alignedStart);
-            scheduleWaveformChunk(deckIsA, alignedStart, count);
-        }
-        return;
-    }
-
-    // Determine if requested region is outside or far from current cached window
-    const bool outsideLeft = endBin <= session.cachedStartBin;
-    const bool outsideRight = startBin >= session.cachedEndBin;
-    const bool farFromCached = (outsideLeft || outsideRight) ||
-        (std::min(std::abs(alignedStart - session.cachedStartBin), std::abs(alignedStart - session.cachedEndBin)) > session.chunkBinSize * 2);
-
-    if (farFromCached) {
-        // Jump directly to requested region: schedule that chunk and a neighbor forward for faster fill-in
-        auto scheduleIfNeeded = [&](int chunkStart){
-            if (chunkStart < 0 || chunkStart >= session.totalBins) return;
-            if (!session.pendingChunks.contains(chunkStart)) {
-                session.pendingChunks.insert(chunkStart);
-                const int count = std::min(session.chunkBinSize, session.totalBins - chunkStart);
-                scheduleWaveformChunk(deckIsA, chunkStart, count);
-            }
-        };
-        // First, schedule a small micro-chunk centered on the request to get instant pixels
-        if (!session.pendingChunks.contains(microStart)) {
-            session.pendingChunks.insert(microStart);
-            const int count = std::min(microSize, session.totalBins - microStart);
-            scheduleWaveformChunk(deckIsA, microStart, count);
-        }
+        const int microSize = 1024;
+        const int microStart = std::clamp(requestCenterBin - microSize / 2, 0, std::max(0, session.totalBins - microSize));
+        scheduleIfNeeded(microStart);
         scheduleIfNeeded(alignedStart);
-        scheduleIfNeeded(std::min(session.totalBins, alignedStart + session.chunkBinSize));
+        scheduleIfNeeded(alignedStart + session.chunkBinSize);
+        scheduleIfNeeded(alignedStart + session.chunkBinSize * 2);
         return;
     }
 
-    // Otherwise, extend cache progressively toward the requested region as before
-    if (startBin < session.cachedStartBin) {
-        const int nextStart = std::max(0, session.cachedStartBin - session.chunkBinSize);
-        if (!session.pendingChunks.contains(nextStart) && session.cachedStartBin > 0) {
-            session.pendingChunks.insert(nextStart);
-            const int count = std::min(session.chunkBinSize, session.totalBins - nextStart);
-            scheduleWaveformChunk(deckIsA, nextStart, count);
-        }
+    const bool outsideCache = (endBin <= session.cachedStartBin) || (startBin >= session.cachedEndBin);
+    
+    if (outsideCache) {
+        const int microSize = 1024;
+        const int microStart = std::clamp(requestCenterBin - microSize / 2, 0, std::max(0, session.totalBins - microSize));
+        scheduleIfNeeded(microStart);
+        scheduleIfNeeded(alignedStart);
+        scheduleIfNeeded(alignedStart + session.chunkBinSize);
+        scheduleIfNeeded(alignedStart + session.chunkBinSize * 2);
+        scheduleIfNeeded(std::max(0, alignedStart - session.chunkBinSize));
         return;
-    }
-
-    if (endBin > session.cachedEndBin) {
-        const int nextStart = session.cachedEndBin;
-        if (nextStart < session.totalBins && !session.pendingChunks.contains(nextStart)) {
-            session.pendingChunks.insert(nextStart);
-            const int count = std::min(session.chunkBinSize, session.totalBins - nextStart);
-            scheduleWaveformChunk(deckIsA, nextStart, count);
-        }
     }
 }
 
@@ -1436,3 +1411,39 @@ void QtMainWindow::updatePlaybackPositions() {
     }
 }
 
+void QtMainWindow::continuousWaveformFillIn(bool deckIsA)
+{
+    WaveformStreamSession& session = deckIsA ? streamSessionA : streamSessionB;
+    
+    if (!session.valid || session.totalBins <= 0) return;
+    
+    const bool fullyLoaded = (session.cachedStartBin <= 0 && session.cachedEndBin >= session.totalBins);
+    if (fullyLoaded) return;
+    
+    if (session.pendingChunks.size() >= 8) return;
+    
+    auto scheduleIfNeeded = [&](int chunkStart) {
+        if (chunkStart < 0 || chunkStart >= session.totalBins) return false;
+        if (session.pendingChunks.contains(chunkStart)) return false;
+        
+        session.pendingChunks.insert(chunkStart);
+        const int count = std::min(session.chunkBinSize, session.totalBins - chunkStart);
+        scheduleWaveformChunk(deckIsA, chunkStart, count);
+        return true;
+    };
+    
+    int scheduled = 0;
+    const int maxSchedulePerCycle = 4;
+    
+    while (scheduled < maxSchedulePerCycle && session.cachedEndBin < session.totalBins) {
+        const int nextStart = session.cachedEndBin;
+        if (!scheduleIfNeeded(nextStart)) break;
+        scheduled++;
+    }
+    
+    while (scheduled < maxSchedulePerCycle && session.cachedStartBin > 0) {
+        const int nextStart = std::max(0, session.cachedStartBin - session.chunkBinSize);
+        if (!scheduleIfNeeded(nextStart)) break;
+        scheduled++;
+    }
+}
