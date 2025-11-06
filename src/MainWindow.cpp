@@ -223,6 +223,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     connect(deckA, &QtDeckWidget::fileLoaded, this, [this]() {
         applyStoredCuePoints(deckA, true);
         applyStoredBeatGrid(deckA, true);
+        loadAndApplyCoverArt(deckA, true);  // NEW: Load cover art from database
     });
 
     connect(deckB, &QtDeckWidget::fileLoadingStarted, this, [this](const QString&) {
@@ -240,6 +241,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });    connect(deckB, &QtDeckWidget::fileLoaded, this, [this]() {
         applyStoredCuePoints(deckB, false);
         applyStoredBeatGrid(deckB, false);
+        loadAndApplyCoverArt(deckB, false);  // NEW: Load cover art from database
     });
 
     // Clear visuals and indicator when a deck unloads
@@ -341,6 +343,13 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
 
     connect(deckA, &QtDeckWidget::tempoFactorChanged, overviewTopA, &WaveformDisplay::setTempoFactor);
     connect(deckB, &QtDeckWidget::tempoFactorChanged, overviewTopB, &WaveformDisplay::setTempoFactor);
+    
+    connect(deckA, &QtDeckWidget::playStateChanged, this, [this](bool playing) {
+        if (!playing && overviewTopA) overviewTopA->stopPlayback();
+    });
+    connect(deckB, &QtDeckWidget::playStateChanged, this, [this](bool playing) {
+        if (!playing && overviewTopB) overviewTopB->stopPlayback();
+    });
     
     // Connect cue points from performance pads to top waveform displays
     if (deckA->getPerformancePads()) {

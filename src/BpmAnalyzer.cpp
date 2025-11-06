@@ -829,17 +829,17 @@ double BpmAnalyzer::analyzeFile(const juce::File& file, double maxSecondsToAnaly
             }
         }
         
-        // Genre-Präferenzen
-        if (bpm >= 120.0 && bpm <= 170.0) {
-            score *= 1.3; // EDM/House Sweet Spot
-            if (bpm >= 140.0 && bpm <= 155.0) {
-                score *= 1.25; // Progressive House/Big Room (So Far Away Range)
-            }
-        } else if (bpm >= 170.0 && bpm <= 200.0) {
-            score *= 1.2; // Techno/Trance
-        } else if (bpm >= 85.0 && bpm <= 110.0) {
-            score *= 1.15; // Deep House/Downtempo
+        // Genre-Präferenzen (optimiert für 78-155 Standard-Range)
+        if (bpm >= 78.0 && bpm <= 95.0) {
+            score *= 1.25; // Hip-Hop/Trap/R&B
+        } else if (bpm >= 95.0 && bpm <= 115.0) {
+            score *= 1.2; // Deep House/Downtempo/Midtempo
+        } else if (bpm >= 115.0 && bpm <= 135.0) {
+            score *= 1.35; // House/Progressive/Tech House (Most Common)
+        } else if (bpm >= 135.0 && bpm <= 155.0) {
+            score *= 1.3; // Techno/Trance/Hardstyle
         }
+        // Außerhalb des optimierten Bereichs: Kein Malus, aber auch kein Bonus
         
         // Cross-Section-Validierung
         double totalAlignment = 0.0;

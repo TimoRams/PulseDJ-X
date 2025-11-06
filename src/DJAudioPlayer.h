@@ -94,6 +94,10 @@ public:
     // Audio level monitoring for Master Out display
     float getLeftChannelLevel() const { return leftChannelLevel.load(); }
     float getRightChannelLevel() const { return rightChannelLevel.load(); }
+    
+    // Latency measurement (in milliseconds)
+    double getMeasuredLatencyMs() const { return measuredLatencyMs.load(); }
+    int getLatencyCompensationSamples() const { return latencyCompensationSamples; }
 
     void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override;
     void getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill) override;
@@ -105,8 +109,10 @@ private:
     float fetchScratchSample(AudioFormatReader* reader, double samplePos, int channel);
     void ensureScratchCache(AudioFormatReader* reader, int64 sampleIndex);
     
+    void applyDSPEffects(const AudioSourceChannelInfo &bufferToFill);
+    void applyCrossfadeTransition(const AudioSourceChannelInfo &bufferToFill);
+    
 #if defined(RUBBERBAND_FOUND)
-    // Recreate/configure Rubber Band according to the selected quality profile
     void reinitRubberBand();
 #endif
 
@@ -114,20 +120,16 @@ private:
     AudioTransportSource transportSource;
     std::unique_ptr<AudioFormatReaderSource> readerSource;
     ResamplingAudioSource resampleSource{&transportSource, false, 2};
-    // Store EQ/filter values
     double highGain{0.0};
     double midGain{0.0};
     double lowGain{0.0};
-    // filter knob: -1..0..+1; negative -> lowpass, positive -> highpass
     double filterKnob{0.0};
 
-    // DSP objects for a simple 3-band EQ + filter (optimized for real-time performance)
     juce::dsp::IIR::Filter<float> lowShelf;
     juce::dsp::IIR::Filter<float> midPeak;
     juce::dsp::IIR::Filter<float> highShelf;
-    juce::dsp::StateVariableTPTFilter<float> svf; // used for filter knob (LP/HP)
+    juce::dsp::StateVariableTPTFilter<float> svf;
     
-    // Performance optimization: Cache coefficient objects to avoid recreation
     juce::dsp::IIR::Coefficients<float>::Ptr cachedLowCoeffs;
     juce::dsp::IIR::Coefficients<float>::Ptr cachedMidCoeffs;
     juce::dsp::IIR::Coefficients<float>::Ptr cachedHighCoeffs;
@@ -149,7 +151,6 @@ private:
     void updateResampleRatio() noexcept;
 
 #if defined(RUBBERBAND_FOUND)
-    // High-quality Rubber Band time-stretcher (required for keylock functionality)
     std::unique_ptr<RubberBand::RubberBandStretcher> rb;
     juce::AudioBuffer<float> rbInputBuffer;
     juce::AudioBuffer<float> rbOutScratch;
@@ -163,38 +164,50 @@ private:
     KeylockQuality rbQuality{KeylockQuality::Quality};
 #endif
 
-    // Hard mute flag to kill output immediately on stop
     std::atomic<bool> forceSilent{false};
-    // Soft pause flag: mute output without stopping transport to avoid glitches
     std::atomic<bool> softPaused{false};
-    // Request to capture exact position on the audio thread
     std::atomic<bool> savePosRequested{false};
-    // Request transportSource.stop() to be executed on the audio thread
     std::atomic<bool> stopRequested{false};
-    // Perform one-time heavy resets after pause/stop inside audio thread without repeating every callback
     std::atomic<bool> pausedResetPending{false};
+    
+    // Latency compensation and crossfade buffering
+    static constexpr int kKeylockTransitionMs = 5;
+    AudioBuffer<float> transitionBuffer;
+    bool transitionBufferValid = false;
+    int transitionSamplesRemaining = 0;
+    int transitionSamplesTotal = 0;
+    bool transitionToKeylock = false;
+    
+    std::atomic<double> measuredLatencyMs{0.0};
+    int latencyCompensationSamples = 0;
+    
+    std::atomic<int> keylockChangePending{-1};
 
-    // DSP prepare state
     double currentSampleRate{44100.0};
     bool dspPrepared{false};
-    // Precise pause/resume handling
     double pausedPosSec{0.0};
+    
+    bool startFadeActive{false};
+    bool stopFadeActive{false};
+    int fadeSamplesRemaining{0};
+    int fadeSamplesTotal{0};
+    float fadeStartGain{1.0f};
+    float fadeTargetGain{1.0f};
+    float lastOutputSampleL{0.0f};
+    float lastOutputSampleR{0.0f};
     bool resumeCompensatePending{false};
     int resumeWarmupSamplesRemaining{0};
     int lastBlockSizeHint{512};
     
-    // Performance optimizations for multiple loaded songs
     static constexpr int AUDIO_POOL_SIZE = 4;
     std::array<std::unique_ptr<AudioBuffer<float>>, AUDIO_POOL_SIZE> audioBufferPool;
     std::atomic<int> poolIndex{0};
     
-    // Loop crossfade buffers for click-free loop transitions
     juce::AudioBuffer<float> loopCrossfadeBuffer;
     bool loopCrossfadeActive{false};
     int loopCrossfadeSamples{0};
     int loopCrossfadePosition{0};
     
-    // Smart caching for waveform data to reduce memory allocations
     struct WaveformCache {
         std::vector<float> peaks;
         double lastDuration = 0.0;
@@ -202,8 +215,7 @@ private:
         std::chrono::steady_clock::time_point lastUpdate;
     } waveformCache;
 
-    // Loop state
-    bool loopEnabled{false};
+    bool loopEnabled = false;
     double loopStartSec{0.0};
     double loopEndSec{0.0};
     
@@ -230,8 +242,6 @@ private:
     
     // Keylock state
     bool keylockEnabled{false};
-    // Defer keylock toggles to audio thread: -1 none, 0 disable, 1 enable
-    std::atomic<int> keylockChangePending{-1};
     // Debug logging for keylock paths
     bool debugKeylock{false};
     // Short warm-up delay for keylock to ensure internal buffers are primed (~5ms)

@@ -53,9 +53,19 @@ message(STATUS "Using Qt6 with OpenGLWidgets")
 find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
 
-pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+# Platform-specific dependencies
+if(UNIX AND NOT APPLE)
+    # Linux: GTK3 required for JUCE gui_extra (if ever needed)
+    pkg_check_modules(GTK3 gtk+-3.0)
+    if(GTK3_FOUND)
+        message(STATUS "GTK3 found on Linux")
+    endif()
+endif()
+
+# Cross-platform optional dependencies
 pkg_check_modules(AUBIO QUIET aubio)
-pkg_check_modules(RUBBERBAND REQUIRED rubberband)
+pkg_check_modules(RUBBERBAND QUIET rubberband)
+pkg_check_modules(TAGLIB QUIET taglib)
 
 juce_add_console_app(David
     PRODUCT_NAME "David")
@@ -120,6 +130,8 @@ set(DAVID_SOURCES
     src/PreferencesDialog.h
     src/MidiEngine.cpp
     src/MidiEngine.h
+    src/CoverArtExtractor.cpp
+    src/CoverArtExtractor.h
     src/AppConfig.h
     src/DeckSettings.h)
 
@@ -150,16 +162,32 @@ else()
     message(STATUS "Aubio not found - building with fallback BPM analyzer")
 endif()
 
-message(STATUS "Rubber Band found: enabling high-quality keylock")
-target_include_directories(David PRIVATE ${RUBBERBAND_INCLUDE_DIRS})
-target_link_libraries(David PRIVATE ${RUBBERBAND_LIBRARIES})
-target_compile_options(David PRIVATE ${RUBBERBAND_CFLAGS_OTHER})
-target_compile_definitions(David PRIVATE RUBBERBAND_FOUND=1)
+if(TAGLIB_FOUND)
+    message(STATUS "TagLib found: enabling cover art extraction")
+    target_include_directories(David PRIVATE ${TAGLIB_INCLUDE_DIRS})
+    target_link_libraries(David PRIVATE ${TAGLIB_LIBRARIES})
+    target_compile_options(David PRIVATE ${TAGLIB_CFLAGS_OTHER})
+    target_compile_definitions(David PRIVATE TAGLIB_FOUND=1)
+else()
+    message(STATUS "TagLib not found - cover art extraction disabled")
+endif()
 
-# JUCE's juce_gui_extra on Linux expects GTK headers/libs even if Qt is used for the main UI
-target_include_directories(David PRIVATE ${GTK3_INCLUDE_DIRS})
-target_link_libraries(David PRIVATE ${GTK3_LIBRARIES})
-target_compile_options(David PRIVATE ${GTK3_CFLAGS_OTHER})
+if(RUBBERBAND_FOUND)
+    message(STATUS "Rubber Band found: enabling high-quality keylock")
+    target_include_directories(David PRIVATE ${RUBBERBAND_INCLUDE_DIRS})
+    target_link_libraries(David PRIVATE ${RUBBERBAND_LIBRARIES})
+    target_compile_options(David PRIVATE ${RUBBERBAND_CFLAGS_OTHER})
+    target_compile_definitions(David PRIVATE RUBBERBAND_FOUND=1)
+else()
+    message(WARNING "Rubber Band not found - keylock quality will be reduced")
+endif()
+
+# Linux-specific: JUCE's juce_gui_extra expects GTK (not needed for this project)
+if(GTK3_FOUND)
+    target_include_directories(David PRIVATE ${GTK3_INCLUDE_DIRS})
+    target_link_libraries(David PRIVATE ${GTK3_LIBRARIES})
+    target_compile_options(David PRIVATE ${GTK3_CFLAGS_OTHER})
+endif()
 
 # Removed unused MPG123 and WebKit2 blocks (no references in source)
 

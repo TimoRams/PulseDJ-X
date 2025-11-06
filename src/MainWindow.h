@@ -267,6 +267,7 @@ private:
     void connectDeckSettings();     // Verbindet Deck-Controls mit Settings-System
     void applyStoredCuePoints(QtDeckWidget* deck, bool isDeckA);
     void applyStoredBeatGrid(QtDeckWidget* deck, bool isDeckA);
+    void loadAndApplyCoverArt(QtDeckWidget* deck, bool isDeckA);  // NEW: Load cover art from DB
     void reapplyStoredDeckMetadata(bool isDeckA);
 
     // Scratch helper routines

@@ -58,6 +58,18 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     trackInfoLabel->setStyleSheet("font-size: 11px; color: #b8bfd0; padding: 0px;");
     trackInfoLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 
+    // Cover art placeholder (single box spanning both header and waveform rows)
+    coverArtLabel = new QLabel(controlsWidget);
+    coverArtLabel->setFixedSize(60, 60);  // Square that spans both rows
+    coverArtLabel->setStyleSheet("background-color: #1a1a1a; border: 1px solid #444; border-radius: 2px;");
+    coverArtLabel->setAlignment(Qt::AlignCenter);
+    coverArtLabel->setText("🎵");
+    coverArtLabel->setToolTip("Album Cover Art");
+    coverArtLabel->setScaledContents(false);  // Don't stretch - we'll scale manually
+    
+    // Second label not needed - using only one cover art per deck
+    coverArtLabelWave = nullptr;
+
     turntable = new QtTurntableWidget(controlsWidget);
     playPauseBtn = new QPushButton("Play", controlsWidget);
     loadBtn = new QPushButton("Load", controlsWidget);
@@ -161,7 +173,20 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     controlsLayout->setSpacing(2);  // Reduced from 3
     controlsLayout->setContentsMargins(4, 4, 4, 4);  // Reduced from 6
     
-    // Header section: Title and track name
+    // Combined row: Cover art + (Header row + Waveform row stacked)
+    auto topSection = new QHBoxLayout;
+    topSection->setSpacing(4);
+    topSection->setContentsMargins(0, 0, 0, 0);
+    
+    // Cover art on the left (spans full height)
+    topSection->addWidget(coverArtLabel, 0, Qt::AlignTop);
+    
+    // Right side: Header and waveform stacked vertically
+    auto rightStack = new QVBoxLayout;
+    rightStack->setSpacing(2);
+    rightStack->setContentsMargins(0, 0, 0, 0);
+    
+    // Header row: Title and track name
     auto headerRow = new QWidget(controlsWidget);
     headerRow->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto headerRowLayout = new QHBoxLayout(headerRow);
@@ -170,12 +195,15 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     headerRowLayout->addWidget(deckTitleLabel);
     headerRowLayout->addWidget(songNameLabel, 1);
     headerRowLayout->addWidget(trackInfoLabel, 0);
-    controlsLayout->addWidget(headerRow);
+    rightStack->addWidget(headerRow);
     
     // Waveform overview (more compact)
     waveform->setFixedHeight(25);
     waveform->setStyleSheet("border: 1px solid #444; border-radius: 0px;");
-    controlsLayout->addWidget(waveform);
+    rightStack->addWidget(waveform);
+    
+    topSection->addLayout(rightStack, 1);
+    controlsLayout->addLayout(topSection);
     waveform->setAcceptDrops(true);
     connect(waveform, &DeckWaveformOverview::fileDropped, this, [this](const QString &path){ this->loadFile(path); });
     
@@ -443,6 +471,39 @@ void QtDeckWidget::setTrackInfoDisplay(const QString& text, const QString& style
     trackInfoLabel->setText(text);
     trackInfoLabel->setToolTip(tooltip.isEmpty() ? text : tooltip);
     trackInfoLabel->setStyleSheet(style.isEmpty() ? defaultStyle : style);
+}
+
+// NEW: Set cover art from image data
+void QtDeckWidget::setCoverArt(const QByteArray& imageData, const QString& format) {
+    if (!coverArtLabel) return;
+    
+    if (imageData.isEmpty()) {
+        // Reset to placeholder
+        coverArtLabel->clear();
+        coverArtLabel->setText("🎵");
+        coverArtLabel->setStyleSheet("background-color: #1a1a1a; border: 1px solid #444; border-radius: 2px; color: #666; font-size: 24px;");
+        return;
+    }
+    
+    // Load image from data
+    QPixmap pixmap;
+    if (pixmap.loadFromData(imageData, format.isEmpty() ? nullptr : format.toUtf8().constData())) {
+        // Scale to fit label size while maintaining aspect ratio
+        QPixmap scaled = pixmap.scaled(coverArtLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        coverArtLabel->setPixmap(scaled);
+        coverArtLabel->setText("");  // Clear emoji when showing image
+        // Update stylesheet to remove background when showing image
+        coverArtLabel->setStyleSheet("border: 1px solid #444; border-radius: 2px; background-color: #0a0a0a;");
+        std::cout << "QtDeckWidget: Cover art loaded successfully (" << format.toStdString() << ", " 
+                  << pixmap.width() << "x" << pixmap.height() << ")" << std::endl;
+    } else {
+        // Failed to load - keep placeholder
+        std::cerr << "QtDeckWidget: Failed to load cover art image (format: " << format.toStdString() 
+                  << ", size: " << imageData.size() << " bytes)" << std::endl;
+        coverArtLabel->clear();
+        coverArtLabel->setText("❌");
+        coverArtLabel->setStyleSheet("background-color: #1a1a1a; border: 1px solid #444; border-radius: 2px; color: #ff0000; font-size: 24px;");
+    }
 }
 
 // NEW: Handle completion of threaded file loading

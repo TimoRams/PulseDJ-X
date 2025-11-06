@@ -114,6 +114,8 @@ public:
     void updateTempo(double newBpm);
     void refreshBeatGrid();
     
+    void stopPlayback() { estimatedPlaybackRate = 0.0; updateRenderActivity(); }
+    
     void setCuePoints(const std::array<double, 8>& cuePoints);
     void clearCuePoints();
     

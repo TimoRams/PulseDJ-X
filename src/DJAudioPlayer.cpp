@@ -4,8 +4,13 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <ranges>
+#include <span>
+#include <expected>
 
 namespace {
+using std::numbers::pi;
+
 constexpr double kMinSpeedRatio = 0.05;
 constexpr double kMaxSpeedRatio = 8.0;
 constexpr double kPitchBendMinRatio = 0.4;
@@ -13,6 +18,43 @@ constexpr double kPitchBendMaxRatio = 2.5;
 constexpr double kDbMin = -60.0;
 constexpr double kDbMax = 0.0;
 constexpr float kSmoothingFactor = 0.3f;
+constexpr double kDbRange = kDbMax - kDbMin;
+constexpr int kFadeInMs = 5;
+constexpr int kFadeOutMs = 5;
+constexpr float kClickSuppressionThreshold = 0.01f;
+
+constexpr auto dbToLinear = [](float db) constexpr noexcept -> float {
+    return std::pow(10.0f, db / 20.0f);
+};
+
+constexpr auto linearToDb = [](float linear) constexpr noexcept -> float {
+    return linear > 0.0f ? 20.0f * std::log10(linear) : static_cast<float>(kDbMin);
+};
+
+template<typename T>
+[[nodiscard]] constexpr auto fastClamp(T value, T min, T max) noexcept -> T {
+    return std::clamp(value, min, max);
+}
+
+constexpr auto applyEqualPowerFade = [](float* buffer, int numSamples, float startGain, float endGain) noexcept {
+    const float invSamples = 1.0f / static_cast<float>(numSamples);
+    for (int i = 0; i < numSamples; ++i) {
+        const float progress = static_cast<float>(i) * invSamples;
+        const float angle = progress * static_cast<float>(pi) * 0.5f;
+        const float gain = startGain * std::cos(angle) + endGain * std::sin(angle);
+        buffer[i] *= gain;
+    }
+};
+
+constexpr auto detectAndSuppressClick = [](float* buffer, int numSamples, float prevSample) noexcept {
+    if (numSamples > 0 && std::abs(buffer[0] - prevSample) > kClickSuppressionThreshold) {
+        const int fadeLength = std::min(16, numSamples);
+        for (int i = 0; i < fadeLength; ++i) {
+            const float fade = static_cast<float>(i) / fadeLength;
+            buffer[i] = prevSample * (1.0f - fade) + buffer[i] * fade;
+        }
+    }
+};
 }
 
 DJAudioPlayer::DJAudioPlayer(AudioFormatManager &_formatManager) 
@@ -46,23 +88,20 @@ void DJAudioPlayer::prepareToPlay(int samplesPerBlockExpected, double sampleRate
     transportSource.prepareToPlay(samplesPerBlockExpected, sampleRate);
     resampleSource.prepareToPlay(samplesPerBlockExpected, sampleRate);
     currentSampleRate = sampleRate;
-    
-    for (auto& buffer : audioBufferPool) {
-        buffer = std::make_unique<AudioBuffer<float>>(2, samplesPerBlockExpected * 2);
-        buffer->clear();
-    }
-    
     lastBlockSizeHint = samplesPerBlockExpected;
     
-    juce::dsp::ProcessSpec spec{ sampleRate, static_cast<uint32>(samplesPerBlockExpected), 2 };
-    lowShelf.reset(); 
-    lowShelf.prepare(spec);
-    midPeak.reset(); 
-    midPeak.prepare(spec);
-    highShelf.reset(); 
-    highShelf.prepare(spec);
-    svf.reset(); 
-    svf.prepare(spec);
+    std::ranges::for_each(audioBufferPool, [samplesPerBlockExpected](auto& buffer) {
+        buffer = std::make_unique<AudioBuffer<float>>(2, samplesPerBlockExpected * 2);
+        buffer->clear();
+    });
+    
+    const juce::dsp::ProcessSpec spec{ sampleRate, static_cast<uint32>(samplesPerBlockExpected), 2 };
+    
+    auto prepareFilter = [&spec](auto& filter) { filter.reset(); filter.prepare(spec); };
+    prepareFilter(lowShelf);
+    prepareFilter(midPeak);
+    prepareFilter(highShelf);
+    prepareFilter(svf);
 
     cachedLowCoeffs = juce::dsp::IIR::Coefficients<float>::makeLowShelf(currentSampleRate, 250.0f, 0.707f, 1.0f);
     cachedMidCoeffs = juce::dsp::IIR::Coefficients<float>::makePeakFilter(currentSampleRate, 2500.0f, 1.0f, 1.0f);
@@ -71,7 +110,6 @@ void DJAudioPlayer::prepareToPlay(int samplesPerBlockExpected, double sampleRate
     lowShelf.coefficients = cachedLowCoeffs;
     midPeak.coefficients = cachedMidCoeffs;
     highShelf.coefficients = cachedHighCoeffs;
-
     svf.setCutoffFrequency(1000.0f);
     svf.setResonance(0.7f);
 
@@ -96,6 +134,32 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     int pendingKL = keylockChangePending.exchange(-1);
     if (pendingKL != -1) [[unlikely]] {
         const bool enable = (pendingKL == 1);
+        
+        // Prepare crossfade buffer for seamless transition
+        const int transitionSamples = (int)std::ceil((kKeylockTransitionMs / 1000.0) * currentSampleRate);
+        const int numChannels = bufferToFill.buffer->getNumChannels();
+        
+        if (transitionSamples > 0 && numChannels > 0) {
+            // Fill transition buffer with current mode audio
+            transitionBuffer.setSize(numChannels, transitionSamples, false, true, true);
+            AudioSourceChannelInfo transitionInfo;
+            transitionInfo.buffer = &transitionBuffer;
+            transitionInfo.startSample = 0;
+            transitionInfo.numSamples = transitionSamples;
+            
+            if (keylockEnabled) {
+                resampleSource.setResamplingRatio(1.0);
+            } else {
+                resampleSource.setResamplingRatio(effectiveSpeed());
+            }
+            resampleSource.getNextAudioBlock(transitionInfo);
+            
+            transitionBufferValid = true;
+            transitionSamplesRemaining = transitionSamples;
+            transitionSamplesTotal = transitionSamples;
+            transitionToKeylock = enable;
+        }
+        
         keylockEnabled = enable;
         if (enable) {
             updateResampleRatio();
@@ -117,11 +181,15 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
 
     if (forceSilent.load() || softPaused.load()) [[unlikely]] {
         bufferToFill.clearActiveBufferRegion();
+        transitionBufferValid = false;
+        transitionSamplesRemaining = 0;
         return;
     }
 
     if (scratchMode.load()) [[unlikely]] {
         renderScratchAudio(bufferToFill);
+        transitionBufferValid = false;
+        transitionSamplesRemaining = 0;
         return;
     }
 
@@ -204,31 +272,21 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             // Clamp to buffer boundaries
             samplesToLoopEnd = std::max(0, std::min(samplesToLoopEnd, bufferToFill.numSamples));
             
-            // IMPROVED: Longer crossfade with better pre-buffering for ultra-smooth loops
             const int crossfadeLength = std::min(1024, std::min(samplesToLoopEnd, bufferToFill.numSamples / 2));
             
             if (crossfadeLength >= 16 && samplesToLoopEnd >= crossfadeLength) {
-                // ADVANCED STRATEGY: Pre-buffer both end and start with overlap compensation
-                
-                // Step 1: Get the complete current buffer (end portion)
                 AudioBuffer<float> endBuffer(bufferToFill.buffer->getNumChannels(), bufferToFill.numSamples);
                 AudioSourceChannelInfo endInfo;
                 endInfo.buffer = &endBuffer;
                 endInfo.startSample = 0;
                 endInfo.numSamples = bufferToFill.numSamples;
                 
-                if (keylockEnabled) {
-                    resampleSource.setResamplingRatio(1.0);
-                } else {
-                    resampleSource.setResamplingRatio(effectiveSpeed());
-                }
+                resampleSource.setResamplingRatio(keylockEnabled ? 1.0 : effectiveSpeed());
                 resampleSource.getNextAudioBlock(endInfo);
                 
-                // Step 2: Store current position and jump to loop start
                 double currentPos = transportSource.getCurrentPosition();
                 transportSource.setPosition(loopStartSec);
                 
-                // Step 3: Get extended start portion for seamless crossfade
                 const int startBufferSize = std::max(crossfadeLength * 2, bufferToFill.numSamples);
                 AudioBuffer<float> startBuffer(bufferToFill.buffer->getNumChannels(), startBufferSize);
                 AudioSourceChannelInfo startInfo;
@@ -237,151 +295,97 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 startInfo.numSamples = startBufferSize;
                 resampleSource.getNextAudioBlock(startInfo);
                 
-                // Step 4: Create ultra-smooth crossfade with equal-power panning
                 const int fadeStartIndex = samplesToLoopEnd - crossfadeLength;
+                const float invCrossfade = 1.0f / (crossfadeLength - 1);
                 
                 for (int ch = 0; ch < bufferToFill.buffer->getNumChannels(); ++ch) {
-                    // First, copy the end buffer completely
                     bufferToFill.buffer->copyFrom(ch, bufferToFill.startSample, endBuffer, ch, 0, bufferToFill.numSamples);
                     
-                    // Apply extended crossfade with equal-power curves
+                    auto* channelData = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample);
+                    
                     for (int i = 0; i < crossfadeLength; ++i) {
-                        int outputIndex = fadeStartIndex + i;
+                        const int outputIndex = fadeStartIndex + i;
                         if (outputIndex >= 0 && outputIndex < bufferToFill.numSamples) {
-                            // Equal-power crossfade for perfect energy conservation
-                            float fadeProgress = (float)i / (float)(crossfadeLength - 1);
+                            const float progress = i * invCrossfade;
+                            const float hannProgress = 0.5f * (1.0f - std::cos(progress * static_cast<float>(pi)));
+                            const float angle = hannProgress * static_cast<float>(pi) * 0.5f;
+                            const float endGain = std::cos(angle);
+                            const float startGain = std::sin(angle);
                             
-                            // Raised cosine (Hann window) for ultra-smooth transition
-                            float hannProgress = 0.5f * (1.0f - std::cos(fadeProgress * M_PI));
+                            const float endSample = endBuffer.getSample(ch, outputIndex);
+                            const float startSample = (i < startBuffer.getNumSamples()) ? startBuffer.getSample(ch, i) : 0.0f;
                             
-                            // Equal-power gain curves
-                            float endGain = std::cos(hannProgress * M_PI * 0.5f);
-                            float startGain = std::sin(hannProgress * M_PI * 0.5f);
-                            
-                            // Get samples with bounds checking
-                            float endSample = endBuffer.getSample(ch, outputIndex);
-                            float startSample = (i < startBuffer.getNumSamples()) ? startBuffer.getSample(ch, i) : 0.0f;
-                            
-                            // Apply equal-power crossfade
-                            float crossfadedSample = endSample * endGain + startSample * startGain;
-                            
-                            bufferToFill.buffer->setSample(ch, bufferToFill.startSample + outputIndex, crossfadedSample);
+                            channelData[outputIndex] = std::fma(endSample, endGain, startSample * startGain);
                         }
                     }
                     
-                    // Fill remainder with pure start audio for seamless continuation
-                    int remainderStart = fadeStartIndex + crossfadeLength;
-                    int remainderLength = bufferToFill.numSamples - remainderStart;
+                    const int remainderStart = fadeStartIndex + crossfadeLength;
+                    const int remainderLength = bufferToFill.numSamples - remainderStart;
                     if (remainderLength > 0 && remainderStart >= 0) {
                         for (int i = 0; i < remainderLength; ++i) {
-                            int outputIndex = remainderStart + i;
-                            int startIndex = crossfadeLength + i;
+                            const int outputIndex = remainderStart + i;
+                            const int startIndex = crossfadeLength + i;
                             if (outputIndex < bufferToFill.numSamples && startIndex < startBuffer.getNumSamples()) {
-                                float startSample = startBuffer.getSample(ch, startIndex);
-                                bufferToFill.buffer->setSample(ch, bufferToFill.startSample + outputIndex, startSample);
+                                channelData[outputIndex] = startBuffer.getSample(ch, startIndex);
                             }
                         }
                     }
                 }
                 
-                qDebug() << "EQUAL-POWER crossfade applied: pos" << currentPos << "-> start" << loopStartSec
-                         << "crossfade:" << crossfadeLength << "samples, fadeStart:" << fadeStartIndex
-                         << "remainder:" << (bufferToFill.numSamples - (fadeStartIndex + crossfadeLength));
-                
-                return; // Skip normal processing
+                qDebug() << "Loop crossfade:" << crossfadeLength << "samples @" << currentPos;
+                return;
             } else {
-                // For very short crossfades, use extended linear fade with pre-buffering
-                
-                // Get a small buffer before jumping to analyze waveform continuity
                 AudioBuffer<float> preJumpBuffer(bufferToFill.buffer->getNumChannels(), 32);
                 AudioSourceChannelInfo preInfo;
                 preInfo.buffer = &preJumpBuffer;
                 preInfo.startSample = 0;
                 preInfo.numSamples = 32;
                 
-                if (keylockEnabled) {
-                    resampleSource.setResamplingRatio(1.0);
-                } else {
-                    resampleSource.setResamplingRatio(effectiveSpeed());
-                }
+                resampleSource.setResamplingRatio(keylockEnabled ? 1.0 : effectiveSpeed());
                 resampleSource.getNextAudioBlock(preInfo);
                 
-                // Jump to loop start
                 transportSource.setPosition(loopStartSec);
-                
-                // Get audio from new position with extended buffer
-                if (keylockEnabled) {
-                    resampleSource.setResamplingRatio(1.0);
-                } else {
-                    resampleSource.setResamplingRatio(effectiveSpeed());
-                }
                 resampleSource.getNextAudioBlock(bufferToFill);
                 
-                // Apply intelligent fade-in based on waveform matching
                 const int extendedFade = std::min(64, bufferToFill.numSamples / 2);
                 for (int ch = 0; ch < bufferToFill.buffer->getNumChannels(); ++ch) {
-                    // Get last sample from pre-jump for continuity reference
-                    float lastSample = (preJumpBuffer.getNumSamples() > 0) ? 
+                    const float lastSample = (preJumpBuffer.getNumSamples() > 0) ? 
                                       preJumpBuffer.getSample(ch, preJumpBuffer.getNumSamples() - 1) : 0.0f;
                     
+                    auto* channelData = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample);
+                    
                     for (int i = 0; i < extendedFade; ++i) {
-                        // Smooth Hann window fade-in with DC offset compensation
-                        float fadeProgress = (float)i / (float)extendedFade;
-                        float hannFade = 0.5f * (1.0f - std::cos(fadeProgress * M_PI));
+                        const float fadeProgress = static_cast<float>(i) / extendedFade;
+                        const float hannFade = 0.5f * (1.0f - std::cos(fadeProgress * static_cast<float>(pi)));
                         
-                        float currentSample = bufferToFill.buffer->getSample(ch, bufferToFill.startSample + i);
-                        
-                        // Compensate for potential DC offset at loop boundary
                         if (i == 0 && std::abs(lastSample) > 0.001f) {
-                            float dcOffset = lastSample * 0.1f; // Small compensation
-                            currentSample += dcOffset * (1.0f - hannFade);
+                            channelData[i] = std::fma(channelData[i] - lastSample, hannFade, lastSample);
+                        } else {
+                            channelData[i] *= hannFade;
                         }
-                        
-                        float fadedSample = currentSample * hannFade;
-                        bufferToFill.buffer->setSample(ch, bufferToFill.startSample + i, fadedSample);
                     }
                 }
                 
-                qDebug() << "EXTENDED Hann fade-in applied: pos" << pos << "-> start" << loopStartSec 
-                         << "fadeLength:" << extendedFade;
                 return;
             }
         }
-        // Fallback: if position is already past loop end, jump back with intelligent fade-in
         else if (pos >= loopEndSec && loopEndSec > loopStartSec) {
             transportSource.setPosition(loopStartSec);
-            qDebug() << "Late loop jump with intelligent fade-in: pos" << pos << "-> start" << loopStartSec;
-            
-            // Get audio and apply sophisticated fade-in to prevent any artifacts
-            if (keylockEnabled) {
-                resampleSource.setResamplingRatio(1.0);
-            } else {
-                resampleSource.setResamplingRatio(effectiveSpeed());
-            }
+            resampleSource.setResamplingRatio(keylockEnabled ? 1.0 : effectiveSpeed());
             resampleSource.getNextAudioBlock(bufferToFill);
             
-            // Apply double-stage fade-in: fast initial suppression + smooth ramp
             const int totalFadeLength = std::min(128, bufferToFill.numSamples / 2);
-            const int quickSuppressLength = totalFadeLength / 4; // First 25% for click suppression
+            const int quickSuppressLength = totalFadeLength / 4;
             
             for (int ch = 0; ch < bufferToFill.buffer->getNumChannels(); ++ch) {
+                auto* channelData = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample);
+                
                 for (int i = 0; i < totalFadeLength; ++i) {
-                    float sample = bufferToFill.buffer->getSample(ch, bufferToFill.startSample + i);
-                    float fadedSample;
-                    
-                    if (i < quickSuppressLength) {
-                        // Stage 1: Quick exponential suppression for click elimination
-                        float quickFade = (float)i / (float)quickSuppressLength;
-                        quickFade = quickFade * quickFade; // Quadratic for faster initial suppression
-                        fadedSample = sample * quickFade;
-                    } else {
-                        // Stage 2: Smooth cosine ramp for natural sound
-                        float remainingProgress = (float)(i - quickSuppressLength) / (float)(totalFadeLength - quickSuppressLength);
-                        float cosineFade = 0.5f * (1.0f - std::cos(remainingProgress * M_PI));
-                        fadedSample = sample * cosineFade;
-                    }
-                    
-                    bufferToFill.buffer->setSample(ch, bufferToFill.startSample + i, fadedSample);
+                    const float progress = static_cast<float>(i) / totalFadeLength;
+                    const float fade = (i < quickSuppressLength) ? 
+                        (progress * 4.0f) * (progress * 4.0f) :
+                        0.5f * (1.0f - std::cos((progress - 0.25f) / 0.75f * static_cast<float>(pi)));
+                    channelData[i] *= fade;
                 }
             }
             return;
@@ -391,11 +395,16 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
 #if defined(RUBBERBAND_FOUND)
     if (rbReady && rb) [[likely]] {
         const bool isKeylockActive = keylockEnabled;
+        
+        if (rbLatencySamples > 0 && currentSampleRate > 0.0) {
+            measuredLatencyMs.store((rbLatencySamples / currentSampleRate) * 1000.0);
+            latencyCompensationSamples = rbLatencySamples;
+        }
+        
         if (debugKeylock) std::cout << "[RB] Enter path: keylock=" << isKeylockActive 
                                      << ", desiredOut=" << bufferToFill.numSamples
                                      << ", chsOut=" << bufferToFill.buffer->getNumChannels() << std::endl;
         if (lastBlockSizeHint <= 0 || currentSampleRate <= 0.0) [[unlikely]] {
-            // Not ready; fallback this block
             if (debugKeylock) std::cout << "[KL][RB] Not ready: lastBlockSizeHint=" << lastBlockSizeHint
                                         << ", SR=" << currentSampleRate << ". Fallback." << std::endl;
             resampleSource.getNextAudioBlock(bufferToFill);
@@ -433,15 +442,19 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             if (debugKeylock) std::cout << "[RB] Keylock OFF - using normal resampling" << std::endl;
             resampleSource.setResamplingRatio(effectiveSpeed()); // Normal pitch+tempo changes
             resampleSource.getNextAudioBlock(bufferToFill);
+            measuredLatencyMs.store(0.0);
+            latencyCompensationSamples = 0;
+            
+            // Apply crossfade transition if switching from keylock
+            if (transitionBufferValid && transitionSamplesRemaining > 0 && !transitionToKeylock) {
+                applyCrossfadeTransition(bufferToFill);
+            }
             return;
         }
         
         try {
-        // When keylock is active, ALWAYS use RubberBand processing (even at 1.0x speed)
-        // This ensures consistent behavior and no audio dropout at unity speed
-        // Set desired time ratio (tempo change) and keep pitch 1.0
     const double speed = effectiveSpeed();
-        double timeRatio = 1.0 / speed; // speed up -> smaller ratio
+        double timeRatio = 1.0 / speed;
         if (std::abs(timeRatio - rbLastTimeRatio) > 1e-4) {
             rb->setTimeRatio(timeRatio);
             rbLastTimeRatio = timeRatio;
@@ -449,20 +462,16 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         }
         rb->setPitchScale(1.0);
 
-    // Number of output samples requested this callback
     const int desiredOut = bufferToFill.numSamples;
     const int chsOut = bufferToFill.buffer->getNumChannels();
-    const int chsRB = rbNumChannels; // Always talk to RB with its configured channel count
+    const int chsRB = rbNumChannels;
 
-        // Ensure we provide enough input using getSamplesRequired when possible
         resampleSource.setResamplingRatio(1.0);
 
-        // Handle preferred start padding once after (re)initialisation
         if (!rbPaddedStartDone) {
             size_t pad = rb->getPreferredStartPad();
             if (debugKeylock) std::cout << "[KL][RB] preferredStartPad=" << pad << std::endl;
             if (pad > 0) {
-                // Feed silence to prime the stretcher
                 if (rbInputBuffer.getNumChannels() < chsRB || rbInputBuffer.getNumSamples() < (int)pad)
                     rbInputBuffer.setSize(chsRB, (int)pad, false, true, true);
                 rbInputBuffer.clear();
@@ -478,7 +487,6 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             rbPaddedStartDone = true;
         }
 
-        // Produce enough output to fully cover desiredOut, honouring initial start-delay discard
         int produced = 0;
         while (rbDiscardOutRemaining > 0 || rb->available() < (desiredOut - produced)) {
             int needIn = (int)rb->getSamplesRequired();
@@ -506,7 +514,6 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             for (int c = 0; c < chsRB; ++c) inPtrs[c] = rbInputBuffer.getReadPointer(c);
             rb->process(inPtrs.data(), needIn, false);
 
-            // Drain and discard initial latency into scratch buffer
             if (rbDiscardOutRemaining > 0 && rb->available() > 0) {
                 int avail = rb->available();
                 int toTake = juce::jmin(avail, rbDiscardOutRemaining);
@@ -522,7 +529,6 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             if (produced >= desiredOut) break;
         }
 
-        // Now retrieve exactly what we need for this buffer
         const int toRetrieve = std::max(0, juce::jmin(rb->available(), desiredOut));
         if (rbOutScratch.getNumChannels() < chsRB || rbOutScratch.getNumSamples() < std::max(1, toRetrieve))
             rbOutScratch.setSize(chsRB, std::max(1, toRetrieve), false, true, true);
@@ -532,23 +538,19 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     if (debugKeylock) std::cout << "[KL][RB] retrieved got=" << got << "/" << desiredOut
                      << ", availableAfter=" << rb->available() << std::endl;
 
-        // Robustly map/mix RubberBand output into the device buffer
         if (got <= 0) {
             bufferToFill.clearActiveBufferRegion();
         } else {
-            // Case 1: RB provides >= output channels -> copy matching channels
             if (chsRB >= chsOut) {
                 for (int c = 0; c < chsOut; ++c) {
                     bufferToFill.buffer->copyFrom(c, bufferToFill.startSample, rbOutScratch, c, 0, got);
                 }
             }
-            // Case 2: RB mono -> duplicate to all output channels
             else if (chsRB == 1 && chsOut >= 1) {
                 for (int c = 0; c < chsOut; ++c) {
                     bufferToFill.buffer->copyFrom(c, bufferToFill.startSample, rbOutScratch, 0, 0, got);
                 }
             }
-            // Case 3: RB stereo but output mono -> mix to mono and copy
             else if (chsRB >= 2 && chsOut == 1) {
                 if (rbOutScratch.getNumChannels() >= 2) {
                     AudioBuffer<float> mix;
@@ -564,13 +566,11 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 }
             }
 
-            // If RB had fewer channels than device, clear remaining channels to silence
             for (int c = chsRB; c < chsOut; ++c) {
                 bufferToFill.buffer->clear(c, bufferToFill.startSample, got);
             }
         }
 
-        // Fill any remainder with silence for available channels
         if (got < desiredOut) {
             const int remain = desiredOut - got;
             if (remain > 0) {
@@ -581,16 +581,24 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             }
         }
         resumeCompensatePending = false;
+        
+        // Apply crossfade transition if switching to keylock
+        if (transitionBufferValid && transitionSamplesRemaining > 0 && transitionToKeylock) {
+            applyCrossfadeTransition(bufferToFill);
+        }
         } catch (const std::exception& e) {
-            // If RB throws or anything goes wrong, fail safe to silence + fallback next block
             std::cout << "RubberBand processing error: " << e.what() << std::endl;
             bufferToFill.clearActiveBufferRegion();
             rbReady = false;
+            measuredLatencyMs.store(0.0);
+            latencyCompensationSamples = 0;
             return;
         } catch (...) {
             std::cout << "RubberBand processing unknown error" << std::endl;
             bufferToFill.clearActiveBufferRegion();
             rbReady = false;
+            measuredLatencyMs.store(0.0);
+            latencyCompensationSamples = 0;
             return;
         }
     } else {
@@ -600,6 +608,8 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         
         resampleSource.setResamplingRatio(effectiveSpeed());
         resampleSource.getNextAudioBlock(bufferToFill);
+        measuredLatencyMs.store(0.0);
+        latencyCompensationSamples = 0;
         
         static int normalPlaybackCounter = 0;
         if (++normalPlaybackCounter % 2000 == 0) [[unlikely]] {
@@ -611,9 +621,54 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     #error "RubberBand is required for keylock functionality"
 #endif
 
-    if (!dspPrepared || bufferToFill.buffer->getNumChannels() == 0) [[unlikely]] {
-        return;
+    applyDSPEffects(bufferToFill);
+    
+    if (fadeSamplesRemaining > 0 && fadeSamplesTotal > 0) {
+        const int samplesToProcess = std::min(bufferToFill.numSamples, fadeSamplesRemaining);
+        const int numChannels = bufferToFill.buffer->getNumChannels();
+        const float invTotal = 1.0f / static_cast<float>(fadeSamplesTotal);
+        
+        for (int ch = 0; ch < numChannels; ++ch) {
+            auto* channelData = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample);
+            
+            for (int i = 0; i < samplesToProcess; ++i) {
+                const float progress = static_cast<float>(fadeSamplesTotal - fadeSamplesRemaining + i) * invTotal;
+                const float angle = progress * static_cast<float>(pi) * 0.5f;
+                const float gain = fadeStartGain * std::cos(angle) + fadeTargetGain * std::sin(angle);
+                channelData[i] *= gain;
+            }
+            
+            if (ch == 0) lastOutputSampleL = channelData[samplesToProcess - 1];
+            if (ch == 1) lastOutputSampleR = channelData[samplesToProcess - 1];
+        }
+        
+        fadeSamplesRemaining -= samplesToProcess;
+        
+        if (fadeSamplesRemaining <= 0) {
+            fadeSamplesRemaining = 0;
+            startFadeActive = false;
+            stopFadeActive = false;
+        }
+    } else if (bufferToFill.numSamples > 0) {
+        const int numChannels = bufferToFill.buffer->getNumChannels();
+        const int lastSample = bufferToFill.startSample + bufferToFill.numSamples - 1;
+        
+        for (int ch = 0; ch < numChannels; ++ch) {
+            auto* channelData = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample);
+            
+            if (ch == 0) {
+                detectAndSuppressClick(channelData, bufferToFill.numSamples, lastOutputSampleL);
+                lastOutputSampleL = bufferToFill.buffer->getSample(ch, lastSample);
+            } else if (ch == 1) {
+                detectAndSuppressClick(channelData, bufferToFill.numSamples, lastOutputSampleR);
+                lastOutputSampleR = bufferToFill.buffer->getSample(ch, lastSample);
+            }
+        }
     }
+}
+
+void DJAudioPlayer::applyDSPEffects(const AudioSourceChannelInfo &bufferToFill) {
+    if (!dspPrepared || bufferToFill.buffer->getNumChannels() == 0) [[unlikely]] return;
 
     AudioBuffer<float>& buffer = *bufferToFill.buffer;
     const int numSamples = bufferToFill.numSamples;
@@ -624,79 +679,89 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
     auto limitedBlock = subBlock.getSubsetChannelBlock(0, std::min(buffer.getNumChannels(), 2));
     juce::dsp::ProcessContextReplacing<float> ctx(limitedBlock);
 
-    float gainDbHigh = std::clamp(static_cast<float>(highGain * 12.0), -12.0f, 12.0f);
-    float gainLinearHigh = juce::Decibels::decibelsToGain(gainDbHigh);
-    highShelf.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighShelf(
-        currentSampleRate, 8000.0f, 0.707f, gainLinearHigh);
+    auto updateFilter = [this, &ctx](auto& filter, double gain, float freq, auto makeCoeff, bool shelf = true) {
+        const float gainLinear = dbToLinear(fastClamp(static_cast<float>(gain * 12.0), -12.0f, 12.0f));
+        filter.coefficients = shelf ? 
+            makeCoeff(currentSampleRate, freq, 0.707f, gainLinear) :
+            makeCoeff(currentSampleRate, freq, 1.0f, gainLinear);
+        filter.process(ctx);
+    };
 
-    float gainDbMid = std::clamp(static_cast<float>(midGain * 12.0), -12.0f, 12.0f);
-    float gainLinearMid = juce::Decibels::decibelsToGain(gainDbMid);
-    midPeak.coefficients = juce::dsp::IIR::Coefficients<float>::makePeakFilter(
-        currentSampleRate, 2500.0f, 1.0f, gainLinearMid);
+    updateFilter(lowShelf, lowGain, 300.0f, juce::dsp::IIR::Coefficients<float>::makeLowShelf, true);
+    updateFilter(midPeak, midGain, 2500.0f, juce::dsp::IIR::Coefficients<float>::makePeakFilter, false);
+    updateFilter(highShelf, highGain, 8000.0f, juce::dsp::IIR::Coefficients<float>::makeHighShelf, true);
 
-    float gainDbLow = std::clamp(static_cast<float>(lowGain * 12.0), -12.0f, 12.0f);
-    float gainLinearLow = juce::Decibels::decibelsToGain(gainDbLow);
-    lowShelf.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowShelf(
-        currentSampleRate, 300.0f, 0.707f, gainLinearLow);
-
-    lowShelf.process(ctx);
-    midPeak.process(ctx);
-    highShelf.process(ctx);
-
-    if (filterKnob < 0.0) {
-        double absNorm = std::abs(filterKnob);
-        double cutoffHz = 20000.0 * std::pow(0.01, absNorm);
-        svf.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
-        svf.setCutoffFrequency(std::clamp(static_cast<float>(cutoffHz), 200.0f, 20000.0f));
-    } else {
-        double absNorm = filterKnob;
-        double cutoffHz = 20.0 * std::pow(250.0, absNorm);
-        svf.setType(juce::dsp::StateVariableTPTFilterType::highpass);
-        svf.setCutoffFrequency(std::clamp(static_cast<float>(cutoffHz), 20.0f, 5000.0f));
-    }
+    const auto absNorm = std::abs(filterKnob);
+    const auto [cutoffHz, filterType] = filterKnob < 0.0 ?
+        std::pair{20000.0 * std::pow(0.01, absNorm), juce::dsp::StateVariableTPTFilterType::lowpass} :
+        std::pair{20.0 * std::pow(250.0, absNorm), juce::dsp::StateVariableTPTFilterType::highpass};
+    
+    svf.setType(filterType);
+    svf.setCutoffFrequency(fastClamp(static_cast<float>(cutoffHz), 20.0f, 20000.0f));
     svf.process(ctx);
     
     if (buffer.getNumChannels() > 0 && numSamples > 0) [[likely]] {
-        float leftRMS = 0.0f;
-        if (buffer.getNumChannels() >= 1) {
-            const float* leftData = buffer.getReadPointer(0, startSample);
+        auto calcRMS = [&](int ch) noexcept {
+            const auto* data = buffer.getReadPointer(ch, startSample);
             float sum = 0.0f;
-            for (int i = 0; i < numSamples; ++i) {
-                float sample = leftData[i];
-                sum += sample * sample;
-            }
-            leftRMS = std::sqrt(sum / numSamples);
+            for (int i = 0; i < numSamples; ++i) sum = std::fma(data[i], data[i], sum);
+            return std::sqrt(sum / numSamples);
+        };
+
+        const float leftRMS = buffer.getNumChannels() >= 1 ? calcRMS(0) : 0.0f;
+        const float rightRMS = buffer.getNumChannels() >= 2 ? calcRMS(1) : leftRMS;
+        
+        auto toPercent = [](float rms) constexpr noexcept {
+            constexpr float kDbMinF = static_cast<float>(kDbMin);
+            constexpr float kDbRangeF = static_cast<float>(kDbRange);
+            const float db = linearToDb(rms);
+            return fastClamp((db - kDbMinF) / kDbRangeF * 100.0f, 0.0f, 100.0f);
+        };
+
+        leftChannelLevel.store(std::fma(kSmoothingFactor, toPercent(leftRMS), 
+            (1.0f - kSmoothingFactor) * leftChannelLevel.load()), std::memory_order_relaxed);
+        rightChannelLevel.store(std::fma(kSmoothingFactor, toPercent(rightRMS),
+            (1.0f - kSmoothingFactor) * rightChannelLevel.load()), std::memory_order_relaxed);
+    }
+}
+
+void DJAudioPlayer::applyCrossfadeTransition(const AudioSourceChannelInfo &bufferToFill) {
+    if (!transitionBufferValid || transitionSamplesRemaining <= 0 || transitionSamplesTotal <= 0) [[unlikely]] {
+        return;
+    }
+    
+    const int numChannels = std::min(bufferToFill.buffer->getNumChannels(), transitionBuffer.getNumChannels());
+    const int samplesToProcess = std::min(bufferToFill.numSamples, transitionSamplesRemaining);
+    const int transitionReadPos = transitionSamplesTotal - transitionSamplesRemaining;
+    
+    constexpr auto equalPowerGains = [](float progress) constexpr noexcept -> std::pair<float, float> {
+        const float angle = progress * static_cast<float>(pi) * 0.5f;
+        return {std::cos(angle), std::sin(angle)};
+    };
+    
+    const float invTotal = 1.0f / static_cast<float>(transitionSamplesTotal);
+    
+    for (int ch = 0; ch < numChannels; ++ch) {
+        auto* outPtr = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample);
+        const auto* oldPtr = transitionBuffer.getReadPointer(ch, transitionReadPos);
+        
+        for (int i = 0; i < samplesToProcess; ++i) {
+            const float fadeProgress = static_cast<float>(transitionReadPos + i) * invTotal;
+            const auto [oldGain, newGain] = equalPowerGains(fadeProgress);
+            
+            outPtr[i] = std::fma(oldPtr[i], oldGain, outPtr[i] * newGain);
         }
-        
-        float rightRMS = leftRMS;
-        if (buffer.getNumChannels() >= 2) {
-            const float* rightData = buffer.getReadPointer(1, startSample);
-            float sum = 0.0f;
-            for (int i = 0; i < numSamples; ++i) {
-                float sample = rightData[i];
-                sum += sample * sample;
-            }
-            rightRMS = std::sqrt(sum / numSamples);
+    }
+    
+    transitionSamplesRemaining -= samplesToProcess;
+    
+    if (transitionSamplesRemaining <= 0) [[unlikely]] {
+        transitionBufferValid = false;
+        transitionSamplesRemaining = 0;
+        if (debugKeylock) [[unlikely]] {
+            std::cout << "[Transition] Crossfade completed to " 
+                      << (transitionToKeylock ? "KEYLOCK" : "NORMAL") << " mode" << std::endl;
         }
-        
-        float leftDb = leftRMS > 0.0f ? 20.0f * std::log10(leftRMS) : static_cast<float>(kDbMin);
-        float rightDb = rightRMS > 0.0f ? 20.0f * std::log10(rightRMS) : static_cast<float>(kDbMin);
-        
-        constexpr float kDbMinFloat = static_cast<float>(kDbMin);
-        constexpr float kDbMaxFloat = static_cast<float>(kDbMax);
-        constexpr float kDbRange = kDbMaxFloat - kDbMinFloat;
-        
-        float leftPercent = std::clamp(((leftDb - kDbMinFloat) / kDbRange) * 100.0f, 0.0f, 100.0f);
-        float rightPercent = std::clamp(((rightDb - kDbMinFloat) / kDbRange) * 100.0f, 0.0f, 100.0f);
-        
-        float currentLeft = leftChannelLevel.load();
-        float currentRight = rightChannelLevel.load();
-        
-        float newLeft = currentLeft * (1.0f - kSmoothingFactor) + leftPercent * kSmoothingFactor;
-        float newRight = currentRight * (1.0f - kSmoothingFactor) + rightPercent * kSmoothingFactor;
-        
-        leftChannelLevel.store(newLeft);
-        rightChannelLevel.store(newRight);
     }
 }
 
@@ -1039,11 +1104,11 @@ void DJAudioPlayer::setGain(double gain) {
 }
 
 [[nodiscard]] double DJAudioPlayer::effectiveSpeed() const noexcept {
-    double speed = currentSpeed * pitchBendRatio;
-    if (!std::isfinite(speed) || speed <= 0.0) [[unlikely]] {
-        return 1.0;
+    const double speed = currentSpeed * pitchBendRatio;
+    if (std::isfinite(speed) && speed > 0.0) [[likely]] {
+        return fastClamp(speed, kMinSpeedRatio, kMaxSpeedRatio);
     }
-    return std::clamp(speed, kMinSpeedRatio, kMaxSpeedRatio);
+    return 1.0;
 }
 
 void DJAudioPlayer::updateResampleRatio() noexcept {
@@ -1055,22 +1120,19 @@ void DJAudioPlayer::updateResampleRatio() noexcept {
 }
 
 void DJAudioPlayer::setSpeed(double ratio) {
-    if (ratio < 0.0 || ratio > 100.0) [[unlikely]] {
-        return;
-    }
+    if (ratio < 0.0 || ratio > 100.0) [[unlikely]] return;
     
     currentSpeed = ratio;
     updateResampleRatio();
 }
 
 void DJAudioPlayer::setPitchBendRatio(double ratio) noexcept {
-    if (!std::isfinite(ratio)) [[unlikely]] {
-        ratio = 1.0;
-    }
-    double clamped = std::clamp(ratio, kPitchBendMinRatio, kPitchBendMaxRatio);
-    if (std::abs(clamped - pitchBendRatio) < 1e-4) [[unlikely]] {
-        return;
-    }
+    constexpr double kEpsilon = 1e-4;
+    const double clamped = fastClamp(std::isfinite(ratio) ? ratio : 1.0, 
+                                     kPitchBendMinRatio, kPitchBendMaxRatio);
+    
+    if (std::abs(clamped - pitchBendRatio) < kEpsilon) [[unlikely]] return;
+    
     pitchBendRatio = clamped;
     updateResampleRatio();
 }
@@ -1228,6 +1290,13 @@ void DJAudioPlayer::start() {
             pausedResetPending.store(false);
             resumeCompensatePending = keylockEnabled;
             
+            fadeSamplesTotal = static_cast<int>(std::ceil((kFadeInMs / 1000.0) * currentSampleRate));
+            fadeSamplesRemaining = fadeSamplesTotal;
+            fadeStartGain = 0.0f;
+            fadeTargetGain = 1.0f;
+            startFadeActive = true;
+            stopFadeActive = false;
+            
             transportSource.start();
         }
     } catch (const std::exception& e) {
@@ -1239,6 +1308,13 @@ void DJAudioPlayer::start() {
 
 void DJAudioPlayer::stop() {
     try {
+        fadeSamplesTotal = static_cast<int>(std::ceil((kFadeOutMs / 1000.0) * currentSampleRate));
+        fadeSamplesRemaining = fadeSamplesTotal;
+        fadeStartGain = 1.0f;
+        fadeTargetGain = 0.0f;
+        stopFadeActive = true;
+        startFadeActive = false;
+        
         softPaused.store(true);
         pausedPosSec = transportSource.getCurrentPosition();
         pausedResetPending.store(true);
@@ -1359,21 +1435,10 @@ bool DJAudioPlayer::isPlaying() {
     return transportSource.isPlaying() && !softPaused.load() && !forceSilent.load();
 }
 
-void DJAudioPlayer::setHighGain(double v) noexcept {
-    highGain = std::clamp(v, -1.0, 1.0);
-}
-
-void DJAudioPlayer::setMidGain(double v) noexcept {
-    midGain = std::clamp(v, -1.0, 1.0);
-}
-
-void DJAudioPlayer::setLowGain(double v) noexcept {
-    lowGain = std::clamp(v, -1.0, 1.0);
-}
-
-void DJAudioPlayer::setFilterCutoff(double v) noexcept {
-    filterKnob = std::clamp(v, -1.0, 1.0);
-}
+void DJAudioPlayer::setHighGain(double v) noexcept { highGain = fastClamp(v, -1.0, 1.0); }
+void DJAudioPlayer::setMidGain(double v) noexcept { midGain = fastClamp(v, -1.0, 1.0); }
+void DJAudioPlayer::setLowGain(double v) noexcept { lowGain = fastClamp(v, -1.0, 1.0); }
+void DJAudioPlayer::setFilterCutoff(double v) noexcept { filterKnob = fastClamp(v, -1.0, 1.0); }
 
 void DJAudioPlayer::enableLoop(double startSec, double lengthSec) {
     if (lengthSec <= 0.0) [[unlikely]] { 
@@ -1528,15 +1593,12 @@ void DJAudioPlayer::setBeatInfo(double bpm, double firstBeatOffset, double track
 }
 
 [[nodiscard]] double DJAudioPlayer::quantizePosition(double positionSec) const noexcept {
-    if (!quantizeEnabled || trackBpm <= 0.0) [[unlikely]] {
-        return positionSec;
-    }
+    if (!quantizeEnabled || trackBpm <= 0.0) [[unlikely]] return positionSec;
     
-    double beatLengthSec = 60.0 / trackBpm;
-    double relativePos = positionSec - trackFirstBeatOffset;
+    const double beatLengthSec = 60.0 / trackBpm;
+    const double relativePos = positionSec - trackFirstBeatOffset;
+    const double beatNumber = std::round(relativePos / beatLengthSec);
     
-    double beatNumber = std::round(relativePos / beatLengthSec);
-    double quantizedPos = trackFirstBeatOffset + (beatNumber * beatLengthSec);
-    
-    return std::clamp(quantizedPos, 0.0, trackLengthSec);
+    return fastClamp(std::fma(beatNumber, beatLengthSec, trackFirstBeatOffset), 
+                     0.0, trackLengthSec);
 }

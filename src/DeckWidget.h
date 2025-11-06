@@ -54,6 +54,7 @@ public:
 
     void setTrackNameDisplay(const QString& text, const QString& tooltip = QString());
     void setTrackInfoDisplay(const QString& text, const QString& style = QString(), const QString& tooltip = QString());
+    void setCoverArt(const QByteArray& imageData, const QString& format); // NEW: Set cover art
     void setScratchEngine(ScratchEngine* engine);
     ScratchEngine* getScratchEngine() const { return scratchEngine; }
     
@@ -105,6 +106,8 @@ private:
     QLabel* deckTitleLabel;
     QLabel* songNameLabel;
     QLabel* trackInfoLabel;
+    QLabel* coverArtLabel;      // Cover art placeholder (top)
+    QLabel* coverArtLabelWave;  // Cover art placeholder (waveform row)
     QPushButton* playPauseBtn;
     QPushButton* loadBtn;
     QPushButton* unloadBtn;

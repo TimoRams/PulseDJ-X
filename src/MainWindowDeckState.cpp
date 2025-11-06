@@ -175,6 +175,32 @@ void QtMainWindow::applyStoredBeatGrid(QtDeckWidget* deck, bool isDeckA)
 	updateOverviewLabel(isDeckA);
 }
 
+// NEW: Load and apply cover art from database
+void QtMainWindow::loadAndApplyCoverArt(QtDeckWidget* deck, bool isDeckA)
+{
+	if (!deck || !libraryManager)
+		return;
+
+	const QString filePath = deck->getCurrentFilePath();
+	if (filePath.isEmpty())
+		return;
+
+	auto trackInfo = libraryManager->getTrackInfo(filePath);
+	if (!trackInfo)
+		return;
+
+	const TrackInfo& track = *trackInfo;
+	if (track.hasCoverArt())
+	{
+		deck->setCoverArt(track.coverArtData, track.coverArtFormat);
+	}
+	else
+	{
+		// No cover art - reset to placeholder
+		deck->setCoverArt(QByteArray(), QString());
+	}
+}
+
 void QtMainWindow::reapplyStoredDeckMetadata(bool isDeckA)
 {
 	QtDeckWidget* deck = isDeckA ? deckA : deckB;

@@ -264,9 +264,10 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
 
     QSqlQuery query(db);
     if (!query.exec(QStringLiteral(
-        "SELECT file_path, title, artist, album, genre, year, duration, bpm, file_size, comment, track_key, file_modified, added_at, updated_at, "
+        "SELECT file_path, title, artist, album, genre, year, duration, bpm, bitrate, file_size, comment, track_key, file_modified, added_at, updated_at, "
         "analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points, "
-        "waveform_max_bins, waveform_min_bins, waveform_audio_start_offset, waveform_analyzed_at "
+        "waveform_max_bins, waveform_min_bins, waveform_audio_start_offset, waveform_analyzed_at, "
+        "cover_art_data, cover_art_format "
         "FROM tracks ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE")))
     {
     std::cerr << "LibraryDatabase loadAllTracks failed: "
@@ -285,6 +286,7 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
     const int idxYear = record.indexOf("year");
     const int idxDuration = record.indexOf("duration");
     const int idxBpm = record.indexOf("bpm");
+    const int idxBitrate = record.indexOf("bitrate");
     const int idxFileSize = record.indexOf("file_size");
     const int idxComment = record.indexOf("comment");
     const int idxTrackKey = record.indexOf("track_key");
@@ -302,6 +304,8 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
     const int idxWaveformMinBins = record.indexOf("waveform_min_bins");
     const int idxWaveformAudioStartOffset = record.indexOf("waveform_audio_start_offset");
     const int idxWaveformAnalyzedAt = record.indexOf("waveform_analyzed_at");
+    const int idxCoverArtData = record.indexOf("cover_art_data");
+    const int idxCoverArtFormat = record.indexOf("cover_art_format");
 
     while (query.next())
     {
@@ -313,6 +317,7 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
         track.year = query.value(idxYear).toString();
         track.duration = query.value(idxDuration).toDouble();
         track.bpm = query.value(idxBpm).toDouble();
+        track.bitrate = query.value(idxBitrate).toInt();
         track.fileSize = query.value(idxFileSize).toLongLong();
         track.comment = query.value(idxComment).toString();
         track.key = query.value(idxTrackKey).toString();
@@ -342,6 +347,10 @@ QVector<TrackInfo> LibraryDatabase::loadAllTracks() const
         track.waveformAudioStartOffset = query.value(idxWaveformAudioStartOffset).toDouble();
         track.waveformAnalyzedAt = query.value(idxWaveformAnalyzedAt).toLongLong();
         
+        // COVER ART: Load cover art data if available
+        track.coverArtData = query.value(idxCoverArtData).toByteArray();
+        track.coverArtFormat = query.value(idxCoverArtFormat).toString();
+        
         if (track.trackLengthSeconds <= 0.0)
             track.trackLengthSeconds = track.duration;
         if (track.duration <= 0.0 && track.trackLengthSeconds > 0.0)
@@ -363,8 +372,9 @@ std::optional<TrackInfo> LibraryDatabase::loadTrackByPath(const QString& filePat
 
     QSqlQuery query(db);
     query.prepare(QStringLiteral(
-        "SELECT file_path, title, artist, album, genre, year, duration, bpm, file_size, comment, track_key, file_modified, added_at, updated_at, "
-        "analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points "
+        "SELECT file_path, title, artist, album, genre, year, duration, bpm, bitrate, file_size, comment, track_key, file_modified, added_at, updated_at, "
+        "analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points, "
+        "cover_art_data, cover_art_format "
         "FROM tracks WHERE file_path = :file_path"));
     query.bindValue(QStringLiteral(":file_path"), filePath);
 
@@ -380,6 +390,7 @@ std::optional<TrackInfo> LibraryDatabase::loadTrackByPath(const QString& filePat
     const int idxYear = record.indexOf("year");
     const int idxDuration = record.indexOf("duration");
     const int idxBpm = record.indexOf("bpm");
+    const int idxBitrate = record.indexOf("bitrate");
     const int idxFileSize = record.indexOf("file_size");
     const int idxComment = record.indexOf("comment");
     const int idxTrackKey = record.indexOf("track_key");
@@ -393,6 +404,8 @@ std::optional<TrackInfo> LibraryDatabase::loadTrackByPath(const QString& filePat
     const int idxBeatGrid = record.indexOf("beat_grid");
     const int idxAnalysisFailed = record.indexOf("analysis_failed");
     const int idxCuePoints = record.indexOf("cue_points");
+    const int idxCoverArtData = record.indexOf("cover_art_data");
+    const int idxCoverArtFormat = record.indexOf("cover_art_format");
 
     if (!query.next())
         return std::nullopt;
@@ -405,6 +418,7 @@ std::optional<TrackInfo> LibraryDatabase::loadTrackByPath(const QString& filePat
     track.year = query.value(idxYear).toString();
     track.duration = query.value(idxDuration).toDouble();
     track.bpm = query.value(idxBpm).toDouble();
+    track.bitrate = query.value(idxBitrate).toInt();
     track.fileSize = query.value(idxFileSize).toLongLong();
     track.comment = query.value(idxComment).toString();
     track.key = query.value(idxTrackKey).toString();
@@ -428,6 +442,10 @@ std::optional<TrackInfo> LibraryDatabase::loadTrackByPath(const QString& filePat
             break;
         }
     }
+    
+    // COVER ART: Load cover art data if available
+    track.coverArtData = query.value(idxCoverArtData).toByteArray();
+    track.coverArtFormat = query.value(idxCoverArtFormat).toString();
 
     if (track.trackLengthSeconds <= 0.0)
         track.trackLengthSeconds = track.duration;
@@ -452,10 +470,11 @@ bool LibraryDatabase::upsertTrack(const TrackInfo& track)
 
     QSqlQuery update(db);
     update.prepare(QStringLiteral(
-        "UPDATE tracks SET title=:title, artist=:artist, album=:album, genre=:genre, year=:year, duration=:duration, bpm=:bpm, "
+        "UPDATE tracks SET title=:title, artist=:artist, album=:album, genre=:genre, year=:year, duration=:duration, bpm=:bpm, bitrate=:bitrate, "
         "file_size=:file_size, comment=:comment, track_key=:track_key, file_modified=:file_modified, updated_at=:updated_at, "
         "analyzed_at=:analyzed_at, analysis_algorithm=:analysis_algorithm, first_beat_offset=:first_beat_offset, "
-        "track_length=:track_length, beat_grid=:beat_grid, analysis_failed=:analysis_failed, cue_points=:cue_points "
+        "track_length=:track_length, beat_grid=:beat_grid, analysis_failed=:analysis_failed, cue_points=:cue_points, "
+        "cover_art_data=:cover_art_data, cover_art_format=:cover_art_format "
         "WHERE file_path=:file_path"));
     update.bindValue(QStringLiteral(":title"), track.title);
     update.bindValue(QStringLiteral(":artist"), track.artist);
@@ -464,6 +483,7 @@ bool LibraryDatabase::upsertTrack(const TrackInfo& track)
     update.bindValue(QStringLiteral(":year"), track.year);
     update.bindValue(QStringLiteral(":duration"), track.duration);
     update.bindValue(QStringLiteral(":bpm"), track.bpm);
+    update.bindValue(QStringLiteral(":bitrate"), track.bitrate);
     update.bindValue(QStringLiteral(":file_size"), track.fileSize);
     update.bindValue(QStringLiteral(":comment"), track.comment);
     update.bindValue(QStringLiteral(":track_key"), track.key);
@@ -476,6 +496,8 @@ bool LibraryDatabase::upsertTrack(const TrackInfo& track)
     update.bindValue(QStringLiteral(":beat_grid"), serializeBeats(track.beatPositions));
     update.bindValue(QStringLiteral(":analysis_failed"), track.analysisFailed ? 1 : 0);
     update.bindValue(QStringLiteral(":cue_points"), serializeCuePoints(track.cuePoints));
+    update.bindValue(QStringLiteral(":cover_art_data"), track.coverArtData);
+    update.bindValue(QStringLiteral(":cover_art_format"), track.coverArtFormat);
     update.bindValue(QStringLiteral(":file_path"), track.filePath);
 
     if (!execOrLog(update, "update track"))
@@ -486,10 +508,12 @@ bool LibraryDatabase::upsertTrack(const TrackInfo& track)
 
     QSqlQuery insert(db);
     insert.prepare(QStringLiteral(
-        "INSERT INTO tracks (file_path, file_name, title, artist, album, genre, year, duration, bpm, file_size, comment, track_key, "
-        "file_modified, added_at, updated_at, analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points) "
-        "VALUES (:file_path, :file_name, :title, :artist, :album, :genre, :year, :duration, :bpm, :file_size, :comment, :track_key, "
-        ":file_modified, :added_at, :updated_at, :analyzed_at, :analysis_algorithm, :first_beat_offset, :track_length, :beat_grid, :analysis_failed, :cue_points)"));
+        "INSERT INTO tracks (file_path, file_name, title, artist, album, genre, year, duration, bpm, bitrate, file_size, comment, track_key, "
+        "file_modified, added_at, updated_at, analyzed_at, analysis_algorithm, first_beat_offset, track_length, beat_grid, analysis_failed, cue_points, "
+        "cover_art_data, cover_art_format) "
+        "VALUES (:file_path, :file_name, :title, :artist, :album, :genre, :year, :duration, :bpm, :bitrate, :file_size, :comment, :track_key, "
+        ":file_modified, :added_at, :updated_at, :analyzed_at, :analysis_algorithm, :first_beat_offset, :track_length, :beat_grid, :analysis_failed, :cue_points, "
+        ":cover_art_data, :cover_art_format)"));
     insert.bindValue(QStringLiteral(":file_path"), track.filePath);
     insert.bindValue(QStringLiteral(":file_name"), QFileInfo(track.filePath).fileName());
     insert.bindValue(QStringLiteral(":title"), track.title);
@@ -499,6 +523,7 @@ bool LibraryDatabase::upsertTrack(const TrackInfo& track)
     insert.bindValue(QStringLiteral(":year"), track.year);
     insert.bindValue(QStringLiteral(":duration"), track.duration);
     insert.bindValue(QStringLiteral(":bpm"), track.bpm);
+    insert.bindValue(QStringLiteral(":bitrate"), track.bitrate);
     insert.bindValue(QStringLiteral(":file_size"), track.fileSize);
     insert.bindValue(QStringLiteral(":comment"), track.comment);
     insert.bindValue(QStringLiteral(":track_key"), track.key);
@@ -512,6 +537,8 @@ bool LibraryDatabase::upsertTrack(const TrackInfo& track)
     insert.bindValue(QStringLiteral(":beat_grid"), serializeBeats(track.beatPositions));
     insert.bindValue(QStringLiteral(":analysis_failed"), track.analysisFailed ? 1 : 0);
     insert.bindValue(QStringLiteral(":cue_points"), serializeCuePoints(track.cuePoints));
+    insert.bindValue(QStringLiteral(":cover_art_data"), track.coverArtData);
+    insert.bindValue(QStringLiteral(":cover_art_format"), track.coverArtFormat);
 
     return execOrLog(insert, "insert track");
 }
@@ -1208,6 +1235,7 @@ bool LibraryDatabase::createSchema()
             "year TEXT,"
             "duration REAL DEFAULT 0,"
             "bpm REAL DEFAULT 0,"
+            "bitrate INTEGER DEFAULT 0,"
             "file_size INTEGER DEFAULT 0,"
             "comment TEXT,"
             "track_key TEXT,"
@@ -1226,7 +1254,9 @@ bool LibraryDatabase::createSchema()
             "waveform_max_bins BLOB,"
             "waveform_min_bins BLOB,"
             "waveform_audio_start_offset REAL DEFAULT 0,"
-            "waveform_analyzed_at INTEGER DEFAULT 0"
+            "waveform_analyzed_at INTEGER DEFAULT 0,"
+            "cover_art_data BLOB,"
+            "cover_art_format TEXT"
             ")")))
     {
     std::cerr << "LibraryDatabase: failed to create tracks table: "
@@ -1242,6 +1272,55 @@ bool LibraryDatabase::createSchema()
 
     QSqlQuery idxTitle(db);
     idxTitle.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title COLLATE NOCASE)"));
+
+    // Migration: Add bitrate column if it doesn't exist
+    QSqlQuery checkBitrate(db);
+    checkBitrate.exec(QStringLiteral("PRAGMA table_info(tracks)"));
+    bool hasBitrate = false;
+    while (checkBitrate.next()) {
+        if (checkBitrate.value(1).toString() == "bitrate") {
+            hasBitrate = true;
+            break;
+        }
+    }
+    if (!hasBitrate) {
+        QSqlQuery addBitrate(db);
+        if (!addBitrate.exec(QStringLiteral("ALTER TABLE tracks ADD COLUMN bitrate INTEGER DEFAULT 0"))) {
+            std::cerr << "LibraryDatabase: Warning - could not add bitrate column: "
+                      << addBitrate.lastError().text().toStdString() << std::endl;
+        } else {
+            std::cout << "LibraryDatabase: Added bitrate column to tracks table" << std::endl;
+        }
+    }
+    
+    // Migration: Add cover art columns if they don't exist
+    QSqlQuery checkCoverArt(db);
+    checkCoverArt.exec(QStringLiteral("PRAGMA table_info(tracks)"));
+    bool hasCoverArtData = false;
+    bool hasCoverArtFormat = false;
+    while (checkCoverArt.next()) {
+        QString colName = checkCoverArt.value(1).toString();
+        if (colName == "cover_art_data") hasCoverArtData = true;
+        if (colName == "cover_art_format") hasCoverArtFormat = true;
+    }
+    if (!hasCoverArtData) {
+        QSqlQuery addCoverArtData(db);
+        if (!addCoverArtData.exec(QStringLiteral("ALTER TABLE tracks ADD COLUMN cover_art_data BLOB"))) {
+            std::cerr << "LibraryDatabase: Warning - could not add cover_art_data column: "
+                      << addCoverArtData.lastError().text().toStdString() << std::endl;
+        } else {
+            std::cout << "LibraryDatabase: Added cover_art_data column to tracks table" << std::endl;
+        }
+    }
+    if (!hasCoverArtFormat) {
+        QSqlQuery addCoverArtFormat(db);
+        if (!addCoverArtFormat.exec(QStringLiteral("ALTER TABLE tracks ADD COLUMN cover_art_format TEXT"))) {
+            std::cerr << "LibraryDatabase: Warning - could not add cover_art_format column: "
+                      << addCoverArtFormat.lastError().text().toStdString() << std::endl;
+        } else {
+            std::cout << "LibraryDatabase: Added cover_art_format column to tracks table" << std::endl;
+        }
+    }
 
     if (!ensurePlaylistTables(db))
         return false;

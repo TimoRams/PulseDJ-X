@@ -44,6 +44,7 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
             case AlbumColumn: return track->album.isEmpty() ? "Unknown Album" : track->album;
             case DurationColumn: return track->getDurationString();
             case BpmColumn: return track->getBpmString();
+            case BitrateColumn: return track->getBitrateString();
             case GenreColumn: return track->genre.isEmpty() ? "Unknown" : track->genre;
             case YearColumn: return track->year.isEmpty() ? "--" : track->year;
             case FileSizeColumn: return track->getFileSizeString();
@@ -75,6 +76,7 @@ QVariant LibraryTableModel::data(const QModelIndex& index, int role) const
                 return int(Qt::AlignCenter);
             case DurationColumn:
             case BpmColumn:
+            case BitrateColumn:
             case YearColumn:
             case FileSizeColumn:
                 return int(Qt::AlignRight | Qt::AlignVCenter);
@@ -98,6 +100,7 @@ QVariant LibraryTableModel::headerData(int section, Qt::Orientation orientation,
             case AlbumColumn: return tr("Album");
             case DurationColumn: return tr("Duration");
             case BpmColumn: return tr("BPM");
+            case BitrateColumn: return tr("Bitrate");
             case GenreColumn: return tr("Genre");
             case YearColumn: return tr("Year");
             case FileSizeColumn: return tr("Size");
@@ -125,6 +128,7 @@ void LibraryTableModel::sort(int column, Qt::SortOrder order)
         case AlbumColumn:   mode = SortByAlbum; break;
         case DurationColumn:mode = SortByDuration; break;
         case BpmColumn:     mode = SortByBpm; break;
+        case BitrateColumn: mode = SortByBitrate; break;
         case GenreColumn:   mode = SortByGenre; break;
         case YearColumn:    mode = SortByYear; break;
         case FileSizeColumn:mode = SortByFileSize; break;
@@ -320,6 +324,8 @@ bool LibraryTableModel::isLessThan(const TrackInfo* a, const TrackInfo* b) const
             return a->duration < b->duration;
         case SortByBpm:
             return a->bpm < b->bpm;
+        case SortByBitrate:
+            return a->bitrate < b->bitrate;
         case SortByGenre:
             return QString::compare(a->genre, b->genre, Qt::CaseInsensitive) < 0;
         case SortByYear:

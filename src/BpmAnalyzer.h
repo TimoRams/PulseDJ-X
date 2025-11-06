@@ -24,8 +24,8 @@ public:
                        double* outFirstBeatOffset = nullptr,
                        ProgressFn progress = nullptr,
                        StatusFn errorOut = nullptr,
-                       double minBpm = 40.0,
-                       double maxBpm = 260.0);
+                       double minBpm = 78.0,    // OPTIMIZED: Standard range for modern music
+                       double maxBpm = 155.0);  // Covers Hip-Hop to Techno
 
     // NEW: Set whether this analyzer should update the global beat grid
     void setUpdateGlobalBeatGrid(bool update) { updateGlobalGrid = update; }

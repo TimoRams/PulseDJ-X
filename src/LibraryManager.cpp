@@ -123,7 +123,8 @@ void LibraryManager::setupUI()
 {
     static constexpr auto kLibraryStyleSheet = 
         "QWidget{background:#101114;color:#f0f0f0}"
-        "QSplitter::handle{background:#23262e;width:2px}"
+        "QSplitter::handle{background:#23262e;width:1px}"
+        "QSplitter::handle:hover{background:#4188ff;width:4px}"
         /* Menus (dropdowns) fully square and compact */
         "QMenu{background:#181b22;border:1px solid #242832;border-radius:0px;padding:0}"
         "QMenu::item{padding:4px 8px;color:#d8dce8;background:transparent;border-radius:0px}"
@@ -186,7 +187,7 @@ void LibraryManager::setupUI()
 
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setSpacing(5);
-    mainLayout->setContentsMargins(6, 6, 6, 6);
+    mainLayout->setContentsMargins(0, 0, 0, 0);
 
     mainSplitter = new QSplitter(Qt::Horizontal, this);
     mainSplitter->setChildrenCollapsible(false);
@@ -1652,6 +1653,7 @@ void LibraryManager::autoSizeColumnsInitial()
     clamp(LibraryTableModel::AlbumColumn,    240);
     clamp(LibraryTableModel::DurationColumn, 80);
     clamp(LibraryTableModel::BpmColumn,      80);
+    clamp(LibraryTableModel::BitrateColumn,  100);
     clamp(LibraryTableModel::GenreColumn,    180);
     clamp(LibraryTableModel::YearColumn,     80);
     clamp(LibraryTableModel::FileSizeColumn, 110);

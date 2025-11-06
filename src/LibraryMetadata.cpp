@@ -1,5 +1,6 @@
 #include "LibraryManager.h"
 #include "AudioFormatGuard.h"
+#include "CoverArtExtractor.h"
 
 #include <QByteArray>
 #include <QDateTime>
@@ -8,6 +9,7 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QRegularExpression>
+#include <QImage>
 
 #include <cstring>
 #include <memory>
@@ -376,6 +378,11 @@ TrackInfo ID3LoaderThread::loadTrackInfo (const QString& filePath)
                     track.duration = reader->lengthInSamples / reader->sampleRate;
                     track.trackLengthSeconds = track.duration;
                 }
+                
+                if (reader->bitsPerSample > 0 && reader->sampleRate > 0 && reader->numChannels > 0)
+                {
+                    track.bitrate = static_cast<int>((reader->bitsPerSample * reader->sampleRate * reader->numChannels) / 1000);
+                }
 
                 const auto metadataMap = buildMetadataLookup (reader->metadataValues);
 
@@ -418,6 +425,14 @@ TrackInfo ID3LoaderThread::loadTrackInfo (const QString& filePath)
     catch (const std::exception& e)
     {
         qWarning() << "Error loading metadata for" << filePath << ":" << e.what();
+    }
+    
+    // COVER ART EXTRACTION: Extract embedded artwork using TagLib
+    auto [coverData, coverFormat] = CoverArtExtractor::extractCoverArt(filePath);
+    if (!coverData.isEmpty())
+    {
+        track.coverArtData = coverData;
+        track.coverArtFormat = coverFormat;
     }
 
     applyId3v1Fallback (id3v1Tag, track);

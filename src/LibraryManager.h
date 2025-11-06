@@ -63,6 +63,7 @@ struct TrackInfo {
     double duration = 0.0; // in seconds
     double bpm = 0.0;
     QString key;
+    int bitrate = 0; // in kbps
     qint64 fileSize = 0;
     QString comment;
     qint64 lastModified = 0;
@@ -82,6 +83,10 @@ struct TrackInfo {
     std::vector<float> waveformMinBins;
     double waveformAudioStartOffset = 0.0;
     qint64 waveformAnalyzedAt = 0;
+    
+    // COVER ART: Store album artwork as image data
+    QByteArray coverArtData;  // Image data (JPEG/PNG)
+    QString coverArtFormat;   // Image format ("JPEG", "PNG", etc.)
     
     TrackInfo() { cuePoints.fill(-1.0); }
     TrackInfo(const QString& path) : filePath(path) { cuePoints.fill(-1.0); }
@@ -124,6 +129,11 @@ struct TrackInfo {
         }
         return QString("%1 %2").arg(QString::number(size, 'f', 1)).arg(units[unitIndex]);
     }
+    
+    // Get bitrate string
+    QString getBitrateString() const {
+        return bitrate > 0 ? QString("%1 kbps").arg(bitrate) : "--";
+    }
 
     bool hasBeatGrid() const {
         return analyzedAt > 0 && !beatPositions.isEmpty();
@@ -131,6 +141,10 @@ struct TrackInfo {
     
     bool hasWaveformCache() const {
         return waveformAnalyzedAt > 0 && !waveformMaxBins.empty() && !waveformMinBins.empty();
+    }
+    
+    bool hasCoverArt() const {
+        return !coverArtData.isEmpty();
     }
 
     bool isFileMissing() const {
@@ -176,6 +190,7 @@ public:
         AlbumColumn,
         DurationColumn,
         BpmColumn,
+        BitrateColumn,
         GenreColumn,
         YearColumn,
         FileSizeColumn,
@@ -189,6 +204,7 @@ public:
         SortByAlbum,
         SortByDuration,
         SortByBpm,
+        SortByBitrate,
         SortByGenre,
         SortByYear,
         SortByFileSize
