@@ -46,6 +46,73 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setStyleSheet("QtMainWindow { background-color: #141a1f; border: none; }");
     
+    // Apply modern auto-hide scrollbar style globally
+    if (auto* app = qobject_cast<QApplication*>(QApplication::instance())) {
+        app->setStyleSheet(
+            // Modern thin scrollbars - small and transparent by default
+            "QScrollBar:vertical {"
+            "    background: transparent;"
+            "    width: 8px;"
+            "    margin: 0px;"
+            "    border: none;"
+            "}"
+            "QScrollBar::handle:vertical {"
+            "    background: rgba(255, 255, 255, 0.15);"
+            "    min-height: 20px;"
+            "    border-radius: 4px;"
+            "    margin: 2px;"
+            "}"
+            "QScrollBar::handle:vertical:hover {"
+            "    background: rgba(255, 255, 255, 0.35);"
+            "}"
+            "QScrollBar::handle:vertical:pressed {"
+            "    background: rgba(255, 255, 255, 0.5);"
+            "}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            "    height: 0px;"
+            "    background: none;"
+            "}"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+            "    background: none;"
+            "}"
+            // Horizontal scrollbar
+            "QScrollBar:horizontal {"
+            "    background: transparent;"
+            "    height: 8px;"
+            "    margin: 0px;"
+            "    border: none;"
+            "}"
+            "QScrollBar::handle:horizontal {"
+            "    background: rgba(255, 255, 255, 0.15);"
+            "    min-width: 20px;"
+            "    border-radius: 4px;"
+            "    margin: 2px;"
+            "}"
+            "QScrollBar::handle:horizontal:hover {"
+            "    background: rgba(255, 255, 255, 0.35);"
+            "}"
+            "QScrollBar::handle:horizontal:pressed {"
+            "    background: rgba(255, 255, 255, 0.5);"
+            "}"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {"
+            "    width: 0px;"
+            "    background: none;"
+            "}"
+            "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {"
+            "    background: none;"
+            "}"
+            // Expand on hover for better usability
+            "QScrollBar:vertical:hover {"
+            "    width: 12px;"
+            "    background: rgba(0, 0, 0, 0.2);"
+            "}"
+            "QScrollBar:horizontal:hover {"
+            "    height: 12px;"
+            "    background: rgba(0, 0, 0, 0.2);"
+            "}"
+        );
+    }
+    
     menuBar = new MenuBar(this);
     
     if (!sharedFormatManager) {
@@ -591,8 +658,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     // Style the overview waveforms (increase height ~2x as requested)
     overviewTopA->setFixedHeight(70);
     overviewTopB->setFixedHeight(70);
-    overviewTopA->setStyleSheet("border: 1px solid #333; background-color: #0a0a0a;");
-    overviewTopB->setStyleSheet("border: 1px solid #333; background-color: #0a0a0a;");
+    overviewTopA->setStyleSheet("border: none; background-color: #0a0a0a;");
+    overviewTopB->setStyleSheet("border: none; background-color: #0a0a0a;");
 
     overviewLayout->setSpacing(0);
     overviewLayout->setContentsMargins(0, 0, 0, 0);
@@ -734,7 +801,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     auto mixerWidget = new QWidget(this);
     mixerWidget->setLayout(mixerSection);
     mixerWidget->setFixedWidth(120);
-    mixerWidget->setStyleSheet("background-color: #2a2a2a; border: 1px solid #555; border-radius: 0px;");
+    mixerWidget->setStyleSheet("background-color: #2a2a2a; border: none;");
     
     decksLayout->addWidget(mixerWidget, 1);
     decksLayout->addWidget(deckB->getControlsWidget(), 2);

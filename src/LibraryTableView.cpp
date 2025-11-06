@@ -45,7 +45,28 @@ LibraryTableView::LibraryTableView(QWidget* parent)
     setColumnWidth(LibraryTableModel::FileSizeColumn, 70);
     setSortingEnabled(true);
     sortByColumn(LibraryTableModel::TitleColumn, Qt::AscendingOrder);
-    setStyleSheet("QTableView { background: #181a1b; color: #e0e0e0; alternate-background-color: #202224; selection-background-color: #2d5aa0; border: none; gridline-color: #2a2d2e; } QHeaderView::section { background: #23272a; color: #e0e0e0; border: none; padding: 4px; font-weight: 600; } QTableView::item { padding-left: 6px; padding-right: 6px; }");
+    setStyleSheet(
+        "QTableView { "
+        "    background: #181a1b; "
+        "    color: #e0e0e0; "
+        "    alternate-background-color: #202224; "
+        "    selection-background-color: #2d5aa0; "
+        "    border: none; "
+        "    gridline-color: transparent; "
+        "} "
+        "QHeaderView::section { "
+        "    background: #23272a; "
+        "    color: #e0e0e0; "
+        "    border: none; "
+        "    padding: 4px; "
+        "    font-weight: 600; "
+        "} "
+        "QTableView::item { "
+        "    padding-left: 6px; "
+        "    padding-right: 6px; "
+        "    border: none; "
+        "}"
+    );
 }
 
 void LibraryTableView::startDrag(Qt::DropActions supportedActions)
