@@ -10,6 +10,10 @@
 #include <memory>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <atomic>
+#include <cstdint>
+#include <vector>
+#include <chrono>
 #include "DeckWaveformOverview.h"
 #include "TurntableWidget.h"
 #include "PerformancePads.h"
@@ -97,6 +101,13 @@ private slots:
     void setTempoRangePm16();
     void setTempoRangeWide();
     void updateTempoControlsForRange();
+    void handleOverviewWaveformResult(std::uint64_t generation,
+                                      std::shared_ptr<std::vector<float>> amplitudes,
+                                      std::shared_ptr<std::vector<float>> colours,
+                                      double audioStart,
+                                      double lengthSec);
+    bool isWaveformGenerationCurrent(std::uint64_t generation) const noexcept;
+    void resetDeckUiToEmptyState();
 
 private:
     DJAudioPlayer* player;
@@ -132,7 +143,7 @@ private:
     bool isCueing{false}; // True when cue button is held down
     QTimer* cueClickTimer; // Timer for detecting double-clicks on cue
     bool cueClickPending{false}; // True when waiting for potential second click
-    qint64 lastPlayPressTime{0}; // Timestamp of last play button press
+    std::chrono::steady_clock::time_point lastPlayPressTime{};
     // Dynamic tempo range
     double minTempoFactor{0.8400};
     double maxTempoFactor{1.1600};
@@ -143,6 +154,7 @@ private:
     double lastLoopStart{-1.0};
     double lastLoopEnd{-1.0};
     ScratchEngine* scratchEngine{nullptr};
+    std::atomic<std::uint64_t> waveformTaskGeneration{0};
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;

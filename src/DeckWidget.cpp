@@ -11,15 +11,29 @@
 #include <QMimeData>
 #include <algorithm>
 #include <cmath>
+#include <ranges>
+#include <span>
+#include <utility>
 #include <QRunnable>
 #include <QThreadPool>
 #include <QThread>
 #include <QPointer>
 #include <chrono>
-#include <thread>
 #include <iostream>
 #include <QAction>
 #include <QPoint>
+
+namespace {
+    using namespace std::chrono_literals;
+
+    constexpr auto kStatusTimerInterval = 100ms;
+    constexpr auto kPlayToggleDebounce = 50ms;
+    constexpr auto kCueDoubleClickWindow = 300ms;
+    constexpr auto kPlayStateGuardWindow = 500ms;
+    constexpr int kSmallOverviewBinCount = 4000;
+    constexpr int kPlayStateSyncStride = 50;
+    constexpr double kPrerollRelativePosition = -0.5;
+}
 
 QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QString& deckTitle, bool isLeftDeck)
     : QWidget(parent), player(player_)
@@ -27,19 +41,15 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     qDebug() << "QtDeckWidget constructor called for" << deckTitle << "isLeftDeck:" << isLeftDeck;
     std::cout << "=== QtDeckWidget constructor for " << deckTitle.toStdString() << " ===" << std::endl;
     waveform = new DeckWaveformOverview(this);
-    
-    // Initialize status timer for play state synchronization
+
     statusTimer = new QTimer(this);
     connect(statusTimer, &QTimer::timeout, this, &QtDeckWidget::syncPlayState);
-    // UPDATED: Use faster interval for responsive loop visualization
-    statusTimer->start(100); // Check every 100ms for responsive loop updates
-    
-    // Initialize cue click timer for double-click detection
+    statusTimer->start(static_cast<int>(kStatusTimerInterval.count()));
+
     cueClickTimer = new QTimer(this);
     cueClickTimer->setSingleShot(true);
     connect(cueClickTimer, &QTimer::timeout, this, [this]() { cueClickPending = false; });
     
-    // Create separate controls widget
     controlsWidget = new QWidget(this);
     controlsWidget->setStyleSheet("background-color: #1a1a1a; border: 1px solid #333;");
     
@@ -61,7 +71,6 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     trackInfoLabel->setStyleSheet("font-size: 11px; color: #b8bfd0; padding: 0px;");
     trackInfoLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 
-    // Cover art placeholder (single box spanning both header and waveform rows)
     coverArtLabel = new QLabel(controlsWidget);
     coverArtLabel->setFixedSize(60, 60);  // Square that spans both rows
     coverArtLabel->setStyleSheet("background-color: #1a1a1a; border: 1px solid #444; border-radius: 2px;");
@@ -70,7 +79,6 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     coverArtLabel->setToolTip("Album Cover Art");
     coverArtLabel->setScaledContents(false);  // Don't stretch - we'll scale manually
     
-    // Second label not needed - using only one cover art per deck
     coverArtLabelWave = nullptr;
 
     turntable = new QtTurntableWidget(controlsWidget);
@@ -89,7 +97,6 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     bpmCurrentLabel = new QLabel("Curr: --", controlsWidget);
     speedLabel = new QLabel("Speed", controlsWidget);
 
-    // Style the controls (more compact)
     playPauseBtn->setStyleSheet("QPushButton { background-color: #0066cc; color: white; border: none; padding: 4px; font-weight: bold; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #0052a3; }");
     loadBtn->setStyleSheet("QPushButton { background-color: #666; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #777; }");
     cueBtn->setStyleSheet("QPushButton { background-color: #ff6600; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #e55a00; }");
@@ -100,16 +107,13 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     tempoRangeBtn->setFixedSize(42, 18); // keep size constant regardless of label
     syncBtn->setStyleSheet("QPushButton { background-color: #008844; color: white; border: none; padding: 4px; border-radius: 0px; font-size: 10px; } QPushButton:hover { background-color: #00733a; } QPushButton:checked { background-color: #00aa55; }");
     
-    // Make keylock and quantize buttons checkable
     keylockBtn->setCheckable(true);
     quantizeBtn->setCheckable(true);
     
-    // Add tooltips
     keylockBtn->setToolTip("Keylock - maintains original pitch when speed changes");
     quantizeBtn->setToolTip("Quantize - snaps cues and loops to nearest beat");
     syncBtn->setToolTip("Sync tempo & phase to the other deck");
     
-    // Tempo fader: ±16% with 0.001 precision via slider (defaults; dynamic range supported)
     speedSlider->setRange(840, 1160);     // store factor*1000
     speedSlider->setSingleStep(1);        // 0.001 per step
     speedSlider->setPageStep(5);          // 0.005 per page
@@ -123,6 +127,8 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     tempoSpin->setSingleStep(0.0005);
     tempoSpin->setValue(1.0000);
     tempoSpin->setKeyboardTracking(false);
+
+    playPauseBtn->setEnabled(false);
     
     speedLabel->setStyleSheet("color: #fff; font-size: 9px; font-weight: bold;");
     bpmDefaultLabel->setStyleSheet("color: #0088ff; font-size: 9px; font-weight: bold;");
@@ -176,20 +182,16 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     controlsLayout->setSpacing(2);  // Reduced from 3
     controlsLayout->setContentsMargins(4, 4, 4, 4);  // Reduced from 6
     
-    // Combined row: Cover art + (Header row + Waveform row stacked)
     auto topSection = new QHBoxLayout;
     topSection->setSpacing(4);
     topSection->setContentsMargins(0, 0, 0, 0);
     
-    // Cover art on the left (spans full height)
     topSection->addWidget(coverArtLabel, 0, Qt::AlignTop);
     
-    // Right side: Header and waveform stacked vertically
     auto rightStack = new QVBoxLayout;
     rightStack->setSpacing(2);
     rightStack->setContentsMargins(0, 0, 0, 0);
     
-    // Header row: Title and track name
     auto headerRow = new QWidget(controlsWidget);
     headerRow->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto headerRowLayout = new QHBoxLayout(headerRow);
@@ -200,7 +202,6 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     headerRowLayout->addWidget(trackInfoLabel, 0);
     rightStack->addWidget(headerRow);
     
-    // Waveform overview (more compact)
     waveform->setFixedHeight(25);
     waveform->setStyleSheet("border: 1px solid #444; border-radius: 0px;");
     rightStack->addWidget(waveform);
@@ -210,13 +211,9 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     waveform->setAcceptDrops(true);
     connect(waveform, &DeckWaveformOverview::fileDropped, this, [this](const QString &path){ this->loadFile(path); });
     
-    // Main control section: Layout depends on deck position
-    // For left deck (A): Controls | Turntable
-    // For right deck (B): Turntable | Controls  
     auto mainControlsLayout = new QHBoxLayout;
     mainControlsLayout->setSpacing(6);
     
-    // Performance Pads section (standalone)
     PerformancePads::DeckId deckId = isLeftDeck ? PerformancePads::DeckId::A : PerformancePads::DeckId::B;
     qDebug() << "QtDeckWidget: About to create PerformancePads for deck" << (deckId == PerformancePads::DeckId::A ? "A" : "B");
     std::cout << "=== About to create PerformancePads ===" << std::endl;
@@ -227,14 +224,11 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     pads->setMaximumHeight(120);
     pads->setMaximumWidth(380);
     
-    // Connect performance pads cue points to waveform displays (after pads are created)
     connect(pads, &PerformancePads::cuePointsChanged, waveform, &DeckWaveformOverview::setCuePoints);
     
-    // Turntable section: Transport buttons, turntable, BPM and tempo slider below
     auto turntableSection = new QVBoxLayout;
     turntableSection->setSpacing(3);
     
-    // Transport buttons above turntable
     auto transportLayout = new QHBoxLayout;
     transportLayout->setSpacing(2);  // Reduced spacing for smaller buttons
     playPauseBtn->setFixedHeight(20);  // Smaller height
@@ -259,10 +253,8 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     transportLayout->addWidget(tempoRangeBtn);
     turntableSection->addLayout(transportLayout);
     
-    // Turntable (smaller to save space)
     turntable->setFixedSize(90, 90);
 
-    // BPM + Tempo panel (to sit beside the turntable)
     auto bpmLayout = new QVBoxLayout;
     bpmLayout->setSpacing(1);
     bpmDefaultLabel->setFixedHeight(12);
@@ -292,7 +284,6 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     bpmTempoPanel->addLayout(bpmLayout);
     bpmTempoPanel->addLayout(speedSection);
 
-    // Place platter pinned to the deck edge and panel next to it
     auto platterRow = new QHBoxLayout;
     platterRow->setSpacing(6);
     if (isLeftDeck) {
@@ -309,13 +300,10 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     turntableSection->addLayout(platterRow);
     turntableSection->addStretch();
     
-    // Arrange sections based on deck position
     if (isLeftDeck) {
-        // Deck A: Performance Pads on left, turntable on right (closer to mixer)
         mainControlsLayout->addWidget(pads, 2, Qt::AlignTop);
         mainControlsLayout->addLayout(turntableSection, 1);
     } else {
-        // Deck B: Turntable on left (closer to mixer), performance pads on right
         mainControlsLayout->addLayout(turntableSection, 1);
         mainControlsLayout->addWidget(pads, 2, Qt::AlignTop);
     }
@@ -323,11 +311,9 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
     controlsLayout->addLayout(mainControlsLayout);
     controlsWidget->setLayout(controlsLayout);
 
-    // accept drops on the controls widget and forward them
     controlsWidget->setAcceptDrops(true);
     controlsWidget->installEventFilter(this);
 
-    // Main deck widget layout (only controls widget, waveform is integrated)
     auto mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(0, 0, 0, 0);
     mainLayout->addWidget(controlsWidget);
@@ -335,11 +321,9 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
 
     setAcceptDrops(true);
 
-    // Initialize tempo range defaults (±16%) and disable Unload until a track is loaded
     setTempoRangePm16(); // also sets tempoRangeIndex to 2 implicitly
     if (unloadBtn) unloadBtn->setEnabled(false);
 
-    // Poll player position and update waveform playhead at ~60 FPS for smooth visuals
     QTimer* t = new QTimer(this);
     t->setTimerType(Qt::PreciseTimer);
     t->setInterval(FrameTiming::kFrameIntervalMs);
@@ -381,6 +365,7 @@ QtDeckWidget::QtDeckWidget(DJAudioPlayer* player_, QWidget* parent, const QStrin
 }
 
 void QtDeckWidget::loadFile(const QString &path) {
+    const auto generation = waveformTaskGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     currentFilePath = path;  // Store the current file path
     if (pads) {
         pads->clearAllCuePoints(false);
@@ -388,56 +373,120 @@ void QtDeckWidget::loadFile(const QString &path) {
     if (waveform) {
         waveform->clearCuePoints();
     }
-    // Don't generate waveform on UI thread; schedule lightweight background generation
-    if (!path.isEmpty()) {
-        class SmallOverviewTask : public QRunnable {
-        public:
-            SmallOverviewTask(DeckWaveformOverview* w, QString p)
-                : wf(w), filePath(std::move(p)) { setAutoDelete(true); }
+    cueClickPending = false;
+    if (cueClickTimer) {
+        cueClickTimer->stop();
+    }
+    isCueing = false;
+    cuePosition = 0.0;
+    lastLoopEnabled = false;
+    lastLoopStart = -1.0;
+    lastLoopEnd = -1.0;
+    if (waveform) {
+        waveform->setLoopRegion(false, 0.0, 0.0);
+    }
+    emit loopChanged(false, 0.0, 0.0);
+
+    detectedBpm = 0.0;
+    emit displayedBpmChanged(0.0);
+    if (bpmDefaultLabel) {
+        bpmDefaultLabel->setText("BPM: --");
+    }
+    if (bpmCurrentLabel) {
+        bpmCurrentLabel->setText("Curr: --");
+    }
+
+    if (path.isEmpty()) {
+        resetDeckUiToEmptyState();
+        return;
+    }
+
+    class SmallOverviewTask : public QRunnable {
+    public:
+        SmallOverviewTask(QPointer<QtDeckWidget> deckPtr, QString p, std::uint64_t generation)
+            : deck(std::move(deckPtr)), filePath(std::move(p)), generation(generation) {
+            setAutoDelete(true);
+        }
             void run() override {
-                if (!wf) return;
+            if (!deck) {
+                return;
+            }
+            const auto currentGeneration = generation;
                 try {
                     QThread::currentThread()->setPriority(QThread::LowestPriority);
                     WaveformGenerator gen;
                     WaveformGenerator::Result res;
-                    const int bins = 4000;
-                    if (!gen.generate(juce::File(filePath.toStdString()), bins, res)) return;
-                    auto amplitudes = std::make_shared<std::vector<float>>(res.maxBins.size());
-                    auto colours = std::make_shared<std::vector<float>>(res.maxBins.size() * 3);
-                    const auto fallback = WaveformTheme::fallbackColor();
-                    for (size_t i = 0; i < res.maxBins.size(); ++i) {
-                        const float maxVal = res.maxBins[i];
-                        const float minVal = (i < res.minBins.size()) ? res.minBins[i] : 0.0f;
-                        const float amplitude = WaveformTheme::computeColumnAmplitude(minVal, maxVal);
-                        (*amplitudes)[i] = std::clamp(amplitude, 0.0f, 1.0f);
+                if (!gen.generate(juce::File(filePath.toStdString()), kSmallOverviewBinCount, res)) {
+                    return;
+                }
 
-                        const float low  = (i < res.lowBins.size())  ? res.lowBins[i]  : amplitude;
-                        const float mid  = (i < res.midBins.size())  ? res.midBins[i]  : amplitude;
-                        const float high = (i < res.highBins.size()) ? res.highBins[i] : amplitude;
-                        WaveformTheme::RgbColor rgb = WaveformTheme::computeSpectrumColor(low, mid, high, 1);
+                if (!deck || !deck->isWaveformGenerationCurrent(currentGeneration)) {
+                    return;
+                }
 
-                        if (!std::isfinite(rgb.r) || !std::isfinite(rgb.g) || !std::isfinite(rgb.b)) {
-                            rgb = fallback;
-                        }
+                const auto binCount = res.maxBins.size();
+                if (binCount == 0) {
+                    return;
+                }
 
-                        (*colours)[i * 3 + 0] = rgb.r;
-                        (*colours)[i * 3 + 1] = rgb.g;
-                        (*colours)[i * 3 + 2] = rgb.b;
+                auto amplitudes = std::make_shared<std::vector<float>>(binCount);
+                auto colours = std::make_shared<std::vector<float>>(binCount * 3);
+                const auto fallback = WaveformTheme::fallbackColor();
+                auto* colourData = colours->data();
+
+                for (auto&& [index, amplitudeSlot] : std::views::enumerate(*amplitudes)) {
+                    const float maxVal = res.maxBins[index];
+                    const float minVal = index < res.minBins.size() ? res.minBins[index] : 0.0f;
+                    const float amplitude = std::clamp(
+                        WaveformTheme::computeColumnAmplitude(minVal, maxVal),
+                        0.0f,
+                        1.0f);
+                    amplitudeSlot = amplitude;
+
+                    const float low  = index < res.lowBins.size()  ? res.lowBins[index]  : amplitude;
+                    const float mid  = index < res.midBins.size()  ? res.midBins[index]  : amplitude;
+                    const float high = index < res.highBins.size() ? res.highBins[index] : amplitude;
+
+                    auto rgb = WaveformTheme::computeSpectrumColor(low, mid, high, 1);
+                    if (!std::isfinite(rgb.r) || !std::isfinite(rgb.g) || !std::isfinite(rgb.b)) {
+                        rgb = fallback;
                     }
-                    const double audioStart = res.audioStartOffsetSec;
-                    const double lengthSec = res.lengthSeconds;
-                    QMetaObject::invokeMethod(wf, [w = wf, amplitudes, colours, audioStart, lengthSec]() {
-                        if (w) w->setWaveformData(*amplitudes, *colours, audioStart, lengthSec);
-                    }, Qt::QueuedConnection);
+
+                    const auto base = index * 3;
+                    colourData[base + 0] = rgb.r;
+                    colourData[base + 1] = rgb.g;
+                    colourData[base + 2] = rgb.b;
+                }
+
+                const auto audioStart = res.audioStartOffsetSec;
+                const auto lengthSec = res.lengthSeconds;
+                auto callback = [deck = deck,
+                                 currentGeneration,
+                                 amplitudes = std::move(amplitudes),
+                                 colours = std::move(colours),
+                                 audioStart,
+                                 lengthSec]() mutable {
+                    if (deck) {
+                        deck->handleOverviewWaveformResult(
+                            currentGeneration,
+                            std::move(amplitudes),
+                            std::move(colours),
+                            audioStart,
+                            lengthSec);
+                    }
+                };
+                if (!deck || !deck->isWaveformGenerationCurrent(currentGeneration)) {
+                    return;
+                }
+                QMetaObject::invokeMethod(deck, std::move(callback), Qt::QueuedConnection);
                 } catch (...) {}
             }
-        private:
-            QPointer<DeckWaveformOverview> wf;
-            QString filePath;
-        };
-        // Use global QThreadPool to run background task
-        QThreadPool::globalInstance()->start(new SmallOverviewTask(waveform, path));
-    }
+    private:
+        QPointer<QtDeckWidget> deck;
+        QString filePath;
+        std::uint64_t generation;
+    };
+    QThreadPool::globalInstance()->start(new SmallOverviewTask(QPointer<QtDeckWidget>(this), path, generation));
     QFileInfo fi(path);
     QString baseName = fi.completeBaseName();
     if (baseName.isEmpty())
@@ -445,27 +494,23 @@ void QtDeckWidget::loadFile(const QString &path) {
     setTrackNameDisplay(baseName, fi.fileName());
     setTrackInfoDisplay("Loading…", "font-size: 11px; color: #4fb0ff; padding: 2px;", QStringLiteral("Preparing analysis"));
     if (player) {
-        // NEW: Start threaded loading instead of blocking synchronous load
         emit fileLoadingStarted(path);  // Signal to start background loading
-        
-        // Update UI immediately to show loading state
-        playPauseBtn->setText("Loading...");
-        playPauseBtn->setEnabled(false);
+
+        if (playPauseBtn) {
+            playPauseBtn->setEnabled(false);
+            playPauseBtn->setText("Play");
+        }
         loadBtn->setText("Loading...");
         loadBtn->setEnabled(false);
         
-        // PREROLL ENHANCEMENT: Load new tracks in preroll mode for professional DJ workflow
-        // Position track at -4 seconds (half of the 8-second preroll range) for optimal cueing
-        const double prerollPosition = -0.5; // -0.5 in relative coordinates = -4 seconds in preroll
+    const double prerollPosition = kPrerollRelativePosition; // -0.5 in relative coordinates = -4 seconds in preroll
         waveform->setPlayhead(prerollPosition);
         playing = false;
         turntable->stop();
         
-        // Reset cue point and cueing state when loading new file
         cuePosition = 0.0;
         isCueing = false;
         
-        // IMPORTANT: Position track in preroll for professional DJ workflow
         if (player) {
             player->setPositionRelative(prerollPosition); // Use relative positioning for preroll
             std::cout << "QtDeckWidget: New track positioned in preroll at " << prerollPosition 
@@ -494,7 +539,6 @@ void QtDeckWidget::setTrackInfoDisplay(const QString& text, const QString& style
     trackInfoLabel->setStyleSheet(style.isEmpty() ? defaultStyle : style);
 }
 
-// NEW: Set cover art from image data
 void QtDeckWidget::setCoverArt(const QByteArray& imageData, const QString& format) {
     if (!coverArtLabel) return;
     
@@ -527,7 +571,6 @@ void QtDeckWidget::setCoverArt(const QByteArray& imageData, const QString& forma
     }
 }
 
-// NEW: Handle completion of threaded file loading
 void QtDeckWidget::onFileLoadingComplete(const QString& filePath) {
     qDebug() << "QtDeckWidget::onFileLoadingComplete called for" << filePath 
              << "current:" << currentFilePath << "player:" << (player != nullptr);
@@ -580,7 +623,6 @@ bool QtDeckWidget::eventFilter(QObject* obj, QEvent* event) {
             }
         }
     }
-    // Double-click on speed slider resets tempo to 1.000x
     if (obj == speedSlider && event->type() == QEvent::MouseButtonDblClick) {
         setTempoFactor(1.0);
         return true;
@@ -596,20 +638,18 @@ void QtDeckWidget::onPlayPause() {
     std::cout << "  Button text: " << playPauseBtn->text().toStdString() << std::endl;
     std::cout << "  Current file: " << currentFilePath.toStdString() << std::endl;
     
-    // Add debouncing to prevent rapid clicks causing issues
-    static auto lastClickTime = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastClickTime).count() < 50) {
+    // Debounce rapid toggles to avoid duplicate transport requests.
+    using Clock = std::chrono::steady_clock;
+    static auto lastClickTime = Clock::now();
+    const auto now = Clock::now();
+    if (now - lastClickTime < kPlayToggleDebounce) {
         std::cout << "  DEBOUNCE: Ignoring rapid click" << std::endl;
-        return; // Ignore clicks within 50ms (reduced from 100ms)
+        return;
     }
     lastClickTime = now;
     
-    // Check if a file is loaded before trying to play
     if (currentFilePath.isEmpty()) {
-        std::cout << "  No file loaded - triggering load dialog" << std::endl;
-        // If no file loaded, trigger load dialog
-        onLoad();
+        std::cout << "  No file loaded - ignoring play request" << std::endl;
         return;
     }
     
@@ -619,12 +659,10 @@ void QtDeckWidget::onPlayPause() {
     
     if (wasPlaying) {
         std::cout << "  STOPPING playback..." << std::endl;
-        // Immediate UI update
         playPauseBtn->setText("Play");
         turntable->stop();
         playing = false;
         emit playStateChanged(playing);
-        // Start/stop are now ultra-lightweight; call directly for deterministic behavior
         if (player) {
             std::cout << "  Calling player->stop()" << std::endl;
             player->stop();
@@ -632,11 +670,8 @@ void QtDeckWidget::onPlayPause() {
         std::cout << "  STOP sequence completed" << std::endl;
     } else {
         std::cout << "  STARTING playback..." << std::endl;
-        // Track when play was pressed for delayed sync checking
-        lastPlayPressTime = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        lastPlayPressTime = Clock::now();
         
-        // Immediate UI update
         playPauseBtn->setText("Pause");
         turntable->start();
         playing = true;
@@ -661,28 +696,23 @@ void QtDeckWidget::onLoad() {
 }
 
 void QtDeckWidget::onUnload() {
+    waveformTaskGeneration.fetch_add(1, std::memory_order_acq_rel);
     // Unload current file
     currentFilePath.clear();
-    setTrackNameDisplay("No Track Loaded");
-    setTrackInfoDisplay("No track loaded", "font-size: 11px; color: #b8bfd0; padding: 2px;");
-    loadBtn->setText("Load");
-    if (unloadBtn) unloadBtn->setEnabled(false);
-    playPauseBtn->setText("Play");
     if (player) {
         player->stop();
         player->unload();
+        player->setSpeed(1.0);
+        player->disableLoop();
+        player->setQuantizeEnabled(false);
+        player->setKeylockEnabled(false);
     }
-    playing = false;
-    turntable->stop();
-    if (pads) {
-        pads->clearAllCuePoints(false);
-    }
-    // Clear displays (waveform, cue/loop, labels, tempo)
-    if (waveform) waveform->clearDisplay();
-    detectedBpm = 0.0;
-    if (bpmDefaultLabel) bpmDefaultLabel->setText("BPM: --");
-    if (bpmCurrentLabel) bpmCurrentLabel->setText("Curr: --");
-    setTempoFactor(1.0);
+    resetDeckUiToEmptyState();
+    emit playStateChanged(false);
+    emit displayedBpmChanged(0.0);
+    emit tempoFactorChanged(1.0);
+    emit loopChanged(false, 0.0, 0.0);
+    emit playheadUpdated(0.0);
     emit fileUnloaded();
 }
 
@@ -700,8 +730,8 @@ void QtDeckWidget::onCue() {
         // Visual feedback could be added here (e.g., brief color change)
     } else {
         // This is the first click - start timer for double-click detection
-        cueClickPending = true;
-        cueClickTimer->start(300); // 300ms window for double-click
+    cueClickPending = true;
+    cueClickTimer->start(static_cast<int>(kCueDoubleClickWindow.count()));
     }
 }
 
@@ -875,6 +905,114 @@ void QtDeckWidget::updateTempoControlsForRange() {
     applyTempo(current);
 }
 
+bool QtDeckWidget::isWaveformGenerationCurrent(std::uint64_t generation) const noexcept {
+    return waveformTaskGeneration.load(std::memory_order_acquire) == generation;
+}
+
+void QtDeckWidget::handleOverviewWaveformResult(
+    std::uint64_t generation,
+    std::shared_ptr<std::vector<float>> amplitudes,
+    std::shared_ptr<std::vector<float>> colours,
+    double audioStart,
+    double lengthSec) {
+    if (!isWaveformGenerationCurrent(generation) || !waveform || !amplitudes || !colours) {
+        return;
+    }
+
+    waveform->setWaveformData(*amplitudes, *colours, audioStart, lengthSec);
+}
+
+void QtDeckWidget::resetDeckUiToEmptyState() {
+    cueClickPending = false;
+    if (cueClickTimer) {
+        cueClickTimer->stop();
+    }
+    isCueing = false;
+    cuePosition = 0.0;
+    playing = false;
+
+    if (playPauseBtn) {
+        playPauseBtn->setText("Play");
+        playPauseBtn->setEnabled(false);
+    }
+    if (keylockBtn) {
+        keylockBtn->setChecked(false);
+        keylockBtn->setText("Key");
+    }
+    if (quantizeBtn) {
+        quantizeBtn->setChecked(false);
+        quantizeBtn->setText("Q");
+    }
+    if (syncBtn) {
+        syncBtn->setChecked(false);
+    }
+    if (loadBtn) {
+        loadBtn->setText("Load");
+        loadBtn->setEnabled(true);
+    }
+    if (unloadBtn) {
+        unloadBtn->setEnabled(false);
+    }
+
+    if (tempoValueLabel) {
+        tempoValueLabel->setText("1.000x");
+    }
+    if (speedSlider) {
+        speedSlider->blockSignals(true);
+        speedSlider->setValue(1000);
+        speedSlider->blockSignals(false);
+    }
+    if (tempoSpin) {
+        tempoSpin->blockSignals(true);
+        tempoSpin->setValue(1.0);
+        tempoSpin->blockSignals(false);
+    }
+
+    if (songNameLabel) {
+        songNameLabel->setText("No Track Loaded");
+        songNameLabel->setToolTip("No Track Loaded");
+    }
+    if (trackInfoLabel) {
+        trackInfoLabel->setText("No track loaded");
+        trackInfoLabel->setToolTip("No track loaded");
+        trackInfoLabel->setStyleSheet("font-size: 11px; color: #b8bfd0; padding: 0px;");
+    }
+    if (coverArtLabel) {
+        coverArtLabel->clear();
+        coverArtLabel->setText("🎵");
+        coverArtLabel->setStyleSheet("background-color: #1a1a1a; border: 1px solid #444; border-radius: 2px; color: #666; font-size: 24px;");
+    }
+
+    detectedBpm = 0.0;
+    if (bpmDefaultLabel) {
+        bpmDefaultLabel->setText("BPM: --");
+    }
+    if (bpmCurrentLabel) {
+        bpmCurrentLabel->setText("Curr: --");
+    }
+
+    lastLoopEnabled = false;
+    lastLoopStart = -1.0;
+    lastLoopEnd = -1.0;
+
+    if (waveform) {
+        waveform->clearDisplay();
+        waveform->clearCuePoints();
+        waveform->setPlayhead(0.0);
+        waveform->setLoopRegion(false, 0.0, 0.0);
+    }
+    if (pads) {
+        pads->clearAllCuePoints(false);
+    }
+    if (turntable) {
+        turntable->stop();
+        turntable->setSpeed(1.0);
+        turntable->setTrackLength(0.0);
+        turntable->setPositionSeconds(0.0);
+        turntable->setBpm(0.0);
+    }
+}
+
 void QtDeckWidget::setDetectedBpm(double bpm) {
     detectedBpm = bpm;
     // if speed slider is at some value, update displayed BPM
@@ -903,28 +1041,43 @@ void QtDeckWidget::setDetectedBpm(double bpm) {
 }
 
 void QtDeckWidget::syncPlayState() {
-    // Smart sync: Only update UI when there's actually a change to avoid transport interference
     if (!player) return;
-    
-    // Don't interfere with play state during file loading
-    if (playPauseBtn->text() == "Loading...") {
+
+    const bool hasTrack = !currentFilePath.isEmpty();
+
+    if (!hasTrack) {
+        if (playPauseBtn && playPauseBtn->isEnabled()) {
+            resetDeckUiToEmptyState();
+        }
+        if (playPauseBtn) {
+            playPauseBtn->setEnabled(false);
+            if (playPauseBtn->text() != "Play") {
+                playPauseBtn->setText("Play");
+            }
+        }
+        if (playing) {
+            playing = false;
+            turntable->stop();
+            emit playStateChanged(playing);
+        }
         return;
     }
-    
-    static int lastUpdateCount = 0;
-    static int currentUpdateCount = 0;
-    currentUpdateCount++;
-    
-    // Only sync occasionally to avoid transport interference for play state changes
-    bool shouldUpdatePlayState = (currentUpdateCount - lastUpdateCount >= 50);
-    if (shouldUpdatePlayState) {
-        lastUpdateCount = currentUpdateCount;
+
+    if (playPauseBtn && !playPauseBtn->isEnabled() && !playing) {
+        return;
     }
-    
-    // Don't interfere immediately after a play button press to allow transport time to start
-    qint64 currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    bool recentPlayPress = (lastPlayPressTime > 0 && (currentTime - lastPlayPressTime) < 500);
+
+    // Throttle expensive transport sync to a manageable cadence.
+    static int updateCounter = 0;
+    const bool shouldUpdatePlayState = (++updateCounter >= kPlayStateSyncStride);
+    if (shouldUpdatePlayState) {
+        updateCounter = 0;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    const bool hasPlayTimestamp = lastPlayPressTime != Clock::time_point{};
+    const bool recentPlayPress = hasPlayTimestamp && (now - lastPlayPressTime) < kPlayStateGuardWindow;
     
     if (shouldUpdatePlayState && !recentPlayPress) {
         bool actuallyPlaying = player->isPlaying();
@@ -933,19 +1086,6 @@ void QtDeckWidget::syncPlayState() {
         // Only update UI if there's a mismatch, don't call any transport actions
         if (actuallyPlaying != uiShowsPlaying) {
             playPauseBtn->setText(actuallyPlaying ? "Pause" : "Play");
-        }
-        
-        // If no file is loaded, ensure button shows correct text
-        if (currentFilePath.isEmpty()) {
-            if (playPauseBtn->text() != "Load File") {
-                playPauseBtn->setText("Load File");
-            }
-            if (playing) {
-                playing = false;
-                turntable->stop();
-                emit playStateChanged(playing);
-            }
-            return;
         }
         
         if (actuallyPlaying != playing) {
