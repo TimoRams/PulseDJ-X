@@ -17,35 +17,40 @@ bool WaveformGenerator::generate(const juce::File& file,
 {
     if (binCount <= 0) [[unlikely]] return false;
 
-    std::vector<float> collectedMax, collectedMin;
-    const int reserveSize = std::max(binCount, 1);
-    collectedMax.reserve(reserveSize);
-    collectedMin.reserve(reserveSize);
-
-    StreamingCallbacks callbacks;
-    callbacks.onBegin = [&](int totalBins, double audioStartOffsetSec, double lengthSeconds, int sampleRate, int64 totalSamples) {
-        collectedMax.assign(totalBins, 0.0f);
-        collectedMin.assign(totalBins, 0.0f);
-        out.audioStartOffsetSec = audioStartOffsetSec;
-        out.lengthSeconds = lengthSeconds;
-        out.sampleRate = sampleRate;
-        out.totalSamples = totalSamples;
-    };
-
-    callbacks.onChunk = [&](int startBin, const std::vector<float>& maxBins, const std::vector<float>& minBins, bool) {
-        if (startBin < 0 || startBin + static_cast<int>(maxBins.size()) > static_cast<int>(collectedMax.size())) [[unlikely]] return;
-        std::copy(maxBins.begin(), maxBins.end(), collectedMax.begin() + startBin);
-        std::copy(minBins.begin(), minBins.end(), collectedMin.begin() + startBin);
-    };
-
-    callbacks.onProgress = nullptr;
-
-    if (!generateStreaming(file, binCount, callbacks, std::max(binCount, 1), silenceThreshold, consecutiveChunksNeeded)) [[unlikely]] {
+    AnalysisMetadata metadata;
+    if (!analyzeFile(file, metadata, silenceThreshold, consecutiveChunksNeeded)) [[unlikely]] {
         return false;
     }
 
-    out.maxBins = std::move(collectedMax);
-    out.minBins = std::move(collectedMin);
+    out.audioStartOffsetSec = metadata.audioStartOffsetSec;
+    out.lengthSeconds = metadata.lengthSeconds;
+    out.sampleRate = metadata.sampleRate;
+    out.totalSamples = metadata.totalSamples;
+
+    std::vector<float> maxBins;
+    std::vector<float> minBins;
+    std::vector<float> lowBins;
+    std::vector<float> midBins;
+    std::vector<float> highBins;
+
+    if (!renderBinWindow(file,
+                         metadata,
+                         binCount,
+                         0,
+                         binCount,
+                         maxBins,
+                         minBins,
+                         lowBins,
+                         midBins,
+                         highBins)) [[unlikely]] {
+        return false;
+    }
+
+    out.maxBins = std::move(maxBins);
+    out.minBins = std::move(minBins);
+    out.lowBins = std::move(lowBins);
+    out.midBins = std::move(midBins);
+    out.highBins = std::move(highBins);
     return true;
 }
 

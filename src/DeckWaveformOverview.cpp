@@ -3,6 +3,7 @@
 #include <QOpenGLShaderProgram>
 #include <QOpenGLBuffer>
 #include "WaveformGenerator.h"
+#include "WaveformTheme.h"
 #include <QPainter>
 #include <QTimer>
 #include <QTime>
@@ -69,88 +70,69 @@ void DeckWaveformOverview::initializeGL()
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     
-    // Professional waveform shader with gradients and anti-aliasing
-    const char* vsrc = R"GLSL(
-        #version 330 core
-        layout(location=0) in vec2 aPos; // x in [0,1], y amplitude [0,1]
-        layout(location=1) in float aIntensity; // intensity for color variation
+        // Professional waveform shader with gradients and anti-aliasing
+        const char* vsrc = R"GLSL(
+            #version 330 core
+            layout(location=0) in vec2 aPos; // x in [0,1], y amplitude [0,1]
+            layout(location=1) in vec3 aColor; // RGB colour per column
+            
+            uniform vec2 uResolution;
+            out vec2 vUV;
+            out float vAmp;
+            out vec3 vColor;
+            out vec2 vScreenPos;
+            
+            void main(){
+                float x = aPos.x * 2.0 - 1.0; // NDC x
+                float y = aPos.y * 2.0 - 1.0; // NDC y (already mapped)
+                gl_Position = vec4(x, y, 0.0, 1.0);
+                
+                vUV = aPos;
+                vAmp = clamp(aPos.y, 0.0, 1.0);
+                vColor = aColor;
+                vScreenPos = (gl_Position.xy + 1.0) * 0.5 * uResolution;
+            }
+        )GLSL";
         
-        uniform vec2 uResolution;
-        out vec2 vUV;
-        out float vAmp;
-        out float vIntensity;
-        out vec2 vScreenPos;
-        
-        void main(){
-            float x = aPos.x * 2.0 - 1.0; // NDC x
-            float y = aPos.y * 2.0 - 1.0; // NDC y (already mapped)
-            gl_Position = vec4(x, y, 0.0, 1.0);
+        const char* fsrc = R"GLSL(
+            #version 330 core
+            in vec2 vUV;
+            in float vAmp;
+            in vec3 vColor;
+            in vec2 vScreenPos;
             
-            vUV = aPos;
-            vAmp = clamp(aPos.y, 0.0, 1.0);
-            vIntensity = aIntensity;
-            vScreenPos = (gl_Position.xy + 1.0) * 0.5 * uResolution;
-        }
-    )GLSL";
-    
-    const char* fsrc = R"GLSL(
-        #version 330 core
-        in vec2 vUV;
-        in float vAmp;
-        in float vIntensity;
-        in vec2 vScreenPos;
-        
-        uniform vec3 uBaseColor;
-        uniform vec3 uHighlightColor;
-        uniform vec2 uResolution;
-        uniform float uTime;
-        
-        out vec4 FragColor;
-        
-        // Smooth step function for anti-aliasing
-        float smoothEdge(float edge, float x) {
-            float w = fwidth(x) * 0.5;
-            return smoothstep(edge - w, edge + w, x);
-        }
-        
-        // Generate subtle noise for texture
-        float noise(vec2 p) {
-            return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
-        }
-        
-        void main(){
-            // Distance from center line for gradient effect
-            float centerDist = abs(vUV.y - 0.5) * 2.0;
+            uniform vec2 uResolution;
+            uniform float uTime;
             
-            // Create vertical gradient from center
-            float gradient = 1.0 - pow(centerDist, 1.5);
-            gradient = max(gradient, 0.1); // Minimum visibility
+            out vec4 FragColor;
             
-            // Intensity-based color mixing (higher amplitude = brighter)
-            vec3 color = mix(uBaseColor, uHighlightColor, vIntensity * 0.7);
+            float smoothEdge(float edge, float x) {
+                float w = fwidth(x) * 0.5;
+                return smoothstep(edge - w, edge + w, x);
+            }
             
-            // Add subtle noise texture for realism
-            float noiseVal = noise(vScreenPos * 0.1) * 0.05;
-            color += noiseVal;
+            float noise(vec2 p) {
+                return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+            }
             
-            // Amplitude-based brightness
-            float brightness = 0.4 + vAmp * 0.6;
-            color *= brightness;
-            
-            // Apply gradient
-            color *= gradient;
-            
-            // Edge softening for anti-aliasing
-            float edgeSoft = smoothEdge(0.02, vAmp);
-            float alpha = edgeSoft * (0.8 + vIntensity * 0.2);
-            
-            // Subtle glow effect
-            float glow = exp(-centerDist * 3.0) * vIntensity * 0.3;
-            color += glow * uHighlightColor;
-            
-            FragColor = vec4(color, alpha);
-        }
-    )GLSL";
+            void main(){
+                float centerDist = abs(vUV.y - 0.5) * 2.0;
+                float gradient = 1.0 - pow(centerDist, 1.5);
+                gradient = max(gradient, 0.1);
+
+                vec3 color = vColor;
+                float noiseVal = noise(vScreenPos * 0.1 + uTime * 0.015) * 0.04;
+                color += noiseVal;
+
+                float brightness = 0.45 + vAmp * 0.55;
+                color *= brightness;
+                color *= gradient;
+
+                float edgeSoft = smoothEdge(0.02, vAmp);
+                float alpha = edgeSoft * (0.75 + vAmp * 0.25);
+                FragColor = vec4(color, alpha);
+            }
+        )GLSL";
 
     program = new QOpenGLShaderProgram(this);
     program->addShaderFromSourceCode(QOpenGLShader::Vertex, vsrc);
@@ -166,7 +148,9 @@ void DeckWaveformOverview::initializeGL()
     
     program->bind();
     program->enableAttributeArray(0);
-    program->setAttributeBuffer(0, GL_FLOAT, 0, 3, sizeof(float)*3); // x, y, intensity
+    program->setAttributeBuffer(0, GL_FLOAT, 0, 2, sizeof(float) * 5); // x, y
+    program->enableAttributeArray(1);
+    program->setAttributeBuffer(1, GL_FLOAT, sizeof(float) * 2, 3, sizeof(float) * 5); // r, g, b
     vao.release();
     vbo.release();
     program->release();
@@ -228,8 +212,6 @@ void DeckWaveformOverview::paintGL()
             
             // Set uniforms for professional look
             program->setUniformValue("uResolution", QVector2D(viewportW, viewportH));
-            program->setUniformValue("uBaseColor", QVector3D(0.2f, 0.4f, 0.8f));      // Professional blue
-            program->setUniformValue("uHighlightColor", QVector3D(0.4f, 0.8f, 1.0f)); // Bright highlight
             program->setUniformValue("uTime", (float)(QTime::currentTime().msecsSinceStartOfDay() * 0.001f));
             
             vao.bind();
@@ -394,6 +376,19 @@ void DeckWaveformOverview::loadAndRenderWaveform()
     update();
 }
 
+void DeckWaveformOverview::setWaveformData(const std::vector<float>& amplitudes,
+                                           const std::vector<float>& colours,
+                                           double audioStartOffsetSec,
+                                           double lengthSec)
+{
+    waveform = amplitudes;
+    waveformColors = colours;
+    audioStartOffset = audioStartOffsetSec;
+    totalLength = lengthSec;
+    meshDirty = true;
+    update();
+}
+
 void DeckWaveformOverview::loadFile(const QString& path)
 {
     currentFilePath = path;
@@ -542,24 +537,27 @@ void DeckWaveformOverview::rebuildMeshIfNeeded()
     if (!meshDirty || waveform.empty()) return;
     meshDirty = false;
     
-    // Build high-quality triangle strip with intensity data
+    // Build high-quality triangle strip with per-column colours
     std::vector<float> verts;
     const size_t n = waveform.size();
+    const auto fallbackColour = WaveformTheme::fallbackColor();
+    const bool hasColours = waveformColors.size() >= n * 3;
     
-    // Pre-allocate for performance: 3 floats per vertex, 2 vertices per sample
-    verts.reserve(n * 2 * 3);
-    
-    // Calculate intensity (derivative-based for dynamic highlighting)
-    std::vector<float> intensity(n, 0.0f);
-    for (size_t i = 1; i < n - 1; ++i) {
-        float derivative = std::abs(waveform[i + 1] - waveform[i - 1]);
-        intensity[i] = std::min(1.0f, derivative * 8.0f); // Scale for visibility
-    }
+    // Pre-allocate for performance: 5 floats per vertex, 2 vertices per sample
+    verts.reserve(n * 2 * 5);
     
     for (size_t i = 0; i < n; ++i) {
         float x = (float)i / (float)(n - 1); // 0..1
         float amplitude = std::min(1.0f, waveform[i]);
-        float intens = intensity[i];
+        const size_t colorIndex = i * 3;
+        float r = fallbackColour.r;
+        float g = fallbackColour.g;
+        float b = fallbackColour.b;
+        if (hasColours && colorIndex + 2 < waveformColors.size()) {
+            r = waveformColors[colorIndex + 0];
+            g = waveformColors[colorIndex + 1];
+            b = waveformColors[colorIndex + 2];
+        }
         
         // Create triangle strip: bottom vertex at center (0.5), top at amplitude
         float yCenter = 0.5f;  // Center line in [0,1] space
@@ -568,15 +566,19 @@ void DeckWaveformOverview::rebuildMeshIfNeeded()
         // Bottom vertex (center line)
         verts.push_back(x);
         verts.push_back(yCenter);
-        verts.push_back(intens * 0.3f); // Lower intensity at center
+        verts.push_back(r);
+        verts.push_back(g);
+        verts.push_back(b);
         
         // Top vertex (amplitude peak)
         verts.push_back(x);
         verts.push_back(yTop);
-        verts.push_back(intens);
+        verts.push_back(r);
+        verts.push_back(g);
+        verts.push_back(b);
     }
 
-    vertexCount = (int)(verts.size() / 3);
+    vertexCount = (int)(verts.size() / 5);
     
     vao.bind();
     vbo.bind();
@@ -586,7 +588,9 @@ void DeckWaveformOverview::rebuildMeshIfNeeded()
     
     program->bind();
     program->enableAttributeArray(0);
-    program->setAttributeBuffer(0, GL_FLOAT, 0, 3, sizeof(float)*3);
+    program->setAttributeBuffer(0, GL_FLOAT, 0, 2, sizeof(float) * 5);
+    program->enableAttributeArray(1);
+    program->setAttributeBuffer(1, GL_FLOAT, sizeof(float) * 2, 3, sizeof(float) * 5);
     program->release();
     
     vbo.release();
@@ -599,17 +603,7 @@ void DeckWaveformOverview::drawCuePoints() {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
     
-    // Define cue point colors (same as WaveformDisplay for consistency)
-    static const QColor cueColors[8] = {
-        QColor(255, 80, 80),   // Red
-        QColor(255, 150, 80),  // Orange  
-        QColor(255, 220, 80),  // Yellow
-        QColor(150, 255, 80),  // Light Green
-        QColor(80, 255, 150),  // Cyan
-        QColor(80, 180, 255),  // Blue
-        QColor(150, 80, 255),  // Purple
-        QColor(255, 80, 200)   // Magenta
-    };
+    const auto& cueColors = WaveformTheme::cueColors();
     
     for (int i = 0; i < 8; ++i) {
         if (cuePoints[i] < 0.0) continue; // Skip unset cue points
@@ -692,11 +686,14 @@ void DeckWaveformOverview::drawLoopRegion() {
     if (screenEndX <= screenStartX) return;
     
     // Draw semi-transparent loop region
-    QColor loopColor(100, 255, 100, 60); // Green with 60/255 transparency (less than main waveform)
+    QColor loopColor = WaveformTheme::loopBaseColor();
+    loopColor.setAlpha(60); // Less opaque than main waveform
     p.fillRect(screenStartX, 0, screenEndX - screenStartX, height(), loopColor);
     
     // Draw loop boundaries with more opaque lines
-    QPen loopBoundaryPen(QColor(0, 200, 0, 180), 1.5);
+    QColor loopStroke = WaveformTheme::loopBorderColor();
+    loopStroke.setAlpha(180);
+    QPen loopBoundaryPen(loopStroke, 1.5);
     loopBoundaryPen.setStyle(Qt::SolidLine);
     p.setPen(loopBoundaryPen);
     
@@ -718,7 +715,7 @@ void DeckWaveformOverview::drawLoopRegion() {
     p.fillRect(bgRect, QColor(0, 0, 0, 180));
     
     // Draw label text
-    p.setPen(QPen(QColor(100, 255, 100), 1));
+    p.setPen(QPen(WaveformTheme::loopBaseColor(), 1));
     p.drawText(labelX, labelY - 1, loopLabel);
 }
 
@@ -759,11 +756,14 @@ void DeckWaveformOverview::drawGhostLoopRegion() {
     if (screenEndX <= screenStartX) return;
     
     // Draw very transparent ghost loop region (much lighter than active loop)
-    QColor ghostLoopColor(100, 255, 100, 25); // Green with 25/255 transparency (lighter than active)
+    QColor ghostLoopColor = WaveformTheme::ghostLoopBaseColor();
+    ghostLoopColor.setAlpha(25); // Lighter than active loop
     p.fillRect(screenStartX, 0, screenEndX - screenStartX, height(), ghostLoopColor);
     
     // Draw ghost loop boundaries with lighter opacity
-    QPen ghostBoundaryPen(QColor(0, 200, 0, 60), 1.0);
+    QColor ghostStroke = WaveformTheme::ghostLoopBorderColor();
+    ghostStroke.setAlpha(60);
+    QPen ghostBoundaryPen(ghostStroke, 1.0);
     ghostBoundaryPen.setStyle(Qt::DashLine); // Use dashed line to distinguish from active loop
     p.setPen(ghostBoundaryPen);
     
@@ -785,7 +785,9 @@ void DeckWaveformOverview::drawGhostLoopRegion() {
     p.fillRect(bgRect, QColor(0, 0, 0, 80)); // Less opaque background
     
     // Draw label text with lighter color
-    p.setPen(QPen(QColor(100, 255, 100, 100), 1)); // More transparent text
+    QColor ghostText = WaveformTheme::ghostLoopBaseColor();
+    ghostText.setAlpha(100);
+    p.setPen(QPen(ghostText, 1));
     p.drawText(labelX, labelY - 1, ghostLabel);
 }
 

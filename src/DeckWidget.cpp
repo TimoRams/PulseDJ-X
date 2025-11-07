@@ -3,11 +3,14 @@
 #include "WaveformGenerator.h"
 #include "ScratchEngine.h"
 #include "FrameTiming.h"
+#include "WaveformTheme.h"
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QFileDialog>
 #include <QTimer>
 #include <QMimeData>
+#include <algorithm>
+#include <cmath>
 #include <QRunnable>
 #include <QThreadPool>
 #include <QThread>
@@ -399,14 +402,32 @@ void QtDeckWidget::loadFile(const QString &path) {
                     WaveformGenerator::Result res;
                     const int bins = 4000;
                     if (!gen.generate(juce::File(filePath.toStdString()), bins, res)) return;
-                    auto data = std::make_shared<std::vector<float>>(res.maxBins.size());
+                    auto amplitudes = std::make_shared<std::vector<float>>(res.maxBins.size());
+                    auto colours = std::make_shared<std::vector<float>>(res.maxBins.size() * 3);
+                    const auto fallback = WaveformTheme::fallbackColor();
                     for (size_t i = 0; i < res.maxBins.size(); ++i) {
-                        (*data)[i] = std::min(1.0f, std::abs(res.maxBins[i]));
+                        const float maxVal = res.maxBins[i];
+                        const float minVal = (i < res.minBins.size()) ? res.minBins[i] : 0.0f;
+                        const float amplitude = WaveformTheme::computeColumnAmplitude(minVal, maxVal);
+                        (*amplitudes)[i] = std::clamp(amplitude, 0.0f, 1.0f);
+
+                        const float low  = (i < res.lowBins.size())  ? res.lowBins[i]  : amplitude;
+                        const float mid  = (i < res.midBins.size())  ? res.midBins[i]  : amplitude;
+                        const float high = (i < res.highBins.size()) ? res.highBins[i] : amplitude;
+                        WaveformTheme::RgbColor rgb = WaveformTheme::computeSpectrumColor(low, mid, high, 1);
+
+                        if (!std::isfinite(rgb.r) || !std::isfinite(rgb.g) || !std::isfinite(rgb.b)) {
+                            rgb = fallback;
+                        }
+
+                        (*colours)[i * 3 + 0] = rgb.r;
+                        (*colours)[i * 3 + 1] = rgb.g;
+                        (*colours)[i * 3 + 2] = rgb.b;
                     }
                     const double audioStart = res.audioStartOffsetSec;
                     const double lengthSec = res.lengthSeconds;
-                    QMetaObject::invokeMethod(wf, [w = wf, data, audioStart, lengthSec]() {
-                        if (w) w->setWaveformData(*data, audioStart, lengthSec);
+                    QMetaObject::invokeMethod(wf, [w = wf, amplitudes, colours, audioStart, lengthSec]() {
+                        if (w) w->setWaveformData(*amplitudes, *colours, audioStart, lengthSec);
                     }, Qt::QueuedConnection);
                 } catch (...) {}
             }

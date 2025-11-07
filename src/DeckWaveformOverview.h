@@ -44,16 +44,14 @@ public:
     // Visual latency compensation in seconds (UI leads audio by this amount)
     void setVisualLatencyComp(double seconds) { visualLatencyComp = std::clamp(seconds, -0.25, 0.25); }
     // New: set precomputed waveform data from a background thread result (called on UI thread)
-    void setWaveformData(const std::vector<float>& data, double audioStartOffsetSec, double lengthSec) {
-        waveform = data;
-        audioStartOffset = audioStartOffsetSec;
-        totalLength = lengthSec;
-        meshDirty = true;
-        update();
-    }
+    void setWaveformData(const std::vector<float>& amplitudes,
+                         const std::vector<float>& colours,
+                         double audioStartOffsetSec,
+                         double lengthSec);
     // NEW: Clear waveform and overlays for unloaded state
     void clearDisplay() {
         waveform.clear();
+    waveformColors.clear();
         meshDirty = true;
         vertexCount = 0;
         playheadPos = -1.0;
@@ -100,6 +98,7 @@ private:
 
     // CPU-side waveform samples (0..1 upper-half amplitude per column)
     std::vector<float> waveform;
+    std::vector<float> waveformColors; // RGB triplets per column
     bool meshDirty{true};
     int vertexCount{0}; // number of vertices in VBO
     float amplitudeScale{1.2f}; // Increased for better visibility

@@ -17,6 +17,9 @@ public:
     struct Result {
         std::vector<float> minBins;   // signed min per bin [-1..0]
         std::vector<float> maxBins;   // signed max per bin [0..1]
+        std::vector<float> lowBins;   // low-band RMS per bin
+        std::vector<float> midBins;   // mid-band RMS per bin
+        std::vector<float> highBins;  // high-band RMS per bin
         double audioStartOffsetSec{0.0};
         double lengthSeconds{0.0};
         int sampleRate{0};

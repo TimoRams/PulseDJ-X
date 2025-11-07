@@ -509,6 +509,10 @@ public:
 private:
     bool missingSegmentsOverlayEnabled{false};
     
+    // FIX #2: isPausedMode Member Variable (nicht static in Loop)
+    bool isPausedMode_ = true;
+    double lastPauseModeCheck_ = 0.0;
+    
     void loadAndRenderWaveform();
     void generateDefaultGrid();
     void recomputeBeatPhaseShift();
