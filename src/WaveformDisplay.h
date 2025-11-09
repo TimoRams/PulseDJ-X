@@ -317,7 +317,7 @@ private:
         int priority{3}; // 0=ULTRA(128), 1=HIGH(512), 2=MEDIUM(2048), 3=LOW(8192)
     };
     std::vector<AdaptiveChunk> adaptiveChunks_;
-    mutable std::mutex adaptiveChunksMutex_; // Thread-safety for chunk access
+    mutable std::shared_mutex adaptiveChunksMutex_; // Thread-safety with shared read access
     int maxAdaptiveChunks_{500}; // Keep many chunks cached for fast seeking
     bool useAdaptiveChunking_{true}; // Re-enabled with optimizations
     
@@ -386,15 +386,7 @@ private:
         double bufferSec{0.0};
         double fetchLeftSecond{0.0};
         double fetchRightSecond{0.0};
-        double waveformNudgeSec{0.0};
-        // Optional visual alignment shift (in display seconds) applied to audio->display mapping for this frame.
-        // Used to ensure that at playhead==0 the very start of the track (audioSec=0) is exactly centered.
-        double alignShiftSec{0.0};
     } geometryCache;
-
-    // Hysteresis latch to stabilize alignment near track start (prevents tiny oscillations)
-    bool alignZeroLatchActive{false};
-    double alignZeroShiftSec{0.0};
 
     struct GlResources {
         bool initialized{false};
@@ -462,7 +454,7 @@ private:
     ViewMode viewMode{ViewMode::BeatLocked};
     double visualLatencyComp{0.0};
     // Static audio output latency compensation (seconds). Shifts display center relative to playhead.
-    double renderLatencySec{0.03};
+    double renderLatencySec{0.0}; // Audio output latency compensation (negative = shift visual back)
 
     bool analysisActive{false};
     double analysisProgress{0.0};

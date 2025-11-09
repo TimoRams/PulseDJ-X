@@ -153,20 +153,22 @@ void main()
 // Centralized audio/display mapping using the current geometry cache and tempo snapshot
 double WaveformDisplay::mapAudioToDisplay(double audioSec) const {
     const double safeTempo = (geometryCache.lastTempoFactor > 1e-6) ? geometryCache.lastTempoFactor : 1.0;
-    const double nudgeSec = geometryCache.waveformNudgeSec;
     if (viewMode == ViewMode::BeatLocked) {
-        return geometryCache.displayCenterSec + (audioSec - geometryCache.playheadSec) / safeTempo + geometryCache.alignShiftSec - nudgeSec;
+        // In beat-locked mode, adjust for tempo: displayCenter + (audio offset from playhead / tempo)
+        return geometryCache.displayCenterSec + (audioSec - geometryCache.playheadSec) / safeTempo;
     }
-    return audioSec + geometryCache.alignShiftSec - nudgeSec;
+    // Time-locked: displayCenter is at playheadSec, so audio maps directly with offset
+    return geometryCache.displayCenterSec + (audioSec - geometryCache.playheadSec);
 }
 
 double WaveformDisplay::mapDisplayToAudio(double displaySec) const {
     const double safeTempo = (geometryCache.lastTempoFactor > 1e-6) ? geometryCache.lastTempoFactor : 1.0;
-    const double adjustedDisplay = displaySec + geometryCache.waveformNudgeSec;
     if (viewMode == ViewMode::BeatLocked) {
-        return geometryCache.playheadSec + (adjustedDisplay - geometryCache.displayCenterSec - geometryCache.alignShiftSec) * safeTempo;
+        // Inverse: playhead + (display offset from center * tempo)
+        return geometryCache.playheadSec + (displaySec - geometryCache.displayCenterSec) * safeTempo;
     }
-    return adjustedDisplay - geometryCache.alignShiftSec;
+    // Time-locked inverse: playhead + display offset from center
+    return geometryCache.playheadSec + (displaySec - geometryCache.displayCenterSec);
 }
 
 void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, double zoomFactor, double renderPlayheadRel)
@@ -179,10 +181,8 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     geometryCache.displayCenterSec = 0.0;
     geometryCache.bufferSec = 0.0;
     geometryCache.halfViewportTime = 0.0;
-    geometryCache.alignShiftSec = 0.0;
     geometryCache.fetchLeftSecond = 0.0;
     geometryCache.fetchRightSecond = 0.0;
-    geometryCache.waveformNudgeSec = 0.0;
 
     auto& upperPoints = upperPointBuffer;
     auto& lowerPoints = lowerPointBuffer;
@@ -210,32 +210,16 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         sharedLock.lock();
     }
 
-    // Lokale atomare Kopien der kritischen Daten erstellen
-    // Lock nur für die Dauer der Kopie halten, dann sofort freigeben
-    std::vector<float> localSourceMinBins;
-    std::vector<float> localSourceMaxBins;
-    std::vector<float> localSourceLowBins;
-    std::vector<float> localSourceMidBins;
-    std::vector<float> localSourceHighBins;
-    int localSourceWidth;
-    int localAvailableStartBin;
-    int localAvailableEndBin;
-    double localAudioLength;
-    
-    {
-        // Atomare Kopie unter Lock - dann sofort freigeben!
-        localSourceMinBins = sourceMinBins;
-        localSourceMaxBins = sourceMaxBins;
-        localSourceLowBins = sourceLowBins;
-        localSourceMidBins = sourceMidBins;
-        localSourceHighBins = sourceHighBins;
-        localSourceWidth = sourceWidth;
-        localAvailableStartBin = availableStartBin;
-        localAvailableEndBin = availableEndBin;
-        localAudioLength = audioLength;
-    } // sharedLock wird hier automatisch durch Scope-Ende freigegeben
-    
-    sharedLock.unlock(); // Explizit freigeben bevor wir weitermachen
+    // Referenzen unter Shared-Lock nutzen statt große Kopien pro Frame
+    const auto& localSourceMinBins = sourceMinBins;
+    const auto& localSourceMaxBins = sourceMaxBins;
+    const auto& localSourceLowBins = sourceLowBins;
+    const auto& localSourceMidBins = sourceMidBins;
+    const auto& localSourceHighBins = sourceHighBins;
+    const int localSourceWidth = sourceWidth;
+    const int localAvailableStartBin = availableStartBin;
+    const int localAvailableEndBin = availableEndBin;
+    const double localAudioLength = audioLength;
     
     if (viewWidth <= 0 || viewHeight <= 0 || localAudioLength <= 0.0 || localSourceWidth <= 0) {
         return;
@@ -260,12 +244,13 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         playheadSec = playheadRel * localAudioLength;
     }
 
-    // Shift display center by output latency so visual center matches what you hear
-    // BUG #15 FIX: Adaptive Snap-Grid basierend auf Playback-Velocity
-    // Paused: Ganzes Pixel für Stabilität | Playing: Sub-Pixel für Smoothness
+    // Display center: subtract latency because audio output is delayed
+    // playheadSec = where we are reading from buffer NOW
+    // Audio heard now was read (audioLatency) seconds ago
+    // So visual should show position BEHIND current playhead
     const double rawDisplayCenterSec = (viewMode == ViewMode::BeatLocked)
-        ? ((playheadSec + renderLatencySec) / safeTempo)
-        : (playheadSec + renderLatencySec);
+        ? ((playheadSec - renderLatencySec) / safeTempo)
+        : (playheadSec - renderLatencySec);
     
     // Calculate seconds per pixel BEFORE snapping
     const double bufferSec = std::max(0.05, 0.5 / std::max(1.0, zoomFactor));
@@ -273,7 +258,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     const double secondsPerPixel = (pixelsPerSecond > 1e-6) 
         ? (1.0 / pixelsPerSecond) : 0.0;
     
-    // FIX #2: isPausedMode mit Member Variable + Hysterese mit Deadband
+    // Determine pause/playing mode with small hysteresis
     const double velocityMag = std::abs(std::isfinite(estimatedPlaybackRate) ? estimatedPlaybackRate : 0.0);
     
     // Hysterese mit Dead-Zone (verhindert Toggling bei kleinen Schwankungen)
@@ -284,9 +269,8 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         isPausedMode_ = true;
     }
     
-    const double snapGrid = isPausedMode_ 
-        ? secondsPerPixel          // Paused: 1.0px snap
-        : secondsPerPixel * 0.5;   // Playing: 0.5px snap
+    // Snap to pixel grid in both modes
+    const double snapGrid = secondsPerPixel;
     
     const double displayCenterSec = std::round(rawDisplayCenterSec / snapGrid) * snapGrid;
 
@@ -299,19 +283,8 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
 
     const double secondsPerPixelDisplay = timeRange / static_cast<double>(viewportWidth);
 
-    double dpiX = static_cast<double>(logicalDpiX());
-    if (dpiX <= 1.0) dpiX = 96.0; // sensible fallback
-    const double pixelsPerCentimeter = dpiX / 2.54; // 1 inch = 2.54 cm
-    
-    // BUG #19 FIX: Behalte als double (kein int cast) für Sub-Pixel-Präzision
-    const double waveformNudgePx = 0.5 - (pixelsPerCentimeter * 0.35);
-    
-    const double extraLeftDisplaySec = std::max(0.0, -waveformNudgePx) * secondsPerPixelDisplay;
-    const double extraRightDisplaySec = std::max(0.0, waveformNudgePx) * secondsPerPixelDisplay;
-
-    const double fetchLeftSecond = visibleLeftSecond - bufferSec - extraLeftDisplaySec;
-    const double fetchRightSecond = visibleRightSecond + bufferSec + extraRightDisplaySec;
-    geometryCache.waveformNudgeSec = waveformNudgePx * secondsPerPixelDisplay;
+    const double fetchLeftSecond = visibleLeftSecond - bufferSec;
+    const double fetchRightSecond = visibleRightSecond + bufferSec;
 
     geometryCache.playheadSec = playheadSec;
     geometryCache.displayCenterSec = displayCenterSec;
@@ -342,12 +315,8 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         ? (bufferSec * safeTempo)
         : bufferSec;
 
-    const double audioMarginScale = (viewMode == ViewMode::BeatLocked) ? safeTempo : 1.0;
-    const double audioMarginLeft = extraLeftDisplaySec * audioMarginScale;
-    const double audioMarginRight = extraRightDisplaySec * audioMarginScale;
-
-    double audioFetchLeftSec = playheadSec - audioHalfViewport - audioBuffer - audioMarginLeft;
-    double audioFetchRightSec = playheadSec + audioHalfViewport + audioBuffer + audioMarginRight;
+    double audioFetchLeftSec = playheadSec - audioHalfViewport - audioBuffer;
+    double audioFetchRightSec = playheadSec + audioHalfViewport + audioBuffer;
 
     if (!std::isfinite(audioFetchLeftSec)) audioFetchLeftSec = 0.0;
     if (!std::isfinite(audioFetchRightSec)) audioFetchRightSec = 0.0;
@@ -381,33 +350,13 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         return;
     }
 
-    // Align start: when near or before track start (including preroll), keep audioSec=0 centered.
-    // Use tolerance of ~0.75 pixel in time to avoid jitter from tiny positive playhead values.
-    const double alignSnapSec = secondsPerPixel * 0.75; // tolerance band (about 0.75px)
-    // Hysteresis around zero to avoid toggling and micro-jitter when hovering near start
-    const double enterPadSec = secondsPerPixel * 2.0; // enter latch within ~2px
-    const double exitPadSec  = secondsPerPixel * 6.0; // release latch after ~6px past threshold
-    if (viewMode == ViewMode::TimeLocked) {
-        if (!alignZeroLatchActive && playheadSec <= alignSnapSec + enterPadSec) {
-            alignZeroLatchActive = true;
-        } else if (alignZeroLatchActive && playheadSec >= alignSnapSec + exitPadSec) {
-            alignZeroLatchActive = false;
-        }
-        if (alignZeroLatchActive) {
-            alignZeroShiftSec = displayCenterSec + geometryCache.waveformNudgeSec;
-        }
-    } else {
-        alignZeroLatchActive = false;
-    }
-    double alignShiftSec = alignZeroLatchActive ? alignZeroShiftSec : geometryCache.waveformNudgeSec;
-    geometryCache.alignShiftSec = alignShiftSec;
     upperPoints.reserve(pixelWidth + 2);
     lowerPoints.reserve(pixelWidth + 2);
     if (missingSegmentsOverlayEnabled) {
         missingSegments.reserve(4);
     }
 
-    // FIX #5: History Buffer Smart Allocation - verhindert Heap-Fragmentierung
+    // History buffer smart allocation to avoid fragmentation
     const int currentSize = static_cast<int>(pixelUpperScratch.size());
     
     if (currentSize != pixelWidth) {
@@ -418,7 +367,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         pixelColorScratch.resize(pixelWidth * 3);
     }
         
-    // FIX #4: History Buffer Smart Resize - verhindert Memory-Leak
+    // History buffer smart resize
     const size_t requiredSize = static_cast<size_t>(pixelWidth);
     const size_t currentHistSize = pixelUpperHistory.size();
     
@@ -543,7 +492,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         if (!pixelCenterHistory.empty()) pixelCenterHistory[idx] = centerSec;
     };
 
-    // FIX #2: Optimiere storeHistory - FAST PATH ohne komplexe Berechnungen
+    // Fast path storeHistory
     auto storeHistory = [&](int idx, double centerSec) {
         // Bounds check only
         if (idx < 0 || idx >= pixelWidth) return;
@@ -569,7 +518,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         return false;
     };
 
-    // FIX #1: Snap Mode State AUSSERhalb der Pixel-Loop (EINMAL pro Frame berechnen!)
+    // Update snap mode state once per frame
     static bool useSnapMode = false;
     static double lastModeSwitch = 0.0;
     static auto lastModeUpdate = std::chrono::steady_clock::now();
@@ -618,6 +567,15 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     for (int x = 0; x < pixelWidth; ++x) {
         const double displayCenterXSec = leftSecond + (static_cast<double>(x) + 0.5) * secondsPerPixelDisplay;
         const double audioCenterSec = mapDisplayToAudio(displayCenterXSec);
+
+        // Skip rendering before track start (audioSec < 0)
+        if (audioCenterSec < 0.0) {
+            // No waveform before the orange START line
+            pixelCoverageScratch[x] = 0;
+            pixelUpperScratch[x] = 0.0f;
+            pixelLowerScratch[x] = 0.0f;
+            continue;
+        }
 
         // Reuse fast path nur im Pause/Seek Modus (Playback braucht neue Daten)
         if ((isPausedMode_ || isInSeekMode || velocityMag < 0.0005) &&
@@ -681,14 +639,9 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     // FIX: Nur bei Pause/Seek oder sehr niedriger Geschwindigkeit nutzen
     // Verhindert teure Kopien/Locks während aktiver Wiedergabe
     if (useChunksNow) {
-            std::vector<AdaptiveChunk> localChunks;
-            {
-                std::lock_guard<std::mutex> lock(adaptiveChunksMutex_);
-                localChunks = adaptiveChunks_; // Atomare Kopie unter Lock
-            } // Lock wird hier freigegeben
-            
-            if (!localChunks.empty()) {
-                for (const auto& chunk : localChunks) {
+            std::shared_lock<std::shared_mutex> lock(adaptiveChunksMutex_);
+            if (!adaptiveChunks_.empty()) {
+                for (const auto& chunk : adaptiveChunks_) {
                     if (chunk.endBin <= gb0 || chunk.startBin >= gb1) continue;
                     
                     int overlapStart = std::max(gb0, chunk.startBin);
@@ -792,7 +745,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         minVal = std::max(-peakLimit, std::min(0.0f, minVal));
         maxVal = std::min(peakLimit, std::max(0.0f, maxVal));
 
-        // FIX #1: KEIN Temporal Smoothing! Verursacht Lag-Gefühl!
+    // No temporal smoothing here to avoid input lag
         // Nutze History nur für Cache-Reuse, NICHT für Smoothing
         pixelUpperScratch[x] = maxVal; // Direct assignment
         pixelLowerScratch[x] = minVal;
@@ -962,9 +915,9 @@ bool WaveformDisplay::geometryNeedsUpdate(int viewWidth, int viewHeight, double 
     const double minDetectableVelocity = 1e-4;
     const bool hasMovement = playbackVelocity > minDetectableVelocity;
 
-    // FIX #6: NOCH aggressivere Geometry Rebuild Frequenz - spart MASSIV CPU
-    // 16px Playback, 24px Pause (war 12/16)
-    const double pixelThreshold = hasMovement ? 16.0 : 24.0;
+    // Aggressive geometry rebuild threshold to save CPU
+    // Rebuild every 2-3 pixels during playback for smooth motion
+    const double pixelThreshold = hasMovement ? 2.5 : 12.0;
     const double secondsPerPixelThreshold = pixelThreshold / pps;
 
     const double totalLen = (audioLength > 0.0) ? audioLength : trackLengthSec;
@@ -1267,7 +1220,7 @@ void WaveformDisplay::updateWaveformVertexBuffers(int viewWidth, int viewHeight)
     streamUpload(glResources.bottomLineVbo[back], bottomLineVertexData);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    // FIX #7: GPU Upload ohne blocking glFlush() - Swap sofort!
+    // Non-blocking GPU upload
     // GPU Upload passiert asynchron - kein CPU-Wait nötig
     // glFlush() würde hier blocken und Performance kosten
 
@@ -1342,6 +1295,24 @@ void WaveformDisplay::drawMissingSegments(QPainter& painter, int viewWidth, int 
 void WaveformDisplay::drawWaveformOverlays(QPainter& painter, int viewWidth, int viewHeight, double zoomFactor)
 {
     if (geometryCache.valid && geometryCache.timeRange > 0.0) {
+        // CRITICAL: Draw track start line first (orange marker at audioSec=0)
+        // This is the fixed reference point - everything else moves relative to it
+        const double trackStartDisplaySec = mapAudioToDisplay(0.0);
+        if (trackStartDisplaySec >= geometryCache.leftSecond && trackStartDisplaySec <= geometryCache.rightSecond) {
+            const double relPos = (trackStartDisplaySec - geometryCache.leftSecond) / geometryCache.timeRange;
+            const int startX = static_cast<int>(relPos * viewWidth);
+            
+            painter.save();
+            painter.setPen(QPen(QColor(255, 140, 0, 200), 3)); // Orange, bold
+            painter.drawLine(startX, 0, startX, viewHeight);
+            
+            // Label
+            painter.setFont(QFont("Arial", 9, QFont::Bold));
+            painter.setPen(QColor(255, 140, 0, 255));
+            painter.drawText(startX + 5, 15, "START");
+            painter.restore();
+        }
+        
         if (streamingMode && !streamingComplete && missingSegmentsOverlayEnabled) {
             drawMissingSegments(painter, viewWidth, viewHeight);
         }
@@ -1731,7 +1702,7 @@ void WaveformDisplay::appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& 
 
     // === ADAPTIVE CHUNK SYSTEM ===
     if (useAdaptiveChunking_ && !maxBins.empty()) {
-        std::lock_guard<std::mutex> lock(adaptiveChunksMutex_);
+    std::lock_guard<std::shared_mutex> lock(adaptiveChunksMutex_);
         
         // Determine chunk priority based on distance to playhead
         double playheadSec = playheadPos * audioLength;
@@ -1806,12 +1777,9 @@ void WaveformDisplay::appendStreamBinsImpl(std::unique_lock<std::shared_mutex>& 
                 int toRemove = std::min(50, (int)(adaptiveChunks_.size() - maxAdaptiveChunks_));
                 adaptiveChunks_.erase(adaptiveChunks_.begin(), adaptiveChunks_.begin() + toRemove);
                 
-                qDebug() << "[AdaptiveChunk] Evicted" << toRemove 
-                         << "low-priority chunks, keeping" << adaptiveChunks_.size();
+                // Eviction summary suppressed for performance
             } else {
-                qDebug() << "[AdaptiveChunk] Added chunk [" << startBin << "-" << chunkEnd 
-                         << "] Priority:" << priority << "Size:" << newChunk.maxBins.size() 
-                         << "Total:" << adaptiveChunks_.size() << "/" << maxAdaptiveChunks_;
+                // Addition summary suppressed for performance
             }
         }
     }
@@ -2597,7 +2565,7 @@ void WaveformDisplay::resetStreamingState()
     
     // Clear adaptive chunks and fallback for new file
     {
-        std::lock_guard<std::mutex> lock(adaptiveChunksMutex_);
+    std::lock_guard<std::shared_mutex> lock(adaptiveChunksMutex_);
         adaptiveChunks_.clear();
     }
     {

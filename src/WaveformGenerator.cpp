@@ -94,6 +94,11 @@ bool WaveformGenerator::generateStreaming(const juce::File& file,
     int64 processedSamples = 0;
     int flushCursor = 0;
 
+    std::vector<float> chunkMaxScratch;
+    std::vector<float> chunkMinScratch;
+    chunkMaxScratch.reserve(std::max(1, chunkBinSize));
+    chunkMinScratch.reserve(std::max(1, chunkBinSize));
+
     auto flushBins = [&](int upToBin, bool finalChunk) {
         upToBin = std::clamp(upToBin, 0, binCount);
         if (upToBin <= flushCursor) [[unlikely]] return;
@@ -104,10 +109,12 @@ bool WaveformGenerator::generateStreaming(const juce::File& file,
         while (remaining > 0) [[likely]] {
             const int emitCount = std::min(chunkBinSize, remaining);
             const bool isFinal = finalChunk && (emitStart + emitCount >= binCount);
-            callbacks.onChunk(emitStart, 
-                            std::vector<float>(maxBins.begin() + emitStart, maxBins.begin() + emitStart + emitCount),
-                            std::vector<float>(minBins.begin() + emitStart, minBins.begin() + emitStart + emitCount),
-                            isFinal);
+            // Reuse scratch buffers to avoid per-chunk heap churn
+            if ((int)chunkMaxScratch.size() != emitCount) chunkMaxScratch.resize(emitCount);
+            if ((int)chunkMinScratch.size() != emitCount) chunkMinScratch.resize(emitCount);
+            std::copy_n(maxBins.begin() + emitStart, emitCount, chunkMaxScratch.begin());
+            std::copy_n(minBins.begin() + emitStart, emitCount, chunkMinScratch.begin());
+            callbacks.onChunk(emitStart, chunkMaxScratch, chunkMinScratch, isFinal);
 
             emitStart += emitCount;
             remaining -= emitCount;
@@ -154,7 +161,7 @@ bool WaveformGenerator::generateStreaming(const juce::File& file,
 
     flushBins(binCount, true);
 
-    if (callbacks.onProgress) [[unlikely]] callbacks.onProgress(1.0);
+        if (callbacks.onProgress) [[unlikely]] callbacks.onProgress(1.0);
 
     return true;
 }

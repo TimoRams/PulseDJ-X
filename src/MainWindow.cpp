@@ -175,7 +175,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     // Load and apply global render latency compensation for waveform alignment
     {
         QSettings s("DJDavid", "David");
-        userRenderLatencySec = s.value("renderLatency/global", 0.03).toDouble();
+        userRenderLatencySec = s.value("renderLatency/global", 0.0).toDouble();
         overviewTopA->setOutputLatencyComp(userRenderLatencySec);
         overviewTopB->setOutputLatencyComp(userRenderLatencySec);
     }
