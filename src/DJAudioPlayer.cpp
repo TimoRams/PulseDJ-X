@@ -473,21 +473,22 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         
         if (keylockPrimeSamplesRemaining > 0) [[unlikely]] {
             const int chsRB = rbNumChannels;
-            const int chunk = lastBlockSizeHint > 0 ? lastBlockSizeHint : bufferToFill.numSamples;
+            const int chunkHint = lastBlockSizeHint > 0 ? lastBlockSizeHint : bufferToFill.numSamples;
+            const int chunkTarget = std::max(32, chunkHint / 4);
+            const int chunk = std::clamp(chunkTarget, 32, chunkHint);
             if (rbInputBuffer.getNumChannels() < chsRB || rbInputBuffer.getNumSamples() < chunk)
                 rbInputBuffer.setSize(chsRB, chunk, false, true, true);
             AudioSourceChannelInfo tempInfo;
             tempInfo.buffer = &rbInputBuffer;
             tempInfo.startSample = 0;
             tempInfo.numSamples = chunk;
-            for (int c = 0; c < chsRB; ++c) rbInputBuffer.clear(c, 0, chunk);
             const double feedRatio = keylockEnabled ? 1.0 : effectiveSpeed();
             resampleSource.setResamplingRatio(feedRatio);
             resampleSource.getNextAudioBlock(tempInfo);
-            std::vector<const float*> inPtrs(chsRB);
-            for (int c = 0; c < chsRB; ++c) inPtrs[c] = rbInputBuffer.getReadPointer(c);
-            rb->process(inPtrs.data(), chunk, false);
-            keylockPrimeSamplesRemaining -= chunk;
+            rbInPtrStorage.resize(static_cast<size_t>(chsRB));
+            for (int c = 0; c < chsRB; ++c) rbInPtrStorage[c] = rbInputBuffer.getReadPointer(c);
+            rb->process(rbInPtrStorage.data(), chunk, false);
+            keylockPrimeSamplesRemaining = std::max(0, keylockPrimeSamplesRemaining - chunk);
             if (debugKeylock) std::cout << "[RB] Priming... remaining=" << keylockPrimeSamplesRemaining << std::endl;
             bufferToFill.clearActiveBufferRegion();
             return;
@@ -500,6 +501,8 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         try {
     const double speed = playbackSpeed;
     const int chsRB = rbNumChannels;
+    rbInPtrStorage.resize(static_cast<size_t>(chsRB));
+    rbOutPtrStorage.resize(static_cast<size_t>(chsRB));
 
     const double safeSpeed = std::max(1e-6, speed);
     double desiredTimeRatio = isKeylockActive ? (1.0 / safeSpeed) : 1.0;
@@ -524,7 +527,8 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             size_t pad = rb->getPreferredStartPad();
             // ULTRA-OPTIMIZED: Minimal padding for absolute lowest latency
             // DJ mixing prioritizes latency over perfect transient analysis
-            const size_t maxPad = static_cast<size_t>(currentSampleRate * 0.002); // Max 2ms (reduced from 5ms)
+            const auto padLimit = static_cast<size_t>(std::ceil(currentSampleRate * 0.0005)); // cap at ~0.5ms
+            const size_t maxPad = std::max<size_t>(padLimit, 16);
             pad = std::min(pad, maxPad);
             
             if (debugKeylock) std::cout << "[KL][RB] preferredStartPad=" << pad << " (capped at " << maxPad << ")" << std::endl;
@@ -532,15 +536,16 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 if (rbInputBuffer.getNumChannels() < chsRB || rbInputBuffer.getNumSamples() < (int)pad)
                     rbInputBuffer.setSize(chsRB, (int)pad, false, true, true);
                 rbInputBuffer.clear();
-                std::vector<const float*> z(chsRB);
-                for (int c = 0; c < chsRB; ++c) z[c] = rbInputBuffer.getReadPointer(c);
-                rb->process(z.data(), (int)pad, false);
+                rbInPtrStorage.resize(static_cast<size_t>(chsRB));
+                for (int c = 0; c < chsRB; ++c) rbInPtrStorage[c] = rbInputBuffer.getReadPointer(c);
+                rb->process(rbInPtrStorage.data(), static_cast<int>(pad), false);
             }
             rbLatencySamples = (int)rb->getStartDelay();
             rbLatencySeconds = rbLatencySamples / currentSampleRate;
             rbDiscardOutRemaining = rbLatencySamples;
             rbOutScratch.setSize(chsRB, std::max(desiredOut * 2, rbLatencySamples + desiredOut));
             rbOutScratch.clear();
+            rbOutPtrStorage.resize(static_cast<size_t>(chsRB));
             rbPaddedStartDone = true;
         }
 
@@ -569,13 +574,11 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 tempInfo.buffer = &rbInputBuffer;
                 tempInfo.startSample = fed;
                 tempInfo.numSamples = chunk;
-                for (int c = 0; c < chsRB; ++c) rbInputBuffer.clear(c, fed, chunk);
                 resampleSource.getNextAudioBlock(tempInfo);
                 fed += chunk;
             }
-            std::vector<const float*> inPtrs(chsRB);
-            for (int c = 0; c < chsRB; ++c) inPtrs[c] = rbInputBuffer.getReadPointer(c);
-            rb->process(inPtrs.data(), needIn, false);
+            for (int c = 0; c < chsRB; ++c) rbInPtrStorage[c] = rbInputBuffer.getReadPointer(c);
+            rb->process(rbInPtrStorage.data(), needIn, false);
 
             if (rbDiscardOutRemaining > 0 && rb->available() > 0) {
                 int avail = rb->available();
@@ -583,9 +586,8 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 if (debugKeylock) std::cout << "[KL][RB] discard latency toTake=" << toTake << std::endl;
                 if (rbOutScratch.getNumChannels() < chsRB || rbOutScratch.getNumSamples() < toTake)
                     rbOutScratch.setSize(chsRB, toTake, false, true, true);
-                std::vector<float*> sPtrs(chsRB);
-                for (int c = 0; c < chsRB; ++c) sPtrs[c] = rbOutScratch.getWritePointer(c);
-                rb->retrieve(sPtrs.data(), toTake);
+                for (int c = 0; c < chsRB; ++c) rbOutPtrStorage[c] = rbOutScratch.getWritePointer(c);
+                rb->retrieve(rbOutPtrStorage.data(), toTake);
                 rbDiscardOutRemaining -= toTake;
             }
 
@@ -595,9 +597,8 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         const int toRetrieve = std::max(0, juce::jmin(rb->available(), desiredOut));
         if (rbOutScratch.getNumChannels() < chsRB || rbOutScratch.getNumSamples() < std::max(1, toRetrieve))
             rbOutScratch.setSize(chsRB, std::max(1, toRetrieve), false, true, true);
-        std::vector<float*> outPtrsRB(chsRB);
-        for (int c = 0; c < chsRB; ++c) outPtrsRB[c] = rbOutScratch.getWritePointer(c);
-    const int got = (toRetrieve > 0) ? rb->retrieve(outPtrsRB.data(), toRetrieve) : 0;
+        for (int c = 0; c < chsRB; ++c) rbOutPtrStorage[c] = rbOutScratch.getWritePointer(c);
+        const int got = (toRetrieve > 0) ? rb->retrieve(rbOutPtrStorage.data(), toRetrieve) : 0;
     if (debugKeylock) std::cout << "[KL][RB] retrieved got=" << got << "/" << desiredOut
                      << ", availableAfter=" << rb->available() << std::endl;
 
@@ -608,25 +609,19 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 for (int c = 0; c < chsOut; ++c) {
                     bufferToFill.buffer->copyFrom(c, bufferToFill.startSample, rbOutScratch, c, 0, got);
                 }
-            }
-            else if (chsRB == 1 && chsOut >= 1) {
+            } else if (chsRB == 1 && chsOut >= 1) {
                 for (int c = 0; c < chsOut; ++c) {
                     bufferToFill.buffer->copyFrom(c, bufferToFill.startSample, rbOutScratch, 0, 0, got);
                 }
-            }
-            else if (chsRB >= 2 && chsOut == 1) {
-                if (rbOutScratch.getNumChannels() >= 2) {
-                    AudioBuffer<float> mix;
-                    mix.setSize(1, got, false, true, true);
-                    const float* lptr = rbOutScratch.getReadPointer(0);
-                    const float* rptr = rbOutScratch.getReadPointer(1);
-                    float* mptr = mix.getWritePointer(0);
-                    for (int i = 0; i < got; ++i) mptr[i] = 0.5f * (lptr[i] + rptr[i]);
-                    bufferToFill.buffer->copyFrom(0, bufferToFill.startSample, mix, 0, 0, got);
-                } else {
-                    // Fallback: copy first channel
-                    bufferToFill.buffer->copyFrom(0, bufferToFill.startSample, rbOutScratch, 0, 0, got);
+            } else if (chsRB >= 2 && chsOut == 1 && rbOutScratch.getNumChannels() >= 2) {
+                const float* left = rbOutScratch.getReadPointer(0);
+                const float* right = rbOutScratch.getReadPointer(1);
+                auto* mono = bufferToFill.buffer->getWritePointer(0, bufferToFill.startSample);
+                for (int i = 0; i < got; ++i) {
+                    mono[i] = 0.5f * (left[i] + right[i]);
                 }
+            } else if (chsOut == 1) {
+                bufferToFill.buffer->copyFrom(0, bufferToFill.startSample, rbOutScratch, 0, 0, got);
             }
 
             for (int c = chsRB; c < chsOut; ++c) {
@@ -637,7 +632,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         if (got < desiredOut) {
             const int remain = desiredOut - got;
             if (remain > 0) {
-                for (int c = 0; c < chsOut; ++c) {  // Use chsOut instead of min(chsOut, chsRB)
+                for (int c = 0; c < chsOut; ++c) {
                     auto* dst = bufferToFill.buffer->getWritePointer(c, bufferToFill.startSample + got);
                     juce::FloatVectorOperations::clear(dst, remain);
                 }
@@ -1513,10 +1508,11 @@ void DJAudioPlayer::reinitRubberBand() {
         rb = std::make_unique<RubberBand::RubberBandStretcher>(currentSampleRate, rbNumChannels, opts);
         rb->setTimeRatio(1.0);
         rb->setPitchScale(1.0);
-        // ULTRA-OPTIMIZED: Sehr kleine Chunks für minimale Latenz
-        // Reduziert interne RubberBand Buffering drastisch
-        const size_t optimizedProcessSize = std::min(128, std::max(32, lastBlockSizeHint / 4)); // Reduced from 256 and /2
-        rb->setMaxProcessSize(optimizedProcessSize);
+    // ULTRA-OPTIMIZED: Sehr kleine Chunks für minimale Latenz
+    // Reduziert interne RubberBand Buffering drastisch
+    const int blockHint = std::max(32, lastBlockSizeHint);
+    const size_t optimizedProcessSize = static_cast<size_t>(std::clamp(blockHint / 6, 16, 96));
+    rb->setMaxProcessSize(optimizedProcessSize);
         rbLastTimeRatio = 1.0;
     rbLastPitchScale = 1.0;
         rbInputBuffer.setSize(rbNumChannels, std::max(256, lastBlockSizeHint));
@@ -1528,6 +1524,8 @@ void DJAudioPlayer::reinitRubberBand() {
         rbDiscardOutRemaining = 0;
         rbOutScratch.setSize(rbNumChannels, std::max(256, lastBlockSizeHint));
         rbOutScratch.clear();
+        rbInPtrStorage.resize(static_cast<size_t>(rbNumChannels));
+        rbOutPtrStorage.resize(static_cast<size_t>(rbNumChannels));
     } catch (const std::exception& e) {
         std::cout << "RubberBand init failed: " << e.what() << std::endl;
         rb.reset();

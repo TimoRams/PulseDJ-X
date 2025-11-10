@@ -245,9 +245,12 @@ private:
     bool keylockEnabled{false};
     // Debug logging for keylock paths
     bool debugKeylock{false};
-    // Short warm-up delay for keylock to ensure internal buffers are primed (~0.5ms)
+    // Short warm-up delay for keylock to ensure internal buffers are primed (target 0.2ms)
     int keylockPrimeSamplesRemaining{0};
-    double keylockPrimeMs{0.5};  // Ultra-minimal: 0.5ms für absolute lowest latency
+    double keylockPrimeMs{0.2};  // Ultra-minimal: 0.2ms für absolute lowest latency
+    // Pointer scratch arrays to avoid allocating in the audio callback
+    std::vector<const float*> rbInPtrStorage;
+    std::vector<float*> rbOutPtrStorage;
     
     // Quantize state
     bool quantizeEnabled{false};
