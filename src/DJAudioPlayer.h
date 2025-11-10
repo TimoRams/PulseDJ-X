@@ -46,7 +46,7 @@ public:
     // Total processing latency added by the DSP pipeline (e.g., Rubber Band), in seconds
     double getPipelineLatencySeconds() const {
 #if defined(RUBBERBAND_FOUND)
-        if (keylockEnabled && rbReady) return rbLatencySeconds;
+    if (rbReady) return rbLatencySeconds;
 #endif
         return 0.0;
     }
@@ -155,6 +155,7 @@ private:
     juce::AudioBuffer<float> rbInputBuffer;
     juce::AudioBuffer<float> rbOutScratch;
     double rbLastTimeRatio{1.0};
+    double rbLastPitchScale{1.0};
     int rbNumChannels{2};
     bool rbReady{false};
     int rbLatencySamples{0};
