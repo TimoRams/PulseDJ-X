@@ -28,6 +28,7 @@
 #include <QEvent>
 #include <optional>
 #include <algorithm>
+#include <utility>
 
 namespace {
 // Centralized supported audio extensions and name filters reused across the library.
@@ -52,7 +53,7 @@ namespace {
 }
 }
 
-LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget* parent)
+LibraryManager::LibraryManager(std::shared_ptr<juce::AudioFormatManager> formatManager, QWidget* parent)
     : QWidget(parent),
       mainSplitter(nullptr),
       fileSystemTree(nullptr),
@@ -67,7 +68,7 @@ LibraryManager::LibraryManager(juce::AudioFormatManager* formatManager, QWidget*
       statusLabel(nullptr),
       progressBar(nullptr),
       loaderThread(nullptr),
-      audioFormatManager(formatManager),
+            audioFormatManager(std::move(formatManager)),
       filterUpdateTimer(new QTimer(this))
 {
     setObjectName("LibraryManager");

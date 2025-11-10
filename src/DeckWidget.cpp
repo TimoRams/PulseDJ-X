@@ -1158,6 +1158,23 @@ void QtDeckWidget::setBeatIndicator(BeatIndicator* indicator) {
     }
 }
 
+void QtDeckWidget::detachPlayer() {
+    // Stop any outstanding timers to prevent queued timeouts from running during teardown.
+    const auto timers = findChildren<QTimer*>();
+    for (auto* timer : timers) {
+        if (timer) {
+            timer->stop();
+        }
+    }
+
+    if (pads) {
+        pads->setAudioPlayer(nullptr);
+    }
+
+    player = nullptr;
+    playing = false;
+}
+
 void QtDeckWidget::setScratchEngine(ScratchEngine* engine) {
     scratchEngine = engine;
     if (turntable) {

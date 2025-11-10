@@ -13,6 +13,7 @@
 
 #include <cstring>
 #include <memory>
+#include <utility>
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_core/juce_core.h>
@@ -317,8 +318,10 @@ void finaliseMetadata (const QFileInfo& fileInfo, TrackInfo& track)
 }
 }
 
-ID3LoaderThread::ID3LoaderThread (const QStringList& files, juce::AudioFormatManager* formatManager, QObject* parent)
-    : QThread (parent), filesToProcess (files), audioFormatManager (formatManager)
+ID3LoaderThread::ID3LoaderThread (const QStringList& files,
+                                  std::shared_ptr<juce::AudioFormatManager> formatManager,
+                                  QObject* parent)
+    : QThread (parent), filesToProcess (files), audioFormatManager (std::move (formatManager))
 {
 }
 
@@ -347,6 +350,9 @@ void ID3LoaderThread::run()
 TrackInfo ID3LoaderThread::loadTrackInfo (const QString& filePath)
 {
     TrackInfo track (filePath);
+
+    if (! audioFormatManager)
+        return track;
     const QFileInfo fileInfo (filePath);
     track.fileSize = fileInfo.size();
     track.lastModified = fileInfo.lastModified().toSecsSinceEpoch();

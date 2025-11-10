@@ -332,14 +332,35 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
     }
 
     // Use pure track-time (0.0 = track start) for bin selection
+    // CRITICAL: Bins are indexed from audioStartOffset=0, NOT from track absolute time
+    // audioFetchLeftSec/Right are already in "playable audio" coordinates (0 = first audible sample)
     int leftBin = std::max(0, static_cast<int>(std::floor(audioFetchLeftSec * binPerSecond)));
     int rightBin = std::min(localSourceWidth, static_cast<int>(std::ceil(audioFetchRightSec * binPerSecond)));
 
     if (streamingMode && !streamingComplete && binPerSecond > 0.0) {
-        // Aggressive preloading: ±30 seconds ahead/behind
-        const int aggressivePreload = streamingPreloadBins * 8; // Was *1, now *8
-        const int neededStartBin = std::max(0, leftBin - aggressivePreload);
-        int neededEndBin = rightBin + aggressivePreload;
+        // IMPROVED: Predictive preloading based on playback velocity and direction
+        // Calculate how far playhead will move in next 2 seconds
+        const double playbackVel = std::abs(std::isfinite(estimatedPlaybackRate) ? estimatedPlaybackRate : 0.0);
+        const double predictedMovement = playbackVel * 2.0; // 2 seconds ahead
+        const int predictedBins = static_cast<int>(std::ceil(predictedMovement * binPerSecond));
+        
+        // Adaptive preload: more when moving fast, less when paused
+        const int basePreload = streamingPreloadBins * 2;  // Base 2x preload
+        const int velocityPreload = std::min(predictedBins * 2, streamingPreloadBins * 12); // Cap at 12x
+        const int totalPreload = basePreload + velocityPreload;
+        
+        // Determine preload direction based on velocity
+        int preloadAhead = totalPreload;
+        int preloadBehind = basePreload; // Always keep some behind
+        
+        if (playbackVel > 0.001) {
+            // Moving: preload more ahead, less behind
+            preloadAhead = totalPreload;
+            preloadBehind = basePreload / 2;
+        }
+        
+        const int neededStartBin = std::max(0, leftBin - preloadBehind);
+        int neededEndBin = rightBin + preloadAhead;
         if (streamingTotalBins > 0) {
             neededEndBin = std::min(streamingTotalBins, neededEndBin);
         }
@@ -593,9 +614,17 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         audioStart = std::max(0.0, audioStart);
         audioEnd   = std::min(localAudioLength, audioEnd);
 
+        // CRITICAL FIX: Bins are indexed from audioStartOffset (first audible sample), NOT absolute file time
+        // audioStart/audioEnd are already in "playable audio" space (0 = first audible sample)
+        // binPerSecond maps playable-audio-seconds directly to bin index
+        // NO need to subtract audioStartOffsetSec here - already normalized in analyzeFile()
         const int gb0 = static_cast<int>(std::floor(audioStart * binPerSecond));
         const int gb1 = std::max(gb0 + 1, static_cast<int>(std::ceil(audioEnd * binPerSecond)));
 
+        // Clamp to actual available bin range (may be subset during streaming)
+        const int safeGb0 = std::clamp(gb0, localAvailableStartBin, localAvailableEndBin);
+        const int safeGb1 = std::clamp(gb1, safeGb0, localAvailableEndBin);
+        
         float minVal = 0.0f, maxVal = 0.0f;
         float sumLow = 0.0f, sumMid = 0.0f, sumHigh = 0.0f;
         bool have = false;
@@ -610,8 +639,11 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
             std::lock_guard<std::mutex> fbLock(fallbackMutex_);
             if (!fallbackMaxBins_.empty()) {
                 const int fallbackBins = static_cast<int>(fallbackMaxBins_.size());
-                const double fallbackBinPerSec = streamingTotalBins > 0 
-                    ? (double)fallbackBins / audioLength : 1.0;
+                // FIXED: Fallback bins also map from audioStart (not absolute file time)
+                // Use same binPerSecond as main waveform for consistency
+                const double fallbackBinPerSec = (streamingTotalBins > 0 && audioLength > 0.0)
+                    ? (double)streamingTotalBins / audioLength 
+                    : binPerSecond;
                 
                 int fb0 = static_cast<int>(std::floor(audioStart * fallbackBinPerSec));
                 int fb1 = static_cast<int>(std::ceil(audioEnd * fallbackBinPerSec));
@@ -636,24 +668,25 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         }
         
     // === LAYER 2: ADAPTIVE CHUNKS (high-quality overlay) ===
-    // FIX: Nur bei Pause/Seek oder sehr niedriger Geschwindigkeit nutzen
-    // Verhindert teure Kopien/Locks während aktiver Wiedergabe
+    // OPTIMIZED: Only use during pause/seek to avoid lock contention + early exit optimization
     if (useChunksNow) {
             std::shared_lock<std::shared_mutex> lock(adaptiveChunksMutex_);
             if (!adaptiveChunks_.empty()) {
                 for (const auto& chunk : adaptiveChunks_) {
+                    // Early exit: skip non-overlapping chunks
                     if (chunk.endBin <= gb0 || chunk.startBin >= gb1) continue;
                     
-                    int overlapStart = std::max(gb0, chunk.startBin);
-                    int overlapEnd = std::min(gb1, chunk.endBin);
-                    int localStart = overlapStart - chunk.startBin;
-                    int localEnd = overlapEnd - chunk.startBin;
+                    const int overlapStart = std::max(gb0, chunk.startBin);
+                    const int overlapEnd = std::min(gb1, chunk.endBin);
+                    const int localStart = overlapStart - chunk.startBin;
+                    const int localEnd = overlapEnd - chunk.startBin;
+                    const int chunkSize = static_cast<int>(chunk.maxBins.size());
                     
-                    for (int i = localStart; i < localEnd; ++i) {
-                        if (i < 0 || i >= static_cast<int>(chunk.maxBins.size())) continue;
-                        
-                        float vmin = chunk.minBins[i];
-                        float vmax = chunk.maxBins[i];
+                    // Fast path: bounds-checked loop without per-iteration checks
+                    const int safeLocalEnd = std::min(localEnd, chunkSize);
+                    for (int i = std::max(0, localStart); i < safeLocalEnd; ++i) {
+                        const float vmin = chunk.minBins[i];
+                        const float vmax = chunk.maxBins[i];
                         
                         if (!have) {
                             minVal = vmin;
@@ -664,7 +697,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
                             maxVal = std::max(maxVal, vmax);
                         }
                         
-                        // Aggregate band energies from chunks if available
+                        // Band energy aggregation with reduced bounds checks
                         if (i < static_cast<int>(chunk.lowBins.size())) {
                             sumLow += std::max(0.0f, chunk.lowBins[i]);
                             ++count;
@@ -676,46 +709,65 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
                             sumHigh += std::max(0.0f, chunk.highBins[i]);
                         }
                     }
+                    
+                    // Early exit: first matching chunk provides data, don't iterate further
+                    // (chunks should not overlap in normal operation)
+                    if (have) break;
                 }
             }
         }
         
-        // === LAYER 3: LEGACY STREAMING BINS (fallback if no chunks) ===
-        // OPTIMIZED: Use oversampling with smooth interpolation for better zoom quality
-        if (!have) {
+        // === LAYER 3: STREAMING BINS (main high-res source) ===
+        // OPTIMIZED: Reduced per-iteration overhead with early termination
+        if (!have && totalLocalBins > 0) {
             const int oversampleSteps = std::max(2, static_cast<int>(oversampleFactor));
             const double stepWidth = audioWidthPerPixel / oversampleSteps;
             
-            for (int step = 0; step < oversampleSteps; ++step) {
-                const double sampleSec = audioStart + step * stepWidth;
-                if (sampleSec < 0.0 || sampleSec >= localAudioLength) continue;
-                
-                const double exactBinIndex = sampleSec * binPerSecond;
-                const int binIdx = static_cast<int>(exactBinIndex);
-                const int localIdx = binIdx - localAvailableStartBin;
-                
-                if (localIdx >= 0 && localIdx < totalLocalBins) {
-                    // Smooth interpolated sampling
-                    float vmin = sampleBinSmooth(localSourceMinBins, exactBinIndex - localAvailableStartBin);
-                    float vmax = sampleBinSmooth(localSourceMaxBins, exactBinIndex - localAvailableStartBin);
+            // Fast path: pre-calculate bounds to avoid repeated checks
+            const double localMinTime = std::max(0.0, audioStart);
+            const double localMaxTime = std::min(localAudioLength, audioEnd);
+            
+            // Check band availability once before loop
+            const bool hasLow = !localSourceLowBins.empty();
+            const bool hasMid = !localSourceMidBins.empty();
+            const bool hasHigh = !localSourceHighBins.empty();
+            
+            if (localMinTime < localMaxTime) {
+                for (int step = 0; step < oversampleSteps; ++step) {
+                    const double sampleSec = audioStart + step * stepWidth;
+                    
+                    // Quick bounds check with pre-calculated limits
+                    if (sampleSec < localMinTime || sampleSec >= localMaxTime) continue;
+                    
+                    const double exactBinIndex = sampleSec * binPerSecond;
+                    const double localBinIndex = exactBinIndex - localAvailableStartBin;
+                    
+                    // Bounds check once before sampling
+                    if (localBinIndex < 0.0 || localBinIndex >= totalLocalBins - 1) continue;
+                    
+                    // Smooth interpolated sampling (sampleBinSmooth handles fractional indexing)
+                    const float vmin = sampleBinSmooth(localSourceMinBins, localBinIndex);
+                    const float vmax = sampleBinSmooth(localSourceMaxBins, localBinIndex);
                     
                     if (!have) {
-                        minVal = vmin; maxVal = vmax; have = true;
+                        minVal = vmin; 
+                        maxVal = vmax; 
+                        have = true;
                     } else {
                         minVal = std::min(minVal, vmin);
                         maxVal = std::max(maxVal, vmax);
                     }
                     
-                    // Aggregate band energies with interpolation
-                    if (!localSourceLowBins.empty()) {
-                        sumLow += std::max(0.0f, sampleBinSmooth(localSourceLowBins, exactBinIndex - localAvailableStartBin));
+                    // Band energy aggregation (availability already checked before loop)
+                    if (hasLow) {
+                        sumLow += std::max(0.0f, sampleBinSmooth(localSourceLowBins, localBinIndex));
                         ++count;
                     }
-                    if (!localSourceMidBins.empty()) {
-                        sumMid += std::max(0.0f, sampleBinSmooth(localSourceMidBins, exactBinIndex - localAvailableStartBin));
+                    if (hasMid) {
+                        sumMid += std::max(0.0f, sampleBinSmooth(localSourceMidBins, localBinIndex));
                     }
-                    if (!localSourceHighBins.empty()) {
-                        sumHigh += std::max(0.0f, sampleBinSmooth(localSourceHighBins, exactBinIndex - localAvailableStartBin));
+                    if (hasHigh) {
+                        sumHigh += std::max(0.0f, sampleBinSmooth(localSourceHighBins, localBinIndex));
                     }
                 }
             }

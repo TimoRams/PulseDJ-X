@@ -383,6 +383,25 @@ void MenuBar::setupSystemMonitoring() {
     batteryLayout->addWidget(batteryLabel);
     systemLayout->addWidget(batteryWidget);
     
+    // Audio latency display
+    auto latencyWidget = new QWidget();
+    auto latencyLayout = new QVBoxLayout(latencyWidget);
+    latencyLayout->setContentsMargins(0, 0, 0, 0);
+    latencyLayout->setSpacing(0);
+    
+    latencyValue = new QLabel("0.0ms");
+    latencyValue->setStyleSheet("color: #00ccff; font-size: 9px; font-weight: bold;");
+    latencyValue->setAlignment(Qt::AlignCenter);
+    latencyValue->setFixedWidth(40);
+    
+    latencyLabel = new QLabel("LATENCY");
+    latencyLabel->setStyleSheet("color: #888; font-size: 7px;");
+    latencyLabel->setAlignment(Qt::AlignCenter);
+    
+    latencyLayout->addWidget(latencyValue);
+    latencyLayout->addWidget(latencyLabel);
+    systemLayout->addWidget(latencyWidget);
+    
     systemLayout->addSpacing(15);
     
     windowControlsWidget = new QWidget();
@@ -875,6 +894,36 @@ void MenuBar::updateBatteryLevel(int percentage, bool isCharging) {
 void MenuBar::updateMasterLevels(double leftLevel, double rightLevel) {
     masterLeftBar->setValue(static_cast<int>(leftLevel * 100));
     masterRightBar->setValue(static_cast<int>(rightLevel * 100));
+}
+
+void MenuBar::updateAudioLatency(double latencyMs) {
+    if (!latencyValue) return;
+    
+    // Format latency value with appropriate precision
+    QString text;
+    if (latencyMs < 1.0) {
+        text = QString("%1ms").arg(latencyMs, 0, 'f', 2); // e.g., "0.47ms"
+    } else if (latencyMs < 10.0) {
+        text = QString("%1ms").arg(latencyMs, 0, 'f', 1); // e.g., "5.1ms"
+    } else {
+        text = QString("%1ms").arg(static_cast<int>(latencyMs + 0.5)); // e.g., "23ms"
+    }
+    
+    latencyValue->setText(text);
+    
+    // Color coding based on latency range
+    QString color;
+    if (latencyMs < 10.0) {
+        color = "#00ff88";  // Green - excellent latency
+    } else if (latencyMs < 20.0) {
+        color = "#00ccff";  // Cyan - good latency
+    } else if (latencyMs < 50.0) {
+        color = "#ffaa00";  // Orange - acceptable
+    } else {
+        color = "#ff4444";  // Red - high latency
+    }
+    
+    latencyValue->setStyleSheet(QString("color: %1; font-size: 9px; font-weight: bold;").arg(color));
 }
 
 void MenuBar::mousePressEvent(QMouseEvent* event) {

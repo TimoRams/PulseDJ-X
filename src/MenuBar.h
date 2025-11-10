@@ -38,6 +38,7 @@ public:
     void updateRamUsage(double percentage);
     void updateBatteryLevel(int percentage, bool isCharging);
     void updateMasterLevels(double leftLevel, double rightLevel);
+    void updateAudioLatency(double latencyMs);
 
 private slots:
     void updateSystemStats();
@@ -106,6 +107,8 @@ private:
     QLabel* cpuLabel;
     QLabel* ramLabel;
     QLabel* batteryLabel;
+    QLabel* latencyLabel;
+    QLabel* latencyValue;
 
     // System monitoring timer
     QTimer* systemTimer;

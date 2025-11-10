@@ -244,9 +244,9 @@ private:
     bool keylockEnabled{false};
     // Debug logging for keylock paths
     bool debugKeylock{false};
-    // Short warm-up delay for keylock to ensure internal buffers are primed (~5ms)
+    // Short warm-up delay for keylock to ensure internal buffers are primed (~0.5ms)
     int keylockPrimeSamplesRemaining{0};
-    double keylockPrimeMs{5.0};
+    double keylockPrimeMs{0.5};  // Ultra-minimal: 0.5ms für absolute lowest latency
     
     // Quantize state
     bool quantizeEnabled{false};

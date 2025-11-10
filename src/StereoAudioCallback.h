@@ -34,6 +34,13 @@ public:
     void setVolumeB(float vol);
     void setCrossfader(float pos);
     void setMasterVolume(float vol);
+    
+    // Safely detach players before destruction
+    void detachPlayers() {
+        isShuttingDown.store(true);
+        audioPlayerA = nullptr;
+        audioPlayerB = nullptr;
+    }
 
 private:
     DJAudioPlayer* audioPlayerA{nullptr};
@@ -45,4 +52,5 @@ private:
     std::atomic<float> volumeB{1.0f};
     std::atomic<float> crossfaderPos{0.0f};
     std::atomic<float> masterVolume{1.0f};
+    std::atomic<bool> isShuttingDown{false};
 };

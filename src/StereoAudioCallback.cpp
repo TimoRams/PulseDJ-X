@@ -35,6 +35,17 @@ void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* i
                                                            const juce::AudioIODeviceCallbackContext& context) {
     juce::ignoreUnused(inputChannelData, numInputChannels, context);
 
+    // CRITICAL: Check shutdown flag FIRST before accessing ANYTHING
+    if (isShuttingDown.load()) {
+        // Immediately silence all outputs and return
+        for (int ch = 0; ch < numOutputChannels; ++ch) {
+            if (auto* out = outputChannelData[ch]) {
+                juce::FloatVectorOperations::clear(out, numSamples);
+            }
+        }
+        return;
+    }
+
     static int callCount = 0;
     static bool infoLogged = false;
 
@@ -71,12 +82,23 @@ void StereoAudioCallback::audioDeviceIOCallbackWithContext(const float* const* i
     juce::AudioSourceChannelInfo bufferInfoA{&tempBufferA, 0, numSamples};
     juce::AudioSourceChannelInfo bufferInfoB{&tempBufferB, 0, numSamples};
 
+    // Check if players are still valid and safe to access
     if (audioPlayerA) {
-        audioPlayerA->getNextAudioBlock(bufferInfoA);
+        try {
+            audioPlayerA->getNextAudioBlock(bufferInfoA);
+        } catch (...) {
+            // Player might be in shutdown, silence this channel
+            tempBufferA.clear();
+        }
     }
 
     if (audioPlayerB) {
-        audioPlayerB->getNextAudioBlock(bufferInfoB);
+        try {
+            audioPlayerB->getNextAudioBlock(bufferInfoB);
+        } catch (...) {
+            // Player might be in shutdown, silence this channel
+            tempBufferB.clear();
+        }
     }
 
     for (int ch = 0; ch < numOutputChannels; ++ch) {
@@ -151,6 +173,7 @@ void StereoAudioCallback::audioDeviceAboutToStart(juce::AudioIODevice* device) {
 
 void StereoAudioCallback::audioDeviceStopped() {
     std::cout << "StereoAudioCallback: Device stopped" << std::endl;
+    isShuttingDown.store(true);
 }
 
 void StereoAudioCallback::setVolumeA(float vol) {

@@ -115,6 +115,22 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     
     menuBar = new MenuBar(this);
     
+    // Setup latency monitoring timer
+    auto* latencyTimer = new QTimer(this);
+    connect(latencyTimer, &QTimer::timeout, this, [this]() {
+        if (menuBar && (playerA || playerB)) {
+            // Get latency from both decks and use the max (or from the playing deck)
+            double latencyA = playerA ? playerA->getMeasuredLatencyMs() : 0.0;
+            double latencyB = playerB ? playerB->getMeasuredLatencyMs() : 0.0;
+            
+            // Use the higher latency value (both should be similar if using same RB settings)
+            double maxLatency = std::max(latencyA, latencyB);
+            
+            menuBar->updateAudioLatency(maxLatency);
+        }
+    });
+    latencyTimer->start(100); // Update every 100ms
+    
     if (!sharedFormatManager) {
         auto manager = std::make_shared<juce::AudioFormatManager>();
         manager->registerBasicFormats();
@@ -617,7 +633,7 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     });
 
     // Initialize new LibraryManager with ID3 tag support
-    libraryManager = new LibraryManager(sharedFormatManager.get(), this);
+    libraryManager = new LibraryManager(sharedFormatManager, this);
     
     // Connect library manager signals to deck loading
     connect(libraryManager, &LibraryManager::fileSelected, this, [this](const QString& filePath) {
@@ -910,12 +926,12 @@ void QtMainWindow::initializeAudio()
             return;
         }
 
-        // Request an audio buffer size close to 5 ms to minimize audible glitches on seek/keylock
+        // Request an audio buffer size close to 3 ms to minimize latency (optimized for low-latency DJ use)
         {
             juce::AudioDeviceManager::AudioDeviceSetup setup;
             deviceManager.getAudioDeviceSetup(setup);
             const double sr = (setup.sampleRate > 0.0) ? setup.sampleRate : currentDevice->getCurrentSampleRate();
-            const int targetSamples = (sr > 0.0) ? std::max(32, (int) std::lround(sr * 0.005)) : 256; // ~5 ms
+            const int targetSamples = (sr > 0.0) ? std::max(64, (int) std::lround(sr * 0.003)) : 128; // ~3 ms (reduced from 5ms)
 
             int chosen = targetSamples;
 #if JUCE_MODULE_AVAILABLE_juce_audio_devices
@@ -971,14 +987,44 @@ void QtMainWindow::initializeAudio()
 
 QtMainWindow::~QtMainWindow()
 {
+    qDebug() << "[DESTRUCTOR] MainWindow destructor called";
+    
     if (cursorOverridden) {
         QApplication::restoreOverrideCursor();
         cursorOverridden = false;
         currentCursorShape = Qt::ArrowCursor;
     }
+    
     if (!cleanupCompleted) {
+        qDebug() << "[DESTRUCTOR] Cleanup not done yet, calling performCleanup()";
         performCleanup();
     }
+    
+    // CRITICAL: Manually destroy objects in safe order to prevent destructor crashes
+    // C++ destroys members in REVERSE declaration order, which can cause issues
+    qDebug() << "[DESTRUCTOR] Manually destroying critical objects in safe order...";
+    
+    // 1. Destroy callback FIRST (no more audio processing)
+    stereoCallback.reset();
+    
+    // 2. Destroy scratch engines (may reference players)
+    scratchEngineA.reset();
+    scratchEngineB.reset();
+    
+    // 3. Destroy players
+    playerA.reset();
+    playerB.reset();
+    
+    // 4. Destroy BPM analyzer
+    bpmAnalyzer.reset();
+    
+    // 5. CRITICAL: Reset shared format manager to prevent static destruction issues
+    if (sharedFormatManager && sharedFormatManager.use_count() == 1) {
+        qDebug() << "[DESTRUCTOR] Resetting sharedFormatManager (last reference)";
+        sharedFormatManager.reset();
+    }
+    
+    qDebug() << "[DESTRUCTOR] MainWindow destructor completed";
 }
 
 void QtMainWindow::performCleanup()
@@ -986,9 +1032,26 @@ void QtMainWindow::performCleanup()
     if (cleanupCompleted) [[unlikely]] return;
     
     try {
+        // CRITICAL STEP 1: Set shutdown flag IMMEDIATELY to stop all audio processing
+        qDebug() << "[CLEANUP] Step 1: Setting shutdown flag...";
+        if (stereoCallback) {
+            stereoCallback->detachPlayers();
+        }
+        
+        // CRITICAL STEP 2: Wait to ensure any in-flight callbacks complete
+        qDebug() << "[CLEANUP] Step 2: Waiting 100ms for callbacks to finish...";
+        QThread::msleep(100); // Increased from 30ms
+        
         // Stop periodic UI updates early to avoid timers firing during teardown
+        qDebug() << "[CLEANUP] Step 3: Stopping timers...";
         if (positionUpdateTimer) {
             positionUpdateTimer->stop();
+            positionUpdateTimer->disconnect();
+        }
+        
+        if (waveformFillInTimer) {
+            waveformFillInTimer->stop();
+            waveformFillInTimer->disconnect();
         }
 
         // Proactively disconnect waveform region requests to avoid late queued invokes
@@ -999,34 +1062,74 @@ void QtMainWindow::performCleanup()
             disconnect(connWaveformRegionB);
         }
 
-        if (playerA) playerA->stop();
-        if (playerB) playerB->stop();
+        // Stop players (audio callback already disabled by shutdown flag)
+        qDebug() << "[CLEANUP] Step 4: Stopping and unloading players...";
+        if (playerA) {
+            playerA->stop();
+            playerA->unload();
+        }
+        if (playerB) {
+            playerB->stop();
+            playerB->unload();
+        }
+
+        if (deckA) {
+            deckA->detachPlayer();
+        }
+        if (deckB) {
+            deckB->detachPlayer();
+        }
         
+        // Wait again before touching audio system
+        qDebug() << "[CLEANUP] Step 5: Waiting 100ms before audio system cleanup...";
+        QThread::msleep(100);
+        
+        // Now safe to remove audio callbacks (no processing happening anymore)
+        qDebug() << "[CLEANUP] Step 6: Removing audio callbacks...";
         if (stereoCallback) {
             deviceManager.removeAudioCallback(stereoCallback.get());
         }
         deviceManager.removeAudioCallback(&masterLevelMonitor);
         
+        // Close audio device
+        qDebug() << "[CLEANUP] Step 7: Closing audio device...";
         deviceManager.closeAudioDevice();
         
+        // Final wait to ensure device is fully closed
+        qDebug() << "[CLEANUP] Step 8: Waiting 50ms for device close...";
+        QThread::msleep(50);
+        
+        // Wait for all background tasks to complete
+        qDebug() << "[CLEANUP] Step 9: Waiting for thread pools...";
         if (bpmThreadPool) {
-            bpmThreadPool->waitForDone(1000);
+            bpmThreadPool->waitForDone(2000); // Increased timeout
         }
         if (waveformThreadPool) {
-            waveformThreadPool->waitForDone(1000);
+            waveformThreadPool->waitForDone(2000); // Increased timeout
         }
         
+        // Now safe to destroy players (RubberBand already cleaned up by unload())
+        qDebug() << "[CLEANUP] Step 10: Destroying player objects...";
         playerA.reset();
         playerB.reset();
         bpmAnalyzer.reset();
+        
+        // CRITICAL: Destroy stereoCallback AFTER players to prevent destructor issues
+        qDebug() << "[CLEANUP] Step 11: Destroying stereoCallback...";
+        stereoCallback.reset();
         
         if (sharedFormatManager && sharedFormatManager.use_count() == 1) {
             sharedFormatManager.reset();
         }
         
+        qDebug() << "[CLEANUP] COMPLETED SUCCESSFULLY";
         cleanupCompleted = true;
         
+    } catch (const std::exception& e) {
+        qWarning() << "Exception during cleanup:" << e.what();
+        cleanupCompleted = true;
     } catch (...) {
+        qWarning() << "Unknown exception during cleanup";
         cleanupCompleted = true;
     }
 }
@@ -1088,7 +1191,12 @@ void QtMainWindow::closeEvent(QCloseEvent* event)
     shutdownProgress.close();
 
     event->accept();
-    QApplication::quit();
+    
+    // CRITICAL: Delay quit to ensure window is fully destroyed first
+    QTimer::singleShot(100, []() {
+        qDebug() << "[APP] Quitting application...";
+        QApplication::quit();
+    });
 }
 
 void QtMainWindow::onCrossfader(int v) {

@@ -15,6 +15,11 @@
 #include <memory>
 #include <expected>
 #include <print>
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+#include <cstdio>
+#include <iterator>
 
 namespace
 {
@@ -44,6 +49,30 @@ void configureSurfaceDefaults() noexcept
 inline void processUiEvents() noexcept
 {
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
+
+void crashHandler(int signalNumber) noexcept
+{
+    constexpr const char prefix[] = "\n*** Crash Detected ***\nsignal: ";
+    ::write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    char buf[16];
+    int len = std::snprintf(buf, sizeof(buf), "%d\n", signalNumber);
+    if (len > 0) {
+        ::write(STDERR_FILENO, buf, static_cast<size_t>(len));
+    }
+    void* frames[64];
+    const int captured = ::backtrace(frames, std::size(frames));
+    if (captured > 0) {
+        ::backtrace_symbols_fd(frames, captured, STDERR_FILENO);
+    }
+    std::signal(signalNumber, SIG_DFL);
+    std::raise(signalNumber);
+}
+
+void installCrashHandler() noexcept
+{
+    std::signal(SIGSEGV, crashHandler);
+    std::signal(SIGABRT, crashHandler);
 }
 }
 
@@ -117,6 +146,7 @@ private:
 
 int main(int argc, char** argv)
 {
+    installCrashHandler();
     configureSurfaceDefaults();
     QApplication app(argc, argv);
 

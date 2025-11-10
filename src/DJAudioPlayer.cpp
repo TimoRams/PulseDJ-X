@@ -68,15 +68,29 @@ DJAudioPlayer::DJAudioPlayer(AudioFormatManager &_formatManager)
 
 DJAudioPlayer::~DJAudioPlayer() {
     try {
+        // Ensure no audio processing is happening
+        forceSilent.store(true);
+        softPaused.store(true);
+        scratchMode.store(false);
+        
+        // Stop transport first
         transportSource.stop();
+        
+        // Small delay to ensure any pending callbacks complete
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+#if defined(RUBBERBAND_FOUND)
+        // Clean up RubberBand before disconnecting sources
+        rb.reset();
+        rbReady = false;
+#endif
+        
+        // Now safe to disconnect and release
         transportSource.setSource(nullptr);
         resampleSource.releaseResources();
         transportSource.releaseResources();
         readerSource.reset();
         
-#if defined(RUBBERBAND_FOUND)
-        rb.reset();
-#endif
     } catch (const std::exception& e) {
         std::cout << "Exception in DJAudioPlayer destructor: " << e.what() << std::endl;
     } catch (...) {
@@ -165,6 +179,7 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             updateResampleRatio();
 #if defined(RUBBERBAND_FOUND)
             if (!rbReady) {
+                // Ensure RB is available and primed when enabling
                 rbReady = true;
                 rbPaddedStartDone = false;
                 rbDiscardOutRemaining = 0;
@@ -172,10 +187,11 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             }
 #endif
         } else {
+            // Keep RubberBand instance ready even when UI disables keylock to avoid
+            // latency/discontinuity shifts caused by tearing down / reinitializing
+            // the stretcher. We still update resampling state for other paths.
             updateResampleRatio();
-#if defined(RUBBERBAND_FOUND)
-            rbReady = false;
-#endif
+            // Intentionally do NOT set rbReady = false here - keep RB available.
         }
     }
 
@@ -190,6 +206,27 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         renderScratchAudio(bufferToFill);
         transitionBufferValid = false;
         transitionSamplesRemaining = 0;
+        
+        // Scratch mode latency measurement (minimal - direktes sample fetching)
+        if (currentSampleRate > 0.0) {
+            int totalLatencySamples = 0;
+            
+            // 1. Audio system buffer (immer)
+            totalLatencySamples += lastBlockSizeHint;
+            
+            // 2. Scratch cache access latency (sehr klein)
+            totalLatencySamples += 4; // ~0.1ms bei 48kHz
+            
+            // 3. DSP Effects (falls aktiv)
+            totalLatencySamples += (dspPrepared ? 8 : 0);
+            
+            // 4. Hardware output
+            totalLatencySamples += (int)(currentSampleRate * 0.001);
+            
+            measuredLatencyMs.store((totalLatencySamples / currentSampleRate) * 1000.0);
+            latencyCompensationSamples = totalLatencySamples;
+        }
+        
         return;
     }
 
@@ -395,15 +432,57 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
 #if defined(RUBBERBAND_FOUND)
     if (rbReady && rb) [[likely]] {
         const bool isKeylockActive = keylockEnabled;
+        const int desiredOut = bufferToFill.numSamples;
+        const int chsOut = bufferToFill.buffer->getNumChannels();
         
-        if (rbLatencySamples > 0 && currentSampleRate > 0.0) {
-            measuredLatencyMs.store((rbLatencySamples / currentSampleRate) * 1000.0);
-            latencyCompensationSamples = rbLatencySamples;
+        // COMPREHENSIVE LATENCY MEASUREMENT: ALL audio pipeline components
+        if (currentSampleRate > 0.0) {
+            int totalLatencySamples = 0;
+            
+            // 1. RubberBand algorithmic latency (wenn keylock aktiv)
+            if (isKeylockActive) {
+                totalLatencySamples += rbLatencySamples;
+            }
+            
+            // 2. Audio system buffer latency (immer vorhanden)
+            totalLatencySamples += lastBlockSizeHint;
+            
+            // 3. RubberBand internal buffer occupancy (nur überschüssiges, aggressiv gerechnet)
+            if (isKeylockActive) {
+                const int availableSamples = rb->available();
+                const int minRequired = desiredOut;
+                const int excessBuffer = std::max(0, availableSamples - minRequired);
+                // Nur 25% des Excess als Latenz zählen (rest ist notwendiger Puffer)
+                totalLatencySamples += (excessBuffer / 4); // Changed from /2
+            }
+            
+            // 4. Resampling latency (immer vorhanden, auch ohne keylock)
+            const double resampleRatio = isKeylockActive ? 1.0 : effectiveSpeed();
+            const int resamplingLatency = std::max(0, (int)(lastBlockSizeHint * 0.2 / resampleRatio)); // Reduced from 0.3
+            totalLatencySamples += resamplingLatency;
+            
+            // 5. DSP Effects latency (EQ filters, SVF)
+            // IIR filters haben typisch 1-2 samples group delay
+            const int dspFilterLatency = dspPrepared ? 6 : 0; // Reduced from 8
+            totalLatencySamples += dspFilterLatency;
+            
+            // 6. Fade/Crossfade processing latency (wenn aktiv)
+            if (transitionBufferValid || fadeSamplesRemaining > 0) {
+                totalLatencySamples += std::min(16, lastBlockSizeHint / 8); // Reduced from 32 and /4
+            }
+            
+            // 7. Hardware output latency estimation (typisch 0.5-2ms bei low-latency drivers)
+            // Dies ist eine Schätzung - echte HW-Latency müsste vom System abgefragt werden
+            const int hwLatencyEstimate = (int)(currentSampleRate * 0.0008); // Reduced from 0.001 (1ms -> 0.8ms)
+            totalLatencySamples += hwLatencyEstimate;
+            
+            measuredLatencyMs.store((totalLatencySamples / currentSampleRate) * 1000.0);
+            latencyCompensationSamples = totalLatencySamples;
         }
         
         if (debugKeylock) std::cout << "[RB] Enter path: keylock=" << isKeylockActive 
-                                     << ", desiredOut=" << bufferToFill.numSamples
-                                     << ", chsOut=" << bufferToFill.buffer->getNumChannels() << std::endl;
+                                     << ", desiredOut=" << desiredOut
+                                     << ", chsOut=" << chsOut << std::endl;
         if (lastBlockSizeHint <= 0 || currentSampleRate <= 0.0) [[unlikely]] {
             if (debugKeylock) std::cout << "[KL][RB] Not ready: lastBlockSizeHint=" << lastBlockSizeHint
                                         << ", SR=" << currentSampleRate << ". Fallback." << std::endl;
@@ -438,39 +517,46 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             return;
         }
         
-        if (!isKeylockActive) [[unlikely]] {
-            if (debugKeylock) std::cout << "[RB] Keylock OFF - using normal resampling" << std::endl;
-            resampleSource.setResamplingRatio(effectiveSpeed()); // Normal pitch+tempo changes
-            resampleSource.getNextAudioBlock(bufferToFill);
-            measuredLatencyMs.store(0.0);
-            latencyCompensationSamples = 0;
-            
-            // Apply crossfade transition if switching from keylock
-            if (transitionBufferValid && transitionSamplesRemaining > 0 && !transitionToKeylock) {
-                applyCrossfadeTransition(bufferToFill);
-            }
-            return;
-        }
+        // NOTE: RubberBand remains active even when keylock is OFF to avoid latency
+        // discontinuities when toggling. When keylock is OFF, we run RB in pass-through
+        // mode (timeRatio=1.0, pitchScale=1.0) and let the upstream resampler handle
+        // speed changes with natural pitch shifting (vinyl behavior).
         
         try {
     const double speed = effectiveSpeed();
-        double timeRatio = 1.0 / speed;
-        if (std::abs(timeRatio - rbLastTimeRatio) > 1e-4) {
-            rb->setTimeRatio(timeRatio);
-            rbLastTimeRatio = timeRatio;
-            if (debugKeylock) std::cout << "[RB] setTimeRatio=" << timeRatio << std::endl;
-        }
-        rb->setPitchScale(1.0);
-
-    const int desiredOut = bufferToFill.numSamples;
-    const int chsOut = bufferToFill.buffer->getNumChannels();
     const int chsRB = rbNumChannels;
 
-        resampleSource.setResamplingRatio(1.0);
+        if (isKeylockActive) {
+            // KEYLOCK ON: RB does time-stretching while preserving pitch
+            // Resampler feeds RB at 1:1, RB stretches time
+            resampleSource.setResamplingRatio(1.0);
+            double timeRatio = 1.0 / speed;
+            if (std::abs(timeRatio - rbLastTimeRatio) > 1e-4) {
+                rb->setTimeRatio(timeRatio);
+                rbLastTimeRatio = timeRatio;
+                if (debugKeylock) std::cout << "[RB] Keylock ON: setTimeRatio=" << timeRatio << std::endl;
+            }
+            rb->setPitchScale(1.0);
+        } else {
+            // KEYLOCK OFF: RB runs in pass-through (1:1), resampler does speed+pitch change
+            // This gives natural vinyl behavior (faster = higher pitch)
+            resampleSource.setResamplingRatio(effectiveSpeed());
+            if (std::abs(1.0 - rbLastTimeRatio) > 1e-4) {
+                rb->setTimeRatio(1.0);
+                rbLastTimeRatio = 1.0;
+                if (debugKeylock) std::cout << "[RB] Keylock OFF: pass-through mode" << std::endl;
+            }
+            rb->setPitchScale(1.0);
+        }
 
         if (!rbPaddedStartDone) {
             size_t pad = rb->getPreferredStartPad();
-            if (debugKeylock) std::cout << "[KL][RB] preferredStartPad=" << pad << std::endl;
+            // ULTRA-OPTIMIZED: Minimal padding for absolute lowest latency
+            // DJ mixing prioritizes latency over perfect transient analysis
+            const size_t maxPad = static_cast<size_t>(currentSampleRate * 0.002); // Max 2ms (reduced from 5ms)
+            pad = std::min(pad, maxPad);
+            
+            if (debugKeylock) std::cout << "[KL][RB] preferredStartPad=" << pad << " (capped at " << maxPad << ")" << std::endl;
             if (pad > 0) {
                 if (rbInputBuffer.getNumChannels() < chsRB || rbInputBuffer.getNumSamples() < (int)pad)
                     rbInputBuffer.setSize(chsRB, (int)pad, false, true, true);
@@ -495,6 +581,12 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
                 needIn = (int)std::ceil((desiredOut - produced) / tr);
             }
             if (needIn <= 0) break;
+            
+            // ULTRA-OPTIMIZED: Sehr konservatives Feeding für minimale Latenz
+            // Nur das absolut Notwendige füttern, nicht mehr
+            const int maxFeedPerCycle = std::min(needIn, lastBlockSizeHint); // Limit to 1x block size (reduced from 2x)
+            needIn = std::min(needIn, maxFeedPerCycle);
+            
             if (rbInputBuffer.getNumChannels() < chsRB || rbInputBuffer.getNumSamples() < needIn)
                 rbInputBuffer.setSize(chsRB, needIn, false, true, true);
 
@@ -582,8 +674,10 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         }
         resumeCompensatePending = false;
         
-        // Apply crossfade transition if switching to keylock
-        if (transitionBufferValid && transitionSamplesRemaining > 0 && transitionToKeylock) {
+        // Apply any pending crossfade transition (both enabling and disabling
+        // keylock should use the prepared transition buffer). Keep this
+        // unconditional so toggling direction still crossfades smoothly.
+        if (transitionBufferValid && transitionSamplesRemaining > 0) {
             applyCrossfadeTransition(bufferToFill);
         }
         } catch (const std::exception& e) {
@@ -608,8 +702,38 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
         
         resampleSource.setResamplingRatio(effectiveSpeed());
         resampleSource.getNextAudioBlock(bufferToFill);
-        measuredLatencyMs.store(0.0);
-        latencyCompensationSamples = 0;
+        
+        // Latency measurement WITHOUT RubberBand (normal playback mode)
+        if (currentSampleRate > 0.0) {
+            int totalLatencySamples = 0;
+            
+            // 1. Audio system buffer latency
+            totalLatencySamples += lastBlockSizeHint;
+            
+            // 2. Resampling latency (speed-dependent)
+            const double resampleRatio = effectiveSpeed();
+            const int resamplingLatency = std::max(0, (int)(lastBlockSizeHint * 0.3 / resampleRatio));
+            totalLatencySamples += resamplingLatency;
+            
+            // 3. DSP Effects latency
+            const int dspFilterLatency = dspPrepared ? 8 : 0;
+            totalLatencySamples += dspFilterLatency;
+            
+            // 4. Fade processing (wenn aktiv)
+            if (fadeSamplesRemaining > 0) {
+                totalLatencySamples += std::min(32, lastBlockSizeHint / 4);
+            }
+            
+            // 5. Hardware output latency estimation
+            const int hwLatencyEstimate = (int)(currentSampleRate * 0.001); // ~1ms
+            totalLatencySamples += hwLatencyEstimate;
+            
+            measuredLatencyMs.store((totalLatencySamples / currentSampleRate) * 1000.0);
+            latencyCompensationSamples = totalLatencySamples;
+        } else {
+            measuredLatencyMs.store(0.0);
+            latencyCompensationSamples = 0;
+        }
         
         static int normalPlaybackCounter = 0;
         if (++normalPlaybackCounter % 2000 == 0) [[unlikely]] {
@@ -1323,9 +1447,15 @@ void DJAudioPlayer::stop() {
 
 void DJAudioPlayer::unload() {
     try {
-        transportSource.stop();
-        softPaused.store(false);
+        // First: disable all processing modes
         forceSilent.store(true);
+        softPaused.store(true);
+        scratchMode.store(false);
+        
+        // Stop transport
+        transportSource.stop();
+        
+        // Reset playback state
         inPrerollMode = false;
         prerollPosition = 0.0;
         pausedPosSec = 0.0;
@@ -1333,20 +1463,28 @@ void DJAudioPlayer::unload() {
         loopStartSec = 0.0;
         loopEndSec = 0.0;
 
-        transportSource.setSource(nullptr);
-        readerSource.reset();
-
-        try { resampleSource.releaseResources(); } catch (...) {}
-        try { transportSource.releaseResources(); } catch (...) {}
-
 #if defined(RUBBERBAND_FOUND)
-        rb.reset();
+        // Clean up RubberBand BEFORE disconnecting sources
+        // This prevents RB from trying to access deleted audio data
+        if (rb) {
+            rb.reset();
+        }
         rbReady = false;
         rbPaddedStartDone = false;
         rbDiscardOutRemaining = 0;
         rbLatencySamples = 0;
         rbLatencySeconds = 0.0;
+        measuredLatencyMs.store(0.0);
+        latencyCompensationSamples = 0;
 #endif
+
+        // Now safe to disconnect and release resources
+        transportSource.setSource(nullptr);
+        readerSource.reset();
+
+        try { resampleSource.releaseResources(); } catch (...) {}
+        try { transportSource.releaseResources(); } catch (...) {}
+        
     } catch (const std::exception& e) {
         std::cout << "Exception in DJAudioPlayer::unload(): " << e.what() << std::endl;
     } catch (...) {
@@ -1381,16 +1519,18 @@ void DJAudioPlayer::reinitRubberBand() {
                     RubberBand::RubberBandStretcher::OptionChannelsTogether;
             break;
         case KeylockQuality::Balanced:
-            opts |= RubberBand::RubberBandStretcher::OptionEngineFiner |
-                    RubberBand::RubberBandStretcher::OptionTransientsMixed |
-                    RubberBand::RubberBandStretcher::OptionWindowStandard |
+            // OPTIMIZED: Use faster settings for lower latency (DJ use case)
+            opts |= RubberBand::RubberBandStretcher::OptionEngineFaster |  // Changed from Finer
+                    RubberBand::RubberBandStretcher::OptionTransientsCrisp |  // Changed from Mixed
+                    RubberBand::RubberBandStretcher::OptionWindowShort |      // Changed from Standard
                     RubberBand::RubberBandStretcher::OptionPitchHighSpeed |
                     RubberBand::RubberBandStretcher::OptionChannelsTogether;
             break;
         case KeylockQuality::Quality:
+            // OPTIMIZED: Still use finer engine but with shorter window for lower latency
             opts |= RubberBand::RubberBandStretcher::OptionEngineFiner |
-                    RubberBand::RubberBandStretcher::OptionTransientsSmooth |
-                    RubberBand::RubberBandStretcher::OptionWindowStandard |
+                    RubberBand::RubberBandStretcher::OptionTransientsCrisp |  // Changed from Smooth
+                    RubberBand::RubberBandStretcher::OptionWindowShort |      // Changed from Standard
                     RubberBand::RubberBandStretcher::OptionPitchHighQuality |
                     RubberBand::RubberBandStretcher::OptionChannelsTogether;
             break;
@@ -1399,7 +1539,10 @@ void DJAudioPlayer::reinitRubberBand() {
         rb = std::make_unique<RubberBand::RubberBandStretcher>(currentSampleRate, rbNumChannels, opts);
         rb->setTimeRatio(1.0);
         rb->setPitchScale(1.0);
-        rb->setMaxProcessSize((size_t) std::max(128, lastBlockSizeHint));
+        // ULTRA-OPTIMIZED: Sehr kleine Chunks für minimale Latenz
+        // Reduziert interne RubberBand Buffering drastisch
+        const size_t optimizedProcessSize = std::min(128, std::max(32, lastBlockSizeHint / 4)); // Reduced from 256 and /2
+        rb->setMaxProcessSize(optimizedProcessSize);
         rbLastTimeRatio = 1.0;
         rbInputBuffer.setSize(rbNumChannels, std::max(256, lastBlockSizeHint));
         rbInputBuffer.clear();

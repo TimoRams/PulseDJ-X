@@ -76,6 +76,9 @@ public:
     // NEW: Handle threaded file loading completion
     void onFileLoadingComplete(const QString& filePath);
 
+    // Detach the underlying audio player so background timers stop dereferencing freed memory.
+    void detachPlayer();
+
 public slots:
     // BetaPulseX: Public slots für Settings-Integration
     void onKeylockToggle();

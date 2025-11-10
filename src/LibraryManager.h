@@ -157,7 +157,9 @@ class ID3LoaderThread : public QThread {
     Q_OBJECT
     
 public:
-    explicit ID3LoaderThread(const QStringList& files, juce::AudioFormatManager* formatManager, QObject* parent = nullptr);
+    explicit ID3LoaderThread(const QStringList& files,
+                             std::shared_ptr<juce::AudioFormatManager> formatManager,
+                             QObject* parent = nullptr);
     
 protected:
     void run() override;
@@ -169,7 +171,7 @@ signals:
     
 private:
     QStringList filesToProcess;
-    juce::AudioFormatManager* audioFormatManager;
+    std::shared_ptr<juce::AudioFormatManager> audioFormatManager;
     bool shouldStop = false;
     
     TrackInfo loadTrackInfo(const QString& filePath);
@@ -279,7 +281,7 @@ class LibraryManager : public QWidget {
     Q_OBJECT
     
 public:
-    explicit LibraryManager(juce::AudioFormatManager* formatManager, QWidget* parent = nullptr);
+    explicit LibraryManager(std::shared_ptr<juce::AudioFormatManager> formatManager, QWidget* parent = nullptr);
     ~LibraryManager();
     
     // Add files to library
@@ -381,7 +383,7 @@ private:
     
     // Background loading
     ID3LoaderThread* loaderThread;
-    juce::AudioFormatManager* audioFormatManager;
+    std::shared_ptr<juce::AudioFormatManager> audioFormatManager;
     
     // State
     bool isLoading = false;
