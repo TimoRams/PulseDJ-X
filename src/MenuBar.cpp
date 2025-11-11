@@ -224,35 +224,35 @@ void MenuBar::setupMenus() {
     fileMenu = addMenu("File");
     fileMenu->addAction(importSettingsAction);
     fileMenu->addAction(exportSettingsAction);
+    // Preferences and reset live in File for quicker access
+    fileMenu->addAction(preferencesAction);
+    fileMenu->addAction(resetSettingsAction);
     fileMenu->addSeparator();
     fileMenu->addAction(exitAction);
-    
+
     editMenu = addMenu("Edit");
-    editMenu->addAction(preferencesAction);
-    editMenu->addSeparator();
-    editMenu->addAction(resetSettingsAction);
-    
+    QAction* emptyEdit = new QAction("Empty", this);
+    emptyEdit->setEnabled(false);
+    editMenu->addAction(emptyEdit);
+
     viewMenu = addMenu("View");
     viewMenu->addAction(fullScreenAction);
     viewMenu->addAction(alwaysOnTopAction);
 
     toolsMenu = addMenu("Tools");
-    toolsMenu->addAction("Audio Settings")->setEnabled(false);
-    toolsMenu->addAction("MIDI Controllers")->setEnabled(false);
-    toolsMenu->addSeparator();
-    toolsMenu->addAction("Analyze Library")->setEnabled(false);
+    QAction* emptyTools = new QAction("Empty", this);
+    emptyTools->setEnabled(false);
+    toolsMenu->addAction(emptyTools);
 
     helpMenu = addMenu("Help");
-    helpMenu->addAction("User Manual")->setEnabled(false);
-    helpMenu->addAction("Keyboard Shortcuts")->setEnabled(false);
-    helpMenu->addSeparator();
-    helpMenu->addAction("Check for Updates")->setEnabled(false);
     helpMenu->addAction(aboutAction);
-    
+
     modeMenu = addMenu("Mode: Performance");
     modeMenu->addAction(performanceModeAction);
     modeMenu->addAction(exportModeAction);
     modeMenu->addAction(editModeAction);
+
+    // Preferences and Reset to Default are not shown in Edit anymore
 }
 
 void MenuBar::toggleAlwaysOnTop() {
