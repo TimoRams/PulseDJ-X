@@ -6,6 +6,7 @@
 #include <QFileDialog>
 #include <QStandardPaths>
 #include <QJsonDocument>
+#include <cmath>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QJsonParseError>
@@ -18,6 +19,7 @@
 #include <QtGlobal>
 #include <QDateTime>
 #include <QColor>
+#include <QStringList>
 #include <QKeySequence>
 #include <juce_core/juce_core.h>
 
@@ -389,10 +391,10 @@ void MenuBar::setupSystemMonitoring() {
     latencyLayout->setContentsMargins(0, 0, 0, 0);
     latencyLayout->setSpacing(0);
     
-    latencyValue = new QLabel("0.0ms");
+    latencyValue = new QLabel("0.0ms · -- kHz · -- smp");
     latencyValue->setStyleSheet("color: #00ccff; font-size: 9px; font-weight: bold;");
     latencyValue->setAlignment(Qt::AlignCenter);
-    latencyValue->setFixedWidth(40);
+    latencyValue->setFixedWidth(140);
     
     latencyLabel = new QLabel("LATENCY");
     latencyLabel->setStyleSheet("color: #888; font-size: 7px;");
@@ -896,21 +898,40 @@ void MenuBar::updateMasterLevels(double leftLevel, double rightLevel) {
     masterRightBar->setValue(static_cast<int>(rightLevel * 100));
 }
 
-void MenuBar::updateAudioLatency(double latencyMs) {
+void MenuBar::updateAudioLatency(double latencyMs, double sampleRateHz, int bufferSizeSamples) {
     if (!latencyValue) return;
-    
-    // Format latency value with appropriate precision
-    QString text;
+
+    QStringList segments;
+
+    // Latency segment with adaptive precision
+    QString latencyText;
     if (latencyMs < 1.0) {
-        text = QString("%1ms").arg(latencyMs, 0, 'f', 2); // e.g., "0.47ms"
+        latencyText = QString("%1ms").arg(latencyMs, 0, 'f', 2);
     } else if (latencyMs < 10.0) {
-        text = QString("%1ms").arg(latencyMs, 0, 'f', 1); // e.g., "5.1ms"
+        latencyText = QString("%1ms").arg(latencyMs, 0, 'f', 1);
     } else {
-        text = QString("%1ms").arg(static_cast<int>(latencyMs + 0.5)); // e.g., "23ms"
+        latencyText = QString("%1ms").arg(static_cast<int>(latencyMs + 0.5));
     }
-    
-    latencyValue->setText(text);
-    
+    segments << latencyText;
+
+    // Sample rate segment (in kHz with sensible precision)
+    if (sampleRateHz > 0.0) {
+        const double srKHz = sampleRateHz / 1000.0;
+        const int decimals = (std::abs(std::round(srKHz) - srKHz) < 0.05) ? 0 : 1;
+        segments << QString("%1kHz").arg(srKHz, 0, 'f', decimals);
+    } else {
+        segments << QStringLiteral("-- kHz");
+    }
+
+    // Buffer size segment (always show something)
+    if (bufferSizeSamples > 0) {
+        segments << QString("%1 smp").arg(bufferSizeSamples);
+    } else {
+        segments << QStringLiteral("-- smp");
+    }
+
+    latencyValue->setText(segments.join(QStringLiteral(" · ")));
+
     // Color coding based on latency range
     QString color;
     if (latencyMs < 10.0) {
@@ -922,7 +943,7 @@ void MenuBar::updateAudioLatency(double latencyMs) {
     } else {
         color = "#ff4444";  // Red - high latency
     }
-    
+
     latencyValue->setStyleSheet(QString("color: %1; font-size: 9px; font-weight: bold;").arg(color));
 }
 

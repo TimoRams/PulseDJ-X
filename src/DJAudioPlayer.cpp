@@ -448,8 +448,12 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             
             // 7. Hardware output latency estimation (typisch 0.5-2ms bei low-latency drivers)
             // Dies ist eine Schätzung - echte HW-Latency müsste vom System abgefragt werden
-            const int hwLatencyEstimate = (int)(currentSampleRate * 0.0008); // Reduced from 0.001 (1ms -> 0.8ms)
-            totalLatencySamples += hwLatencyEstimate;
+            const int hwLatency = hardwareLatencySamples.load(std::memory_order_relaxed);
+            if (hwLatency > 0) {
+                totalLatencySamples += hwLatency;
+            } else {
+                totalLatencySamples += (int)(currentSampleRate * 0.0008); // Fallback estimate
+            }
             
             measuredLatencyMs.store((totalLatencySamples / currentSampleRate) * 1000.0);
             latencyCompensationSamples = totalLatencySamples;
@@ -691,8 +695,12 @@ void DJAudioPlayer::getNextAudioBlock(const AudioSourceChannelInfo &bufferToFill
             }
             
             // 5. Hardware output latency estimation
-            const int hwLatencyEstimate = (int)(currentSampleRate * 0.001); // ~1ms
-            totalLatencySamples += hwLatencyEstimate;
+            const int hwLatency = hardwareLatencySamples.load(std::memory_order_relaxed);
+            if (hwLatency > 0) {
+                totalLatencySamples += hwLatency;
+            } else {
+                totalLatencySamples += (int)(currentSampleRate * 0.001); // Fallback estimate
+            }
             
             measuredLatencyMs.store((totalLatencySamples / currentSampleRate) * 1000.0);
             latencyCompensationSamples = totalLatencySamples;
@@ -1706,6 +1714,10 @@ void DJAudioPlayer::setBeatInfo(double bpm, double firstBeatOffset, double track
     trackBpm = bpm;
     trackFirstBeatOffset = firstBeatOffset;
     trackLengthSec = trackLength;
+}
+
+void DJAudioPlayer::setHardwareLatencySamples(int samples) noexcept {
+    hardwareLatencySamples.store(std::max(0, samples), std::memory_order_relaxed);
 }
 
 [[nodiscard]] double DJAudioPlayer::quantizePosition(double positionSec) const noexcept {

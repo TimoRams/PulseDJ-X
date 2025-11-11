@@ -38,7 +38,7 @@ public:
     void updateRamUsage(double percentage);
     void updateBatteryLevel(int percentage, bool isCharging);
     void updateMasterLevels(double leftLevel, double rightLevel);
-    void updateAudioLatency(double latencyMs);
+    void updateAudioLatency(double latencyMs, double sampleRateHz, int bufferSizeSamples);
 
 private slots:
     void updateSystemStats();

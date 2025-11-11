@@ -50,6 +50,8 @@ public:
 #endif
         return 0.0;
     }
+
+    void setHardwareLatencySamples(int samples) noexcept;
     
     // Scratch control - sets playback speed based on scratch velocity
     void setScratchVelocity(double velocity);
@@ -181,6 +183,7 @@ private:
     
     std::atomic<double> measuredLatencyMs{0.0};
     int latencyCompensationSamples = 0;
+    std::atomic<int> hardwareLatencySamples{0};
     
     std::atomic<int> keylockChangePending{-1};
 

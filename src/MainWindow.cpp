@@ -32,6 +32,11 @@
 #include <cmath>
 #include <memory>
 #include <limits>
+#include <ranges>
+#include <type_traits>
+#include <vector>
+#include <ranges>
+#include <vector>
 
 std::shared_ptr<juce::AudioFormatManager> QtMainWindow::sharedFormatManager = {};
 
@@ -120,13 +125,15 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     connect(latencyTimer, &QTimer::timeout, this, [this]() {
         if (menuBar && (playerA || playerB)) {
             // Get latency from both decks and use the max (or from the playing deck)
-            double latencyA = playerA ? playerA->getMeasuredLatencyMs() : 0.0;
-            double latencyB = playerB ? playerB->getMeasuredLatencyMs() : 0.0;
-            
-            // Use the higher latency value (both should be similar if using same RB settings)
-            double maxLatency = std::max(latencyA, latencyB);
-            
-            menuBar->updateAudioLatency(maxLatency);
+            const double latencyA = playerA ? playerA->getMeasuredLatencyMs() : 0.0;
+            const double latencyB = playerB ? playerB->getMeasuredLatencyMs() : 0.0;
+            const double maxLatency = std::max(latencyA, latencyB);
+
+            auto* device = deviceManager.getCurrentAudioDevice();
+            const double sampleRate = device ? device->getCurrentSampleRate() : 0.0;
+            const int bufferSize = device ? device->getCurrentBufferSizeSamples() : 0;
+
+            menuBar->updateAudioLatency(maxLatency, sampleRate, bufferSize);
         }
     });
     latencyTimer->start(100); // Update every 100ms
@@ -930,26 +937,59 @@ void QtMainWindow::initializeAudio()
         {
             juce::AudioDeviceManager::AudioDeviceSetup setup;
             deviceManager.getAudioDeviceSetup(setup);
-            const double sr = (setup.sampleRate > 0.0) ? setup.sampleRate : currentDevice->getCurrentSampleRate();
-            const int targetSamples = (sr > 0.0) ? std::max(64, (int) std::lround(sr * 0.003)) : 128; // ~3 ms (reduced from 5ms)
+            const double srHint = (setup.sampleRate > 0.0) ? setup.sampleRate : currentDevice->getCurrentSampleRate();
+            const double effectiveSr = (srHint > 0.0) ? srHint : 44100.0;
+            const int targetSamples = 256; // prefer a 256-sample hardware buffer
 
-            int chosen = targetSamples;
-#if JUCE_MODULE_AVAILABLE_juce_audio_devices
-            // Prefer a supported device buffer size closest to our target
-            const auto sizes = currentDevice->getAvailableBufferSizes();
-            if (sizes.size() > 0) {
-                int best = sizes[0];
-                double bestDiff = std::abs(best - targetSamples);
-                for (int i = 1; i < sizes.size(); ++i) {
-                    const int v = sizes[i];
-                    const double d = std::abs(v - targetSamples);
-                    if (d < bestDiff) { best = v; bestDiff = d; }
-                }
-                chosen = best;
+            const auto juceRates = currentDevice->getAvailableSampleRates();
+            std::vector<double> availableRates;
+            availableRates.reserve((size_t) juceRates.size());
+            for (int i = 0; i < juceRates.size(); ++i) {
+                availableRates.push_back(juceRates.getUnchecked(i));
             }
-#endif
-            setup.bufferSize = chosen;
-            if (setup.sampleRate <= 0.0) setup.sampleRate = (sr > 0.0 ? sr : 48000.0);
+            const double preferredRate = 44100.0;
+            const auto pickRate = [&]() -> double {
+                if (availableRates.empty()) {
+                    return effectiveSr;
+                }
+                if (std::ranges::any_of(availableRates, [preferredRate](double rate) {
+                        return std::abs(rate - preferredRate) < 1.0; })) {
+                    return preferredRate;
+                }
+                const auto nearest = std::ranges::min_element(availableRates, [preferredRate](double lhs, double rhs) {
+                    return std::abs(lhs - preferredRate) < std::abs(rhs - preferredRate);
+                });
+                return (nearest != availableRates.end()) ? *nearest : effectiveSr;
+            }();
+
+            const auto juceSizes = currentDevice->getAvailableBufferSizes();
+            std::vector<int> availableSizes;
+            availableSizes.reserve((size_t) juceSizes.size());
+            for (int i = 0; i < juceSizes.size(); ++i) {
+                availableSizes.push_back(juceSizes.getUnchecked(i));
+            }
+            const auto pickSize = [&]() -> int {
+                if (availableSizes.empty()) {
+                    return targetSamples;
+                }
+                const auto smallest = *std::ranges::min_element(availableSizes);
+                if (smallest >= targetSamples) {
+                    return smallest;
+                }
+                const auto notExceeding = std::ranges::min_element(availableSizes, [targetSamples](int lhs, int rhs) {
+                    const bool lhsValid = lhs >= 48;
+                    const bool rhsValid = rhs >= 48;
+                    if (lhsValid != rhsValid) return lhsValid; // prefer valid
+                    if (lhsValid && rhsValid) {
+                        return std::abs(lhs - targetSamples) < std::abs(rhs - targetSamples);
+                    }
+                    return lhs < rhs;
+                });
+                return std::max(48, (notExceeding != availableSizes.end()) ? *notExceeding : targetSamples);
+            }();
+
+            setup.sampleRate = pickRate;
+            setup.bufferSize = pickSize;
             deviceManager.setAudioDeviceSetup(setup, true);
 
             // Refresh device pointer after potential re-open
@@ -963,7 +1003,11 @@ void QtMainWindow::initializeAudio()
                 const int bs = currentDevice->getCurrentBufferSizeSamples();
                 const double srNow = currentDevice->getCurrentSampleRate();
                 const double ms = (srNow > 0.0) ? (1000.0 * (double) bs / srNow) : 0.0;
-                qDebug() << "Audio device configured:" << bs << "samples (~" << ms << "ms) @" << srNow << "Hz";
+                const double hwLatencyMs = (srNow > 0.0)
+                                              ? (1000.0 * currentDevice->getOutputLatencyInSamples() / srNow)
+                                              : 0.0;
+                qDebug() << "Audio device configured:" << bs << "samples (~" << ms
+                        << "ms) @" << srNow << "Hz, hw latency" << hwLatencyMs << "ms";
             }
         }
 
