@@ -163,7 +163,7 @@ void QtMainWindow::connectDeckSettings()
 
     if (leftVolumeSlider)
     {
-        connect(leftVolumeSlider, &QSlider::valueChanged, [this](int value) {
+        connect(leftVolumeSlider, &CustomFader::valueChanged, [this](int value) {
             double gain = value / 100.0;
             DeckSettings::instance().setGain(0, gain);
         });
@@ -198,7 +198,7 @@ void QtMainWindow::connectDeckSettings()
 
     if (rightVolumeSlider)
     {
-        connect(rightVolumeSlider, &QSlider::valueChanged, [this](int value) {
+        connect(rightVolumeSlider, &CustomFader::valueChanged, [this](int value) {
             double gain = value / 100.0;
             DeckSettings::instance().setGain(1, gain);
         });

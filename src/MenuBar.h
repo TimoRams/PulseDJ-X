@@ -17,6 +17,7 @@
 #include <QMouseEvent>
 #include <QPoint>
 #include <QEvent>
+#include <QWidgetAction>
 
 class QtMainWindow;
 class PreferencesDialog;
@@ -39,6 +40,7 @@ public:
     void updateBatteryLevel(int percentage, bool isCharging);
     void updateMasterLevels(double leftLevel, double rightLevel);
     void updateAudioLatency(double latencyMs, double sampleRateHz, int bufferSizeSamples);
+    bool isGlobalPointInDragHandle(const QPoint& globalPos) const;
 
 private slots:
     void updateSystemStats();
@@ -55,6 +57,7 @@ private:
     void setupLogoWidget();
     void setupSystemMonitoring();
     void createMenuActions();
+    void setupDragSpacer();
 
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -109,6 +112,8 @@ private:
     QLabel* batteryLabel;
     QLabel* latencyLabel;
     QLabel* latencyValue;
+    QWidget* dragHandleWidget{nullptr};
+    QWidgetAction* dragHandleAction{nullptr};
 
     // System monitoring timer
     QTimer* systemTimer;

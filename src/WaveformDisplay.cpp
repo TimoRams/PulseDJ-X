@@ -244,13 +244,13 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
         playheadSec = playheadRel * localAudioLength;
     }
 
-    // Display center: subtract latency because audio output is delayed
+    // Display center: ADD latency to compensate for audio output delay
     // playheadSec = where we are reading from buffer NOW
-    // Audio heard now was read (audioLatency) seconds ago
-    // So visual should show position BEHIND current playhead
+    // Audio heard now was read (renderLatencySec) seconds ago
+    // So visual should show position AHEAD to sync with delayed audio output
     const double rawDisplayCenterSec = (viewMode == ViewMode::BeatLocked)
-        ? ((playheadSec - renderLatencySec) / safeTempo)
-        : (playheadSec - renderLatencySec);
+        ? ((playheadSec + renderLatencySec) / safeTempo)
+        : (playheadSec + renderLatencySec);
     
     // Calculate seconds per pixel BEFORE snapping
     const double bufferSec = std::max(0.05, 0.5 / std::max(1.0, zoomFactor));
@@ -591,7 +591,7 @@ void WaveformDisplay::buildWaveformGeometry(int viewWidth, int viewHeight, doubl
 
         // Skip rendering before track start (audioSec < 0)
         if (audioCenterSec < 0.0) {
-            // No waveform before the orange START line
+            // No waveform before the bright yellow START line
             pixelCoverageScratch[x] = 0;
             pixelUpperScratch[x] = 0.0f;
             pixelLowerScratch[x] = 0.0f;
@@ -1347,7 +1347,7 @@ void WaveformDisplay::drawMissingSegments(QPainter& painter, int viewWidth, int 
 void WaveformDisplay::drawWaveformOverlays(QPainter& painter, int viewWidth, int viewHeight, double zoomFactor)
 {
     if (geometryCache.valid && geometryCache.timeRange > 0.0) {
-        // CRITICAL: Draw track start line first (orange marker at audioSec=0)
+        // CRITICAL: Draw track start line first (bright yellow marker at audioSec=0)
         // This is the fixed reference point - everything else moves relative to it
         const double trackStartDisplaySec = mapAudioToDisplay(0.0);
         if (trackStartDisplaySec >= geometryCache.leftSecond && trackStartDisplaySec <= geometryCache.rightSecond) {
@@ -1355,12 +1355,12 @@ void WaveformDisplay::drawWaveformOverlays(QPainter& painter, int viewWidth, int
             const int startX = static_cast<int>(relPos * viewWidth);
             
             painter.save();
-            painter.setPen(QPen(QColor(255, 140, 0, 200), 3)); // Orange, bold
+            painter.setPen(QPen(QColor(255, 255, 100, 220), 3)); // Bright yellow, bold
             painter.drawLine(startX, 0, startX, viewHeight);
             
             // Label
             painter.setFont(QFont("Arial", 9, QFont::Bold));
-            painter.setPen(QColor(255, 140, 0, 255));
+            painter.setPen(QColor(255, 255, 120, 255));
             painter.drawText(startX + 5, 15, "START");
             painter.restore();
         }
@@ -2289,7 +2289,10 @@ double WaveformDisplay::acquireVisualPlayhead() {
         predicted = visualPlayheadPos;
     }
 
-    measurement += visualLatencyComp * playVelocity;
+    // BUG FIX: Keine Latenz-Kompensation auf Playhead-Position anwenden!
+    // Die Latenz-Kompensation wird bereits in buildWaveformGeometry für displayCenterSec verwendet.
+    // Wenn wir sie hier nochmal anwenden, verschiebt sich der Playhead beim Seek.
+    // measurement += visualLatencyComp * playVelocity; // ENTFERNT
 
     double error = measurement - predicted;
 

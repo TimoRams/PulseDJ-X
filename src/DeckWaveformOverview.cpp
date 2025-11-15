@@ -400,28 +400,19 @@ void DeckWaveformOverview::loadFile(const QString& path)
 void DeckWaveformOverview::setPlayhead(double relative)
 {
     // PREROLL SUPPORT: Allow negative positions for DJ-style cueing
-    // Don't clamp to 0.0-1.0 range; support unlimited preroll like main WaveformDisplay
+    // Overview shows the ENTIRE file including silence before audio start
+    // So playhead position maps directly to file position without offset correction
     
-    if (totalLength > 0.0) {
-        // Handle preroll positions (negative relative values)
-        if (relative < 0.0) {
-            // In preroll: show playhead position proportionally in the preroll area
-            // Map preroll range [-1.0, 0.0] to display range [-1.0, 0.0]
-            playheadPos = relative; // Direct mapping for preroll
-        } else {
-            // Normal playback: adjust for audio start offset
-            double absoluteTime = relative * totalLength;
-            if (absoluteTime >= audioStartOffset) {
-                double displayedDuration = totalLength - audioStartOffset;
-                playheadPos = (absoluteTime - audioStartOffset) / displayedDuration;
-            } else {
-                playheadPos = -0.1; // Show playhead slightly before start
-            }
-        }
+    if (relative < 0.0) {
+        // In preroll: show playhead position proportionally in the preroll area
+        // Map preroll range to display range
+        playheadPos = relative; // Direct mapping for preroll
     } else {
-        // Fallback: direct relative positioning
-        playheadPos = relative;
+        // Normal playback: direct mapping to file position
+        // No audioStartOffset correction needed - overview shows full file
+        playheadPos = std::clamp(relative, 0.0, 1.0);
     }
+    
     update();
 }
 
@@ -438,15 +429,9 @@ void DeckWaveformOverview::mouseMoveEvent(QMouseEvent* event)
 {
     if (!isDragging || width() <= 0) return;
 
+    // Direct mapping: overview shows entire file, so click position = file position
     double relativeInDisplay = event->position().x() / width();
-    relativeInDisplay = std::clamp(relativeInDisplay, 0.0, 1.0);
-
-    double absoluteRelative = relativeInDisplay;
-    if (totalLength > 0.0) {
-        double displayedDuration = totalLength - audioStartOffset;
-        double absoluteTime = audioStartOffset + (relativeInDisplay * displayedDuration);
-        absoluteRelative = absoluteTime / totalLength;
-    }
+    double absoluteRelative = std::clamp(relativeInDisplay, 0.0, 1.0);
 
     // Update the immediate displayed position for responsiveness
     displayedPlayheadPos = absoluteRelative;

@@ -34,6 +34,15 @@ public:
     void setVolumeB(float vol);
     void setCrossfader(float pos);
     void setMasterVolume(float vol);
+    void setTrimA(float trim);  // Trim in dB range (-24 to +24)
+    void setTrimB(float trim);  // Trim in dB range (-24 to +24)
+    void setShuttingDown(bool shuttingDown) { isShuttingDown.store(shuttingDown); }
+    
+    // Get audio levels for VU meters
+    float getDeckALevel() const { return deckALevel.load(); }
+    float getDeckBLevel() const { return deckBLevel.load(); }
+    float getMasterLevelL() const { return masterLevelL.load(); }
+    float getMasterLevelR() const { return masterLevelR.load(); }
     
     // Safely detach players before destruction
     void detachPlayers() {
@@ -52,5 +61,13 @@ private:
     std::atomic<float> volumeB{1.0f};
     std::atomic<float> crossfaderPos{0.0f};
     std::atomic<float> masterVolume{1.0f};
+    std::atomic<float> trimA{0.0f};  // Trim in dB
+    std::atomic<float> trimB{0.0f};  // Trim in dB
     std::atomic<bool> isShuttingDown{false};
+    
+    // Audio level tracking for VU meters
+    std::atomic<float> deckALevel{0.0f};
+    std::atomic<float> deckBLevel{0.0f};
+    std::atomic<float> masterLevelL{0.0f};
+    std::atomic<float> masterLevelR{0.0f};
 };

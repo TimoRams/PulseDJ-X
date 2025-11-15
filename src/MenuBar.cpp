@@ -127,6 +127,7 @@ MenuBar::MenuBar(QtMainWindow* parent)
     setupLogoWidget();
     createMenuActions();
     setupMenus();
+    setupDragSpacer();
     setupSystemMonitoring();
 }
 
@@ -253,6 +254,23 @@ void MenuBar::setupMenus() {
     modeMenu->addAction(editModeAction);
 
     // Preferences and Reset to Default are not shown in Edit anymore
+}
+
+void MenuBar::setupDragSpacer()
+{
+    if (dragHandleWidget)
+        return;
+
+    dragHandleWidget = new QWidget(this);
+    dragHandleWidget->setObjectName("menuDragSpacer");
+    dragHandleWidget->setCursor(Qt::ArrowCursor);
+    dragHandleWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    dragHandleWidget->setMinimumWidth(12);
+    dragHandleWidget->setToolTip("Drag window");
+    dragHandleAction = new QWidgetAction(this);
+    dragHandleAction->setDefaultWidget(dragHandleWidget);
+    addAction(dragHandleAction);
+    registerDragRegion(dragHandleWidget);
 }
 
 void MenuBar::toggleAlwaysOnTop() {
@@ -481,6 +499,50 @@ void MenuBar::setupSystemMonitoring() {
     
     // Initial update to avoid showing 0% on startup
     QTimer::singleShot(100, this, &MenuBar::updateSystemStats);
+}
+
+bool MenuBar::isGlobalPointInDragHandle(const QPoint& globalPos) const
+{
+    auto widgetContains = [](QWidget* widget, const QPoint& globalPoint) {
+        if (!widget || !widget->isVisible())
+            return false;
+        const QPoint local = widget->mapFromGlobal(globalPoint);
+        return widget->rect().contains(local);
+    };
+
+    if (!isVisible())
+        return false;
+
+    if (widgetContains(windowControlsWidget, globalPos))
+        return false;
+
+    if (widgetContains(systemWidget, globalPos))
+        return false;
+
+    if (widgetContains(logoWidget, globalPos))
+        return true;
+
+    if (widgetContains(dragHandleWidget, globalPos))
+        return true;
+
+    const QPoint local = mapFromGlobal(globalPos);
+    if (!rect().contains(local))
+        return false;
+
+    if (actionAt(local))
+        return false;
+
+    if (QWidget* child = childAt(local))
+    {
+        if (logoWidget && (child == logoWidget || logoWidget->isAncestorOf(child)))
+            return true;
+        if (systemWidget && (child == systemWidget || systemWidget->isAncestorOf(child)))
+            return false;
+        if (dragHandleWidget && (child == dragHandleWidget || dragHandleWidget->isAncestorOf(child)))
+            return true;
+    }
+
+    return true;
 }
 
 void MenuBar::updateSystemStats() {
@@ -950,11 +1012,11 @@ void MenuBar::updateAudioLatency(double latencyMs, double sampleRateHz, int buff
 void MenuBar::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton && mainWindow) {
         pressedAction = actionAt(event->pos());
-        dragPending = true;
-    dragStartGlobal = event->globalPosition().toPoint();
+        const QPoint globalPoint = event->globalPosition().toPoint();
+        dragStartGlobal = globalPoint;
+        dragPending = !pressedAction && isGlobalPointInDragHandle(globalPoint);
 
-        if (!pressedAction) {
-            const QPoint globalPoint = event->globalPosition().toPoint();
+        if (dragPending) {
             beginWindowDrag(globalPoint);
             continueWindowDrag(globalPoint);
             event->accept();
@@ -976,16 +1038,20 @@ void MenuBar::mouseMoveEvent(QMouseEvent* event) {
         }
 
         if (dragPending) {
-            const int distance = (event->globalPosition().toPoint() - dragStartGlobal).manhattanLength();
-            if (distance >= QApplication::startDragDistance()) {
-                if (pressedAction) {
-                    setActiveAction(nullptr);
+            if (!isGlobalPointInDragHandle(event->globalPosition().toPoint())) {
+                cancelPendingDrag();
+            } else {
+                const int distance = (event->globalPosition().toPoint() - dragStartGlobal).manhattanLength();
+                if (distance >= QApplication::startDragDistance()) {
+                    if (pressedAction) {
+                        setActiveAction(nullptr);
+                    }
+                    const QPoint globalPoint = event->globalPosition().toPoint();
+                    beginWindowDrag(globalPoint);
+                    continueWindowDrag(globalPoint);
+                    event->accept();
+                    return;
                 }
-                const QPoint globalPoint = event->globalPosition().toPoint();
-                beginWindowDrag(globalPoint);
-                continueWindowDrag(globalPoint);
-                event->accept();
-                return;
             }
         }
     }
@@ -1027,17 +1093,21 @@ bool MenuBar::eventFilter(QObject* watched, QEvent* event) {
             auto mouseEvent = static_cast<QMouseEvent*>(event);
             if (mouseEvent->button() == Qt::LeftButton) {
                 cancelPendingDrag();
-                beginWindowDrag(mouseEvent->globalPosition().toPoint());
-                event->accept();
-                return true;
+                const QPoint globalPos = mouseEvent->globalPosition().toPoint();
+                if (isGlobalPointInDragHandle(globalPos)) {
+                    beginWindowDrag(globalPos);
+                    event->accept();
+                    return true;
+                }
             }
             break;
         }
         case QEvent::MouseMove: {
             auto mouseEvent = static_cast<QMouseEvent*>(event);
             if (mouseEvent->buttons() & Qt::LeftButton) {
-                continueWindowDrag(mouseEvent->globalPosition().toPoint());
+                const QPoint globalPos = mouseEvent->globalPosition().toPoint();
                 if (draggingWindow) {
+                    continueWindowDrag(globalPos);
                     event->accept();
                     return true;
                 }

@@ -90,6 +90,12 @@ set(DAVID_SOURCES
     src/MainWindowWindowing.cpp
     src/MainWindowDeckSettings.cpp
     src/MainWindow.h
+    src/DJKnob.cpp
+    src/DJKnob.h
+    src/VUMeter.cpp
+    src/VUMeter.h
+    src/CustomFader.cpp
+    src/CustomFader.h
     src/DeckWidget.cpp
     src/DeckWidget.h
     src/TurntableWidget.cpp

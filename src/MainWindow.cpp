@@ -9,6 +9,7 @@
 #include "MainWindowTasks.h"
 #include "AppConfig.h"
 #include "DeckSettings.h"
+#include "CustomFader.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QFileDialog>
@@ -46,6 +47,10 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     setMouseTracking(true);
     setAttribute(Qt::WA_Hover, true);
     setAttribute(Qt::WA_StyledBackground, true);
+
+    if (auto* app = qApp) {
+        app->installEventFilter(this);
+    }
     
     // Remove window decorations and make frameless
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
@@ -127,13 +132,30 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
             // Get latency from both decks and use the max (or from the playing deck)
             const double latencyA = playerA ? playerA->getMeasuredLatencyMs() : 0.0;
             const double latencyB = playerB ? playerB->getMeasuredLatencyMs() : 0.0;
-            const double maxLatency = std::max(latencyA, latencyB);
+            // Prefer the audible deck when exactly one is playing so the readout
+            // tracks the perception; otherwise fall back to the higher value.
+            const bool deckAPlaying = playerA && playerA->isAudible();
+            const bool deckBPlaying = playerB && playerB->isAudible();
+            const double maxLatency = deckAPlaying && !deckBPlaying ? latencyA
+                                     : deckBPlaying && !deckAPlaying ? latencyB
+                                     : std::max(latencyA, latencyB);
 
             auto* device = deviceManager.getCurrentAudioDevice();
             const double sampleRate = device ? device->getCurrentSampleRate() : 0.0;
             const int bufferSize = device ? device->getCurrentBufferSizeSamples() : 0;
 
             menuBar->updateAudioLatency(maxLatency, sampleRate, bufferSize);
+            
+            // Update waveform displays with measured latency for perfect audio-visual sync
+            const double latencyASec = latencyA / 1000.0; // Convert ms to seconds
+            const double latencyBSec = latencyB / 1000.0;
+            
+            if (overviewTopA) {
+                overviewTopA->setOutputLatencyComp(latencyASec + userRenderLatencySec);
+            }
+            if (overviewTopB) {
+                overviewTopB->setOutputLatencyComp(latencyBSec + userRenderLatencySec);
+            }
         }
     });
     latencyTimer->start(100); // Update every 100ms
@@ -669,10 +691,11 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
         }
     });
 
-    crossfader = new QSlider(Qt::Horizontal, this);
-    crossfader->setRange(0, 100);
-    crossfader->setValue(50);
-    connect(crossfader, &QSlider::valueChanged, this, &QtMainWindow::onCrossfader);
+    crossfader = new CustomFader(CustomFader::Horizontal, this);
+    crossfader->setMinimum(-100);
+    crossfader->setMaximum(100);
+    crossfader->setValue(0);
+    connect(crossfader, &CustomFader::valueChanged, this, &QtMainWindow::onCrossfader);
 
     // Rekordbox-style layout with Serato-style overview waveforms at top
     // Top section: Two stacked overview waveforms (Serato style)
@@ -692,165 +715,289 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     updateOverviewLabel(true);
     updateOverviewLabel(false);
     
-    // Main deck controls side by side (more compact spacing)
+    // Main deck controls side by side
     auto decksLayout = new QHBoxLayout;
-    decksLayout->setSpacing(6);
+    decksLayout->setSpacing(8);
     decksLayout->setContentsMargins(0, 0, 0, 0);
-    decksLayout->addWidget(deckA->getControlsWidget(), 2);
+    decksLayout->addWidget(deckA->getControlsWidget(), 3);  // Deck A gets more space
     
-    // Mixer section in the center (more compact)
+    // ========== FLAT MIXER SECTION ==========
     auto mixerSection = new QVBoxLayout;
-    mixerSection->setSpacing(2);
-    mixerSection->setContentsMargins(4, 4, 4, 4);
-    auto crossfaderLabel = new QLabel("CROSSFADER", this);
-    crossfaderLabel->setAlignment(Qt::AlignCenter);
-    crossfaderLabel->setStyleSheet("font-weight: bold; color: #fff; font-size: 9px;");
-    crossfaderLabel->setFixedHeight(14);
-    mixerSection->addWidget(crossfaderLabel);
-    mixerSection->addWidget(crossfader);
+    mixerSection->setSpacing(4);
+    mixerSection->setContentsMargins(8, 6, 8, 6);
     
-    // Add EQ knobs: top to bottom High, Mid, Low, then Filter (smaller)
-    auto eqLayout = new QHBoxLayout;
-    eqLayout->setSpacing(4);
+    // Main mixer row - flat responsive layout
+    auto mainMixerRow = new QHBoxLayout;
+    mainMixerRow->setSpacing(8);
+    
+    // === DECK A SECTION ===
+    auto deckASection = new QHBoxLayout;
+    deckASection->setSpacing(4);
+    
+    // Deck A Knobs (Trim + EQ + Filter)
     auto leftEqLayout = new QVBoxLayout;
     leftEqLayout->setSpacing(2);
-    auto rightEqLayout = new QVBoxLayout;
-    rightEqLayout->setSpacing(2);
-
-    leftHigh = new QDial(this);
-    leftHigh->setRange(-100, 100);
-    leftHigh->setNotchesVisible(true);
-    leftHigh->setToolTip("Left High");
-    leftMid = new QDial(this);
-    leftMid->setRange(-100, 100);
-    leftMid->setNotchesVisible(true);
-    leftMid->setToolTip("Left Mid");
-    leftLow = new QDial(this);
-    leftLow->setRange(-100, 100);
-    leftLow->setNotchesVisible(true);
-    leftLow->setToolTip("Left Low");
-    leftFilter = new QDial(this);
-    leftFilter->setRange(-100, 100);
-    leftFilter->setNotchesVisible(true);
-    leftFilter->setToolTip("Left Filter");
-
-    rightHigh = new QDial(this);
-    rightHigh->setRange(-100, 100);
-    rightHigh->setNotchesVisible(true);
-    rightHigh->setToolTip("Right High");
-    rightMid = new QDial(this);
-    rightMid->setRange(-100, 100);
-    rightMid->setNotchesVisible(true);
-    rightMid->setToolTip("Right Mid");
-    rightLow = new QDial(this);
-    rightLow->setRange(-100, 100);
-    rightLow->setNotchesVisible(true);
-    rightLow->setToolTip("Right Low");
-    rightFilter = new QDial(this);
-    rightFilter->setRange(-100, 100);
-    rightFilter->setNotchesVisible(true);
-    rightFilter->setToolTip("Right Filter");
-
-    // Set all knobs to start centered (0) and make them smaller
-    leftHigh->setValue(0); leftMid->setValue(0); leftLow->setValue(0); leftFilter->setValue(0);
-    rightHigh->setValue(0); rightMid->setValue(0); rightLow->setValue(0); rightFilter->setValue(0);
+    leftEqLayout->setAlignment(Qt::AlignCenter);
     
-    // Make knobs smaller
-    leftHigh->setFixedSize(32, 32); leftMid->setFixedSize(32, 32); 
-    leftLow->setFixedSize(32, 32); leftFilter->setFixedSize(32, 32);
-    rightHigh->setFixedSize(32, 32); rightMid->setFixedSize(32, 32);
-    rightLow->setFixedSize(32, 32); rightFilter->setFixedSize(32, 32);
-
-    // Arrange top-to-bottom: High, Mid, Low, Filter
+    leftTrim = new DJKnob(this);
+    leftTrim->setRange(-100, 100);
+    leftTrim->setValue(0);
+    leftTrim->setToolTip("Trim A (Gain)");
+    
+    leftHigh = new DJKnob(this);
+    leftHigh->setRange(-100, 100);
+    leftHigh->setValue(0);
+    leftHigh->setToolTip("High");
+    
+    leftMid = new DJKnob(this);
+    leftMid->setRange(-100, 100);
+    leftMid->setValue(0);
+    leftMid->setToolTip("Mid");
+    
+    leftLow = new DJKnob(this);
+    leftLow->setRange(-100, 100);
+    leftLow->setValue(0);
+    leftLow->setToolTip("Low");
+    
+    leftFilter = new DJKnob(this);
+    leftFilter->setRange(-100, 100);
+    leftFilter->setValue(0);
+    leftFilter->setToolTip("Filter");
+    
+    leftEqLayout->addWidget(leftTrim);
     leftEqLayout->addWidget(leftHigh);
     leftEqLayout->addWidget(leftMid);
     leftEqLayout->addWidget(leftLow);
     leftEqLayout->addWidget(leftFilter);
-
+    
+    // Deck A VU Meter - schmaler und links neben den Knobs
+    auto deckAVULayout = new QVBoxLayout;
+    deckAVULayout->setSpacing(0);
+    deckAVULayout->setAlignment(Qt::AlignCenter);
+    auto deckAVULabel = new QLabel("A", this);
+    deckAVULabel->setAlignment(Qt::AlignCenter);
+    deckAVULabel->setStyleSheet("color: #888; font-size: 8px; font-weight: bold;");
+    vuMeterDeckA = new VUMeter(VUMeter::Channel, this);
+    vuMeterDeckA->setFixedSize(8, 170);  // Schmaler (8px) und Höhe = 5 Knobs (32*5 + 4*2 spacing = 170)
+    deckAVULayout->addWidget(deckAVULabel);
+    deckAVULayout->addWidget(vuMeterDeckA);
+    
+    // VU Meter links, dann Knobs
+    deckASection->addLayout(deckAVULayout);
+    deckASection->addLayout(leftEqLayout);
+    
+    // Deck A Volume + Cue
+    auto leftVolLayout = new QVBoxLayout;
+    leftVolLayout->setSpacing(2);
+    leftVolLayout->setAlignment(Qt::AlignCenter);
+    
+    auto leftVolLabel = new QLabel("VOL", this);
+    leftVolLabel->setAlignment(Qt::AlignCenter);
+    leftVolLabel->setStyleSheet("color: #888; font-size: 8px; font-weight: bold;");
+    
+    leftVolumeSlider = new CustomFader(CustomFader::Vertical, this);
+    leftVolumeSlider->setMinimum(0);
+    leftVolumeSlider->setMaximum(100);
+    leftVolumeSlider->setValue(100);
+    leftVolumeSlider->setMinimumHeight(70);
+    
+    leftCueButton = new QPushButton("CUE", this);
+    leftCueButton->setCheckable(true);
+    leftCueButton->setFixedHeight(20);
+    leftCueButton->setFixedWidth(35);
+    leftCueButton->setStyleSheet(
+        "QPushButton { background: #1a1a1a; color: #666; border: 1px solid #333; border-radius: 2px; font-size: 8px; font-weight: bold; }"
+        "QPushButton:checked { background: #00ff00; color: #000; border: 1px solid #00cc00; }"
+        "QPushButton:hover { background: #2a2a2a; }"
+    );
+    
+    leftVolLayout->addWidget(leftVolLabel);
+    leftVolLayout->addWidget(leftVolumeSlider, 1);
+    leftVolLayout->addWidget(leftCueButton);
+    
+    deckASection->addLayout(leftVolLayout);
+    
+    // === MASTER SECTION ===
+    auto masterSection = new QVBoxLayout;
+    masterSection->setSpacing(2);
+    masterSection->setAlignment(Qt::AlignCenter);
+    
+    auto masterLabel = new QLabel("MASTER", this);
+    masterLabel->setAlignment(Qt::AlignCenter);
+    masterLabel->setStyleSheet("color: #aaa; font-size: 9px; font-weight: bold;");
+    
+    auto masterMetersLayout = new QHBoxLayout;
+    masterMetersLayout->setSpacing(4);
+    
+    auto masterLLayout = new QVBoxLayout;
+    masterLLayout->setSpacing(1);
+    auto masterLLabel = new QLabel("L", this);
+    masterLLabel->setAlignment(Qt::AlignCenter);
+    masterLLabel->setStyleSheet("color: #666; font-size: 8px;");
+    vuMeterMasterL = new VUMeter(VUMeter::Master, this);
+    masterLLayout->addWidget(masterLLabel);
+    masterLLayout->addWidget(vuMeterMasterL);
+    
+    auto masterRLayout = new QVBoxLayout;
+    masterRLayout->setSpacing(1);
+    auto masterRLabel = new QLabel("R", this);
+    masterRLabel->setAlignment(Qt::AlignCenter);
+    masterRLabel->setStyleSheet("color: #666; font-size: 8px;");
+    vuMeterMasterR = new VUMeter(VUMeter::Master, this);
+    masterRLayout->addWidget(masterRLabel);
+    masterRLayout->addWidget(vuMeterMasterR);
+    
+    masterMetersLayout->addLayout(masterLLayout);
+    masterMetersLayout->addLayout(masterRLayout);
+    
+    masterSection->addWidget(masterLabel);
+    masterSection->addLayout(masterMetersLayout);
+    
+    // === DECK B SECTION ===
+    auto deckBSection = new QHBoxLayout;
+    deckBSection->setSpacing(4);
+    
+    // Deck B Volume + Cue
+    auto rightVolLayout = new QVBoxLayout;
+    rightVolLayout->setSpacing(2);
+    rightVolLayout->setAlignment(Qt::AlignCenter);
+    
+    auto rightVolLabel = new QLabel("VOL", this);
+    rightVolLabel->setAlignment(Qt::AlignCenter);
+    rightVolLabel->setStyleSheet("color: #888; font-size: 8px; font-weight: bold;");
+    
+    rightVolumeSlider = new CustomFader(CustomFader::Vertical, this);
+    rightVolumeSlider->setMinimum(0);
+    rightVolumeSlider->setMaximum(100);
+    rightVolumeSlider->setValue(100);
+    rightVolumeSlider->setMinimumHeight(70);
+    
+    rightCueButton = new QPushButton("CUE", this);
+    rightCueButton->setCheckable(true);
+    rightCueButton->setFixedHeight(20);
+    rightCueButton->setFixedWidth(35);
+    rightCueButton->setStyleSheet(
+        "QPushButton { background: #1a1a1a; color: #666; border: 1px solid #333; border-radius: 2px; font-size: 8px; font-weight: bold; }"
+        "QPushButton:checked { background: #00ff00; color: #000; border: 1px solid #00cc00; }"
+        "QPushButton:hover { background: #2a2a2a; }"
+    );
+    
+    rightVolLayout->addWidget(rightVolLabel);
+    rightVolLayout->addWidget(rightVolumeSlider, 1);
+    rightVolLayout->addWidget(rightCueButton);
+    
+    // Deck B Knobs (Trim + EQ + Filter)
+    auto rightEqLayout = new QVBoxLayout;
+    rightEqLayout->setSpacing(2);
+    rightEqLayout->setAlignment(Qt::AlignCenter);
+    
+    rightTrim = new DJKnob(this);
+    rightTrim->setRange(-100, 100);
+    rightTrim->setValue(0);
+    rightTrim->setToolTip("Trim B (Gain)");
+    
+    rightHigh = new DJKnob(this);
+    rightHigh->setRange(-100, 100);
+    rightHigh->setValue(0);
+    rightHigh->setToolTip("High");
+    
+    rightMid = new DJKnob(this);
+    rightMid->setRange(-100, 100);
+    rightMid->setValue(0);
+    rightMid->setToolTip("Mid");
+    
+    rightLow = new DJKnob(this);
+    rightLow->setRange(-100, 100);
+    rightLow->setValue(0);
+    rightLow->setToolTip("Low");
+    
+    rightFilter = new DJKnob(this);
+    rightFilter->setRange(-100, 100);
+    rightFilter->setValue(0);
+    rightFilter->setToolTip("Filter");
+    
+    rightEqLayout->addWidget(rightTrim);
     rightEqLayout->addWidget(rightHigh);
     rightEqLayout->addWidget(rightMid);
     rightEqLayout->addWidget(rightLow);
     rightEqLayout->addWidget(rightFilter);
-
-    eqLayout->addLayout(leftEqLayout);
-    eqLayout->addLayout(rightEqLayout);
-
-    mixerSection->addLayout(eqLayout);
     
-    // Add volume sliders below the filter knobs
-    auto volumeLayout = new QHBoxLayout;
-    volumeLayout->setSpacing(4);
+    // Deck B VU Meter - schmaler und links neben den Knobs
+    auto deckBVULayout = new QVBoxLayout;
+    deckBVULayout->setSpacing(0);
+    deckBVULayout->setAlignment(Qt::AlignCenter);
+    auto deckBVULabel = new QLabel("B", this);
+    deckBVULabel->setAlignment(Qt::AlignCenter);
+    deckBVULabel->setStyleSheet("color: #888; font-size: 8px; font-weight: bold;");
+    vuMeterDeckB = new VUMeter(VUMeter::Channel, this);
+    vuMeterDeckB->setFixedSize(8, 170);  // Schmaler (8px) und Höhe = 5 Knobs
+    deckBVULayout->addWidget(deckBVULabel);
+    deckBVULayout->addWidget(vuMeterDeckB);
     
-    auto leftVolLayout = new QVBoxLayout;
-    leftVolLayout->setSpacing(1);
-    leftVolLayout->setAlignment(Qt::AlignCenter);
-    auto leftVolLabel = new QLabel("Vol A", this);
-    leftVolLabel->setAlignment(Qt::AlignCenter);
-    leftVolLabel->setStyleSheet("color: #fff; font-size: 9px; font-weight: bold;");
-    leftVolLabel->setFixedHeight(12);
+    // Volume links, dann VU Meter, dann Knobs
+    deckBSection->addLayout(rightVolLayout);
+    deckBSection->addLayout(deckBVULayout);
+    deckBSection->addLayout(rightEqLayout);
     
-    leftVolumeSlider = new QSlider(Qt::Vertical, this);
-    leftVolumeSlider->setRange(0, 100);
-    leftVolumeSlider->setValue(100);
-    leftVolumeSlider->setFixedHeight(50);
-    leftVolumeSlider->setFixedWidth(18);
+    // Assemble main mixer row with proper spacing
+    mainMixerRow->addLayout(deckASection);
+    mainMixerRow->addStretch(1);
+    mainMixerRow->addLayout(masterSection);
+    mainMixerRow->addStretch(1);
+    mainMixerRow->addLayout(deckBSection);
     
-    leftVolLayout->addWidget(leftVolLabel);
-    leftVolLayout->addWidget(leftVolumeSlider);
+    mixerSection->addLayout(mainMixerRow, 1);
     
-    auto rightVolLayout = new QVBoxLayout;
-    rightVolLayout->setSpacing(1);
-    rightVolLayout->setAlignment(Qt::AlignCenter);
-    auto rightVolLabel = new QLabel("Vol B", this);
-    rightVolLabel->setAlignment(Qt::AlignCenter);
-    rightVolLabel->setStyleSheet("color: #fff; font-size: 9px; font-weight: bold;");
-    rightVolLabel->setFixedHeight(12);
+    // Crossfader at the bottom
+    auto crossfaderLabel = new QLabel("CROSSFADER", this);
+    crossfaderLabel->setAlignment(Qt::AlignCenter);
+    crossfaderLabel->setStyleSheet("color: #888888; font-size: 9px; font-weight: bold;");
     
-    rightVolumeSlider = new QSlider(Qt::Vertical, this);
-    rightVolumeSlider->setRange(0, 100);
-    rightVolumeSlider->setValue(100);
-    rightVolumeSlider->setFixedHeight(50);
-    rightVolumeSlider->setFixedWidth(18);
+    crossfader->setMinimumHeight(24);
     
-    rightVolLayout->addWidget(rightVolLabel);
-    rightVolLayout->addWidget(rightVolumeSlider);
+    mixerSection->addWidget(crossfaderLabel);
+    mixerSection->addWidget(crossfader);
     
-    volumeLayout->addLayout(leftVolLayout);
-    volumeLayout->addLayout(rightVolLayout);
-    
-    mixerSection->addLayout(volumeLayout);
-    mixerSection->addStretch();
-    
+    // Create flat mixer widget
     auto mixerWidget = new QWidget(this);
     mixerWidget->setLayout(mixerSection);
-    mixerWidget->setFixedWidth(120);
-    mixerWidget->setStyleSheet("background-color: #2a2a2a; border: none;");
+    mixerWidget->setMinimumWidth(220);  // Fixed minimum width
+    mixerWidget->setMaximumWidth(280);  // Fixed maximum width to prevent growing
+    mixerWidget->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+    mixerWidget->setStyleSheet("QWidget { background-color: #2a2a2a; }");
     
-    decksLayout->addWidget(mixerWidget, 1);
-    decksLayout->addWidget(deckB->getControlsWidget(), 2);
+    decksLayout->addWidget(mixerWidget, 0);  // No stretch - stays fixed width
+    decksLayout->addWidget(deckB->getControlsWidget(), 3);  // Deck B gets more space
 
     // Connect knobs to slots to control EQ and filter
-    connect(leftHigh, &QDial::valueChanged, this, &QtMainWindow::onLeftHighChanged);
-    connect(leftMid, &QDial::valueChanged, this, &QtMainWindow::onLeftMidChanged);
-    connect(leftLow, &QDial::valueChanged, this, &QtMainWindow::onLeftLowChanged);
-    connect(leftFilter, &QDial::valueChanged, this, &QtMainWindow::onLeftFilterChanged);
+    connect(leftHigh, &DJKnob::valueChanged, this, &QtMainWindow::onLeftHighChanged);
+    connect(leftMid, &DJKnob::valueChanged, this, &QtMainWindow::onLeftMidChanged);
+    connect(leftLow, &DJKnob::valueChanged, this, &QtMainWindow::onLeftLowChanged);
+    connect(leftFilter, &DJKnob::valueChanged, this, &QtMainWindow::onLeftFilterChanged);
 
-    connect(rightHigh, &QDial::valueChanged, this, &QtMainWindow::onRightHighChanged);
-    connect(rightMid, &QDial::valueChanged, this, &QtMainWindow::onRightMidChanged);
-    connect(rightLow, &QDial::valueChanged, this, &QtMainWindow::onRightLowChanged);
-    connect(rightFilter, &QDial::valueChanged, this, &QtMainWindow::onRightFilterChanged);
+    connect(rightHigh, &DJKnob::valueChanged, this, &QtMainWindow::onRightHighChanged);
+    connect(rightMid, &DJKnob::valueChanged, this, &QtMainWindow::onRightMidChanged);
+    connect(rightLow, &DJKnob::valueChanged, this, &QtMainWindow::onRightLowChanged);
+    connect(rightFilter, &DJKnob::valueChanged, this, &QtMainWindow::onRightFilterChanged);
     
-    // Add double-click reset functionality for all mixer controls
-    // EQ controls reset to 0 (neutral)
-    leftHigh->installEventFilter(this);
-    leftMid->installEventFilter(this);
-    leftLow->installEventFilter(this);
-    leftFilter->installEventFilter(this);
-    rightHigh->installEventFilter(this);
-    rightMid->installEventFilter(this);
-    rightLow->installEventFilter(this);
-    rightFilter->installEventFilter(this);
+    // Connect trim knobs to audio callback
+    connect(leftTrim, &DJKnob::valueChanged, this, [this](int value) {
+        if (stereoCallback) {
+            // Convert knob value (-100 to 100) to dB (-24 to +24)
+            float trimDb = (value / 100.0f) * 24.0f;
+            stereoCallback->setTrimA(trimDb);
+        }
+    });
     
+    connect(rightTrim, &DJKnob::valueChanged, this, [this](int value) {
+        if (stereoCallback) {
+            // Convert knob value (-100 to 100) to dB (-24 to +24)
+            float trimDb = (value / 100.0f) * 24.0f;
+            stereoCallback->setTrimB(trimDb);
+        }
+    });
+    
+    // Add double-click reset functionality for volume sliders and crossfader
     // Volume sliders reset to 100 (full volume)
     leftVolumeSlider->installEventFilter(this);
     rightVolumeSlider->installEventFilter(this);
@@ -859,8 +1006,8 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     crossfader->installEventFilter(this);
     
     // Connect volume sliders
-    connect(leftVolumeSlider, &QSlider::valueChanged, this, &QtMainWindow::onLeftVolumeChanged);
-    connect(rightVolumeSlider, &QSlider::valueChanged, this, &QtMainWindow::onRightVolumeChanged);
+    connect(leftVolumeSlider, &CustomFader::valueChanged, this, &QtMainWindow::onLeftVolumeChanged);
+    connect(rightVolumeSlider, &CustomFader::valueChanged, this, &QtMainWindow::onRightVolumeChanged);
     
     // Bottom section: Library (now with LibraryManager)
     auto libLayout = new QVBoxLayout;
@@ -893,6 +1040,19 @@ QtMainWindow::QtMainWindow(QWidget* parent) : QWidget(parent)
     positionUpdateTimer->setInterval(80);
     connect(positionUpdateTimer, &QTimer::timeout, this, &QtMainWindow::updatePlaybackPositions);
     positionUpdateTimer->start();
+    
+    // VU meter update timer - polls audio levels and updates meters
+    vuMeterUpdateTimer = new QTimer(this);
+    vuMeterUpdateTimer->setInterval(30);
+    connect(vuMeterUpdateTimer, &QTimer::timeout, this, [this]() {
+        if (stereoCallback) {
+            vuMeterDeckA->setLevel(stereoCallback->getDeckALevel());
+            vuMeterDeckB->setLevel(stereoCallback->getDeckBLevel());
+            vuMeterMasterL->setLevel(stereoCallback->getMasterLevelL());
+            vuMeterMasterR->setLevel(stereoCallback->getMasterLevelR());
+        }
+    });
+    vuMeterUpdateTimer->start();
     
     // Continuous waveform fill-in timer - keeps loading chunks until complete
     waveformFillInTimer = new QTimer(this);
@@ -933,13 +1093,52 @@ void QtMainWindow::initializeAudio()
             return;
         }
 
-        // Request an audio buffer size close to 3 ms to minimize latency (optimized for low-latency DJ use)
+        // Request audio settings based on saved preferences (fallback to low-latency defaults)
         {
             juce::AudioDeviceManager::AudioDeviceSetup setup;
             deviceManager.getAudioDeviceSetup(setup);
+
+            QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
+            const QString currentTypeQt = QString::fromStdString(deviceManager.getCurrentAudioDeviceType().toStdString());
+            const QString currentOutputNameQt = QString::fromStdString(setup.outputDeviceName.toStdString());
+
+            const QString savedDeviceType = config.value("Audio/MasterDeviceType", currentTypeQt).toString();
+            const QString savedDeviceName = config
+                                                .value("Audio/MasterDevice",
+                                                       config.value("Audio/Device", currentOutputNameQt).toString())
+                                                .toString();
+            const int savedChannelStart = std::max(0, config.value("Audio/MasterChannelStart", 0).toInt());
+            const int savedChannelCount = std::max(1, config.value("Audio/MasterChannelCount", 2).toInt());
+            const double savedSampleRate = config.value("Audio/SampleRate", 44100).toDouble();
+            const int savedBufferSize = config.value("Audio/BufferSize", 128).toInt();
+
+            if (!savedDeviceType.isEmpty() && savedDeviceType != currentTypeQt) {
+                deviceManager.setCurrentAudioDeviceType(savedDeviceType.toStdString(), true);
+                currentDevice = deviceManager.getCurrentAudioDevice();
+                if (!currentDevice) [[unlikely]] {
+                    return;
+                }
+                deviceManager.getAudioDeviceSetup(setup);
+            }
+
+            if (!savedDeviceName.isEmpty()) {
+                setup.outputDeviceName = juce::String(savedDeviceName.toStdString());
+            }
+
+            setup.useDefaultOutputChannels = false;
+            setup.outputChannels.clear();
+            for (int ch = 0; ch < savedChannelCount; ++ch) {
+                setup.outputChannels.setBit(savedChannelStart + ch);
+            }
+            if (setup.outputChannels.isZero()) {
+                setup.outputChannels.setBit(0);
+                setup.outputChannels.setBit(1);
+            }
+            setup.useDefaultInputChannels = false;
+            setup.inputChannels.clear();
+
             const double srHint = (setup.sampleRate > 0.0) ? setup.sampleRate : currentDevice->getCurrentSampleRate();
             const double effectiveSr = (srHint > 0.0) ? srHint : 44100.0;
-            const int targetSamples = 256; // prefer a 256-sample hardware buffer
 
             const auto juceRates = currentDevice->getAvailableSampleRates();
             std::vector<double> availableRates;
@@ -947,19 +1146,20 @@ void QtMainWindow::initializeAudio()
             for (int i = 0; i < juceRates.size(); ++i) {
                 availableRates.push_back(juceRates.getUnchecked(i));
             }
-            const double preferredRate = 44100.0;
             const auto pickRate = [&]() -> double {
+                const double targetRate = (savedSampleRate > 0.0) ? savedSampleRate : effectiveSr;
                 if (availableRates.empty()) {
-                    return effectiveSr;
+                    return targetRate;
                 }
-                if (std::ranges::any_of(availableRates, [preferredRate](double rate) {
-                        return std::abs(rate - preferredRate) < 1.0; })) {
-                    return preferredRate;
+                if (std::ranges::any_of(availableRates, [targetRate](double rate) {
+                        return std::abs(rate - targetRate) < 1.0;
+                    })) {
+                    return targetRate;
                 }
-                const auto nearest = std::ranges::min_element(availableRates, [preferredRate](double lhs, double rhs) {
-                    return std::abs(lhs - preferredRate) < std::abs(rhs - preferredRate);
+                const auto nearest = std::ranges::min_element(availableRates, [targetRate](double lhs, double rhs) {
+                    return std::abs(lhs - targetRate) < std::abs(rhs - targetRate);
                 });
-                return (nearest != availableRates.end()) ? *nearest : effectiveSr;
+                return (nearest != availableRates.end()) ? *nearest : targetRate;
             }();
 
             const auto juceSizes = currentDevice->getAvailableBufferSizes();
@@ -969,36 +1169,32 @@ void QtMainWindow::initializeAudio()
                 availableSizes.push_back(juceSizes.getUnchecked(i));
             }
             const auto pickSize = [&]() -> int {
+                const int targetSamples = std::clamp(savedBufferSize, 48, 4096);
                 if (availableSizes.empty()) {
                     return targetSamples;
                 }
-                const auto smallest = *std::ranges::min_element(availableSizes);
-                if (smallest >= targetSamples) {
-                    return smallest;
+                if (auto exact = std::ranges::find(availableSizes, targetSamples); exact != availableSizes.end()) {
+                    return *exact;
                 }
-                const auto notExceeding = std::ranges::min_element(availableSizes, [targetSamples](int lhs, int rhs) {
-                    const bool lhsValid = lhs >= 48;
-                    const bool rhsValid = rhs >= 48;
-                    if (lhsValid != rhsValid) return lhsValid; // prefer valid
-                    if (lhsValid && rhsValid) {
-                        return std::abs(lhs - targetSamples) < std::abs(rhs - targetSamples);
-                    }
-                    return lhs < rhs;
+                const auto nearest = std::ranges::min_element(availableSizes, [targetSamples](int lhs, int rhs) {
+                    return std::abs(lhs - targetSamples) < std::abs(rhs - targetSamples);
                 });
-                return std::max(48, (notExceeding != availableSizes.end()) ? *notExceeding : targetSamples);
+                return std::clamp((nearest != availableSizes.end()) ? *nearest : targetSamples, 48, 4096);
             }();
 
             setup.sampleRate = pickRate;
             setup.bufferSize = pickSize;
-            deviceManager.setAudioDeviceSetup(setup, true);
 
-            // Refresh device pointer after potential re-open
+            const juce::String error = deviceManager.setAudioDeviceSetup(setup, true);
+            if (error.isNotEmpty()) {
+                qWarning() << "Failed to apply saved audio device setup:" << QString::fromStdString(error.toStdString());
+            }
+
             currentDevice = deviceManager.getCurrentAudioDevice();
             if (!currentDevice) [[unlikely]] {
                 return;
             }
 
-            // Log the actual buffer size and sample rate the device settled on
             {
                 const int bs = currentDevice->getCurrentBufferSizeSamples();
                 const double srNow = currentDevice->getCurrentSampleRate();
@@ -1011,16 +1207,37 @@ void QtMainWindow::initializeAudio()
             }
         }
 
+        const int deviceLatencySamples = currentDevice->getOutputLatencyInSamples() + currentDevice->getInputLatencyInSamples();
+        const int actualBuffer = currentDevice->getCurrentBufferSizeSamples();
+        const double actualSampleRate = currentDevice->getCurrentSampleRate();
+        const int keylockIndex = std::clamp(QSettings(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat)
+                                                .value("Audio/KeylockQuality", 1)
+                                                .toInt(),
+                                            0,
+                                            2);
+        const auto resolvedKeylock = static_cast<DJAudioPlayer::KeylockQuality>(keylockIndex);
+
         if (playerA) [[likely]] {
-            playerA->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
+            playerA->prepareToPlay(actualBuffer, actualSampleRate);
+            playerA->setHardwareLatencySamples(deviceLatencySamples > 0 ? deviceLatencySamples : actualBuffer);
+            playerA->setKeylockQuality(resolvedKeylock);
         }
         if (playerB) [[likely]] {
-            playerB->prepareToPlay(currentDevice->getCurrentBufferSizeSamples(), currentDevice->getCurrentSampleRate());
+            playerB->prepareToPlay(actualBuffer, actualSampleRate);
+            playerB->setHardwareLatencySamples(deviceLatencySamples > 0 ? deviceLatencySamples : actualBuffer);
+            playerB->setKeylockQuality(resolvedKeylock);
         }
 
     stereoCallback = std::make_unique<StereoAudioCallback>(playerA.get(), playerB.get());
         deviceManager.addAudioCallback(stereoCallback.get());
         deviceManager.addAudioCallback(&masterLevelMonitor);
+
+        if (menuBar) {
+            const double latencyMs = (actualSampleRate > 0.0)
+                                         ? ((actualBuffer * 1000.0) / actualSampleRate)
+                                         : 0.0;
+            menuBar->updateAudioLatency(latencyMs, actualSampleRate, actualBuffer);
+        }
 
         if (crossfader) [[likely]] {
             onCrossfader(crossfader->value());
@@ -1032,6 +1249,10 @@ void QtMainWindow::initializeAudio()
 QtMainWindow::~QtMainWindow()
 {
     qDebug() << "[DESTRUCTOR] MainWindow destructor called";
+
+    if (auto* app = qApp) {
+        app->removeEventFilter(this);
+    }
     
     if (cursorOverridden) {
         QApplication::restoreOverrideCursor();
@@ -1245,13 +1466,16 @@ void QtMainWindow::closeEvent(QCloseEvent* event)
 
 void QtMainWindow::onCrossfader(int v) {
     if (stereoCallback) [[likely]] {
-        stereoCallback->setCrossfader((static_cast<float>(v) - 50.0f) * 0.02f);
+        // Map slider range (-100 .. 100) to audio crossfader range (-1.0 .. 1.0)
+        stereoCallback->setCrossfader(static_cast<float>(v) / 100.0f);
     }
 }
 
 void QtMainWindow::setCrossfaderPosition(float normalizedValue) {
     if (crossfader) [[likely]] {
-        crossfader->setValue(std::clamp(static_cast<int>(normalizedValue * 100.0f), 0, 100));
+        // normalizedValue: 0.0 = full Deck A, 0.5 = center, 1.0 = full Deck B
+        int sliderValue = static_cast<int>((std::clamp(normalizedValue, 0.0f, 1.0f) * 200.0f) - 100.0f);
+        crossfader->setValue(sliderValue);
     }
 }
 
@@ -1295,6 +1519,369 @@ void QtMainWindow::setDeckBVolume(float normalizedValue) {
     if (stereoCallback) [[likely]] {
         stereoCallback->setVolumeB(std::clamp(normalizedValue, 0.0f, 1.0f));
     }
+}
+
+void QtMainWindow::applyAudioSettings(const QString& masterDeviceType,
+                                      const QString& masterDeviceName,
+                                      int masterChannelStart,
+                                      int masterChannelCount,
+                                      const QString& cueDeviceType,
+                                      const QString& cueDeviceName,
+                                      int cueChannelStart,
+                                      int cueChannelCount,
+                                      int bufferSize,
+                                      int sampleRate,
+                                      bool exclusiveMode) {
+    Q_UNUSED(cueDeviceType);
+    Q_UNUSED(cueDeviceName);
+    Q_UNUSED(cueChannelStart);
+    Q_UNUSED(cueChannelCount);
+    Q_UNUSED(exclusiveMode);
+
+    qDebug() << "QtMainWindow::applyAudioSettings - MasterDevice:" << masterDeviceName
+             << "Type:" << masterDeviceType
+             << "Channels start:" << masterChannelStart << "count:" << masterChannelCount
+             << "BufferSize:" << bufferSize
+             << "SampleRate:" << sampleRate;
+
+    auto* currentDevice = deviceManager.getCurrentAudioDevice();
+    if (!currentDevice) {
+        qWarning() << "No audio device available for settings change";
+        QMessageBox::warning(this,
+                             "Audio Settings Error",
+                             "No audio device available. Please check your audio configuration.");
+        return;
+    }
+
+    juce::AudioDeviceManager::AudioDeviceSetup currentSetup;
+    deviceManager.getAudioDeviceSetup(currentSetup);
+    const juce::String currentType = deviceManager.getCurrentAudioDeviceType();
+
+    const QString currentTypeQt = QString::fromStdString(currentType.toStdString());
+    const QString currentDeviceQt = QString::fromStdString(currentSetup.outputDeviceName.toStdString());
+
+    QString requestedTypeQt = masterDeviceType.isEmpty() ? currentTypeQt : masterDeviceType;
+    QString requestedDeviceQt = masterDeviceName.isEmpty() ? currentDeviceQt : masterDeviceName;
+
+    if (requestedDeviceQt.isEmpty()) {
+        requestedDeviceQt = currentDeviceQt;
+    }
+    if (requestedTypeQt.isEmpty()) {
+        requestedTypeQt = currentTypeQt;
+    }
+
+    masterChannelStart = std::max(0, masterChannelStart);
+    masterChannelCount = std::clamp(masterChannelCount, 1, 16);
+
+    juce::BigInteger requestedChannels;
+    for (int i = 0; i < masterChannelCount; ++i) {
+        requestedChannels.setBit(masterChannelStart + i);
+    }
+    if (requestedChannels.isZero()) {
+        requestedChannels.setBit(0);
+        requestedChannels.setBit(1);
+        masterChannelStart = 0;
+        masterChannelCount = 2;
+    }
+
+    if (sampleRate <= 0) {
+        sampleRate = static_cast<int>(std::round(currentDevice->getCurrentSampleRate()));
+    }
+    if (bufferSize <= 0) {
+        bufferSize = currentDevice->getCurrentBufferSizeSamples();
+    }
+
+    const bool bufferMatches = currentDevice->getCurrentBufferSizeSamples() == bufferSize;
+    const bool rateMatches = std::abs(currentDevice->getCurrentSampleRate() - static_cast<double>(sampleRate)) < 1.0;
+    const bool typeMatches = requestedTypeQt == currentTypeQt;
+    const bool deviceMatches = requestedDeviceQt == currentDeviceQt;
+    const bool channelMatches = currentSetup.outputChannels == requestedChannels;
+
+    if (bufferMatches && rateMatches && typeMatches && deviceMatches && channelMatches) {
+        qDebug() << "Audio settings already active - skipping reconfiguration";
+        if (menuBar) {
+            const double latencyMs = (sampleRate > 0) ? ((bufferSize * 1000.0) / sampleRate) : 0.0;
+            menuBar->updateAudioLatency(latencyMs, sampleRate, bufferSize);
+        }
+        return;
+    }
+
+    const double latencyMsEstimate = (sampleRate > 0) ? ((bufferSize * 1000.0) / sampleRate) : 0.0;
+    const QString deviceCaption = QString("%1 (%2)").arg(requestedDeviceQt).arg(requestedTypeQt);
+    const QString channelCaption = QString("%1-%2")
+                                       .arg(masterChannelStart + 1)
+                                       .arg(masterChannelStart + masterChannelCount);
+
+    const QString prompt = QString("Changing audio settings will temporarily stop playback.\n\n"
+                                   "New settings:\n"
+                                   "Device: %1\n"
+                                   "Channels: %2\n"
+                                   "Buffer Size: %3 samples (~%4 ms)\n"
+                                   "Sample Rate: %5 Hz\n\n"
+                                   "Continue?")
+                               .arg(deviceCaption)
+                               .arg(channelCaption)
+                               .arg(bufferSize)
+                               .arg(QString::number(latencyMsEstimate, 'f', 2))
+                               .arg(sampleRate);
+
+    if (QMessageBox::question(this, "Apply Audio Settings", prompt, QMessageBox::Yes | QMessageBox::No)
+        != QMessageBox::Yes) {
+        return;
+    }
+
+    const bool deckAWasPlaying = playerA && playerA->isPlaying();
+    const bool deckBWasPlaying = playerB && playerB->isPlaying();
+    const double deckAPosition = playerA ? playerA->getCurrentPositionSeconds() : 0.0;
+    const double deckBPosition = playerB ? playerB->getCurrentPositionSeconds() : 0.0;
+
+    qDebug() << "Stored state - DeckA playing:" << deckAWasPlaying << "pos:" << deckAPosition;
+    qDebug() << "Stored state - DeckB playing:" << deckBWasPlaying << "pos:" << deckBPosition;
+
+    if (stereoCallback) {
+        stereoCallback->setShuttingDown(true);
+        deviceManager.removeAudioCallback(stereoCallback.get());
+        qDebug() << "Removed audio callback";
+    }
+
+    QThread::msleep(50);
+
+    if (playerA) {
+        playerA->stop();
+        playerA->releaseResources();
+    }
+    if (playerB) {
+        playerB->stop();
+        playerB->releaseResources();
+    }
+
+    qDebug() << "Players stopped and resources released";
+
+    deviceManager.closeAudioDevice();
+    QThread::msleep(100);
+    qDebug() << "Audio device closed";
+
+    const juce::String requestedType = juce::String(requestedTypeQt.toStdString());
+    const juce::String requestedDevice = juce::String(requestedDeviceQt.toStdString());
+
+    if (!typeMatches) {
+        deviceManager.setCurrentAudioDeviceType(requestedType, true);
+        currentDevice = deviceManager.getCurrentAudioDevice();
+        if (!currentDevice) {
+            QMessageBox::critical(this,
+                                  "Audio Settings Error",
+                                  QString("Failed to switch to audio device type '%1'.").arg(requestedTypeQt));
+            if (stereoCallback) {
+                deviceManager.addAudioCallback(stereoCallback.get());
+                stereoCallback->setShuttingDown(false);
+            }
+            return;
+        }
+    }
+
+    juce::AudioDeviceManager::AudioDeviceSetup setup;
+    deviceManager.getAudioDeviceSetup(setup);
+    setup.outputDeviceName = requestedDevice;
+    setup.useDefaultOutputChannels = false;
+    setup.useDefaultInputChannels = false;
+    setup.outputChannels = requestedChannels;
+    setup.inputChannels.clear();
+    setup.bufferSize = bufferSize;
+    setup.sampleRate = sampleRate;
+
+    qDebug() << "Applying new audio setup for device" << requestedDeviceQt;
+
+    const juce::String error = deviceManager.setAudioDeviceSetup(setup, true);
+
+    if (error.isNotEmpty()) {
+        const QString errorMsg = QString::fromStdString(error.toStdString());
+        qCritical() << "Failed to apply audio settings:" << errorMsg;
+
+        QMessageBox::critical(this,
+                              "Audio Settings Error",
+                              QString("Failed to apply audio settings:\n%1\n\n"
+                                      "Attempting to restore previous configuration...")
+                                  .arg(errorMsg));
+
+        deviceManager.initialise(0, 2, nullptr, true);
+
+        if (stereoCallback) {
+            deviceManager.addAudioCallback(stereoCallback.get());
+            stereoCallback->setShuttingDown(false);
+        }
+
+        if (auto* recoveryDevice = deviceManager.getCurrentAudioDevice()) {
+            const int recBufferSize = recoveryDevice->getCurrentBufferSizeSamples();
+            const double recSampleRate = recoveryDevice->getCurrentSampleRate();
+            if (playerA) playerA->prepareToPlay(recBufferSize, recSampleRate);
+            if (playerB) playerB->prepareToPlay(recBufferSize, recSampleRate);
+            qDebug() << "Recovery successful - using buffer size:" << recBufferSize;
+        }
+
+        return;
+    }
+
+    qDebug() << "Audio device reconfigured successfully";
+
+    auto* newDevice = deviceManager.getCurrentAudioDevice();
+    if (!newDevice) {
+        qCritical() << "Failed to get audio device after reconfiguration!";
+        QMessageBox::critical(this,
+                              "Audio Settings Error",
+                              "Failed to reopen audio device after configuration change.\n"
+                              "Please restart the application.");
+        return;
+    }
+
+    const int actualBufferSize = newDevice->getCurrentBufferSizeSamples();
+    const double actualSampleRate = newDevice->getCurrentSampleRate();
+    const QString activeDeviceName = QString::fromStdString(newDevice->getName().toStdString());
+
+    qDebug() << "New audio device settings - Device:" << activeDeviceName
+             << "BufferSize:" << actualBufferSize
+             << "SampleRate:" << actualSampleRate;
+
+    if (playerA) {
+        playerA->prepareToPlay(actualBufferSize, actualSampleRate);
+        qDebug() << "Player A prepared with new settings (length:" << playerA->getLengthInSeconds() << "s)";
+    }
+
+    if (playerB) {
+        playerB->prepareToPlay(actualBufferSize, actualSampleRate);
+        qDebug() << "Player B prepared with new settings (length:" << playerB->getLengthInSeconds() << "s)";
+    }
+
+    if (stereoCallback) {
+        deviceManager.addAudioCallback(stereoCallback.get());
+        stereoCallback->setShuttingDown(false);
+
+        const int hwLatency = newDevice->getOutputLatencyInSamples();
+        if (playerA) playerA->setHardwareLatencySamples(hwLatency);
+        if (playerB) playerB->setHardwareLatencySamples(hwLatency);
+
+        qDebug() << "Audio callback reconnected, hw latency:" << hwLatency << "samples";
+    }
+
+    if (menuBar) {
+        const double latencyMs = (actualSampleRate > 0.0)
+                                     ? ((actualBufferSize * 1000.0) / actualSampleRate)
+                                     : 0.0;
+        menuBar->updateAudioLatency(latencyMs, actualSampleRate, actualBufferSize);
+        qDebug() << "MenuBar updated with new audio settings";
+    }
+
+    QThread::msleep(150);
+
+    if (playerA && playerA->getLengthInSeconds() > 0.0 && deckAPosition > 0.0) {
+        const double relPos = std::clamp(deckAPosition / playerA->getLengthInSeconds(), 0.0, 1.0);
+        playerA->setPositionRelative(relPos);
+        qDebug() << "Deck A position restored to" << relPos << "(" << deckAPosition << "seconds)";
+    }
+
+    if (playerB && playerB->getLengthInSeconds() > 0.0 && deckBPosition > 0.0) {
+        const double relPos = std::clamp(deckBPosition / playerB->getLengthInSeconds(), 0.0, 1.0);
+        playerB->setPositionRelative(relPos);
+        qDebug() << "Deck B position restored to" << relPos << "(" << deckBPosition << "seconds)";
+    }
+
+    if (deckAWasPlaying && playerA && playerA->getLengthInSeconds() > 0.0) {
+        QTimer::singleShot(500, [this]() {
+            if (playerA && playerA->getLengthInSeconds() > 0.0) {
+                playerA->start();
+                qDebug() << "Deck A playback resumed after audio settings change";
+            }
+        });
+    }
+
+    if (deckBWasPlaying && playerB && playerB->getLengthInSeconds() > 0.0) {
+        QTimer::singleShot(500, [this]() {
+            if (playerB && playerB->getLengthInSeconds() > 0.0) {
+                playerB->start();
+                qDebug() << "Deck B playback resumed after audio settings change";
+            }
+        });
+    }
+
+    QMessageBox::information(this,
+                             "Audio Settings Applied",
+                             QString("Audio settings changed successfully:\n\n"
+                                     "Device: %1\n"
+                                     "Channels: %2\n"
+                                     "Buffer Size: %3 samples (~%4 ms)\n"
+                                     "Sample Rate: %5 Hz\n\n"
+                                     "Playback state has been restored.")
+                                 .arg(activeDeviceName)
+                                 .arg(channelCaption)
+                                 .arg(actualBufferSize)
+                                 .arg(QString::number((actualBufferSize * 1000.0) / actualSampleRate, 'f', 2))
+                                 .arg(actualSampleRate));
+}
+
+QVector<QtMainWindow::AudioOutputDeviceInfo> QtMainWindow::getAvailableOutputDevices() {
+    QVector<AudioOutputDeviceInfo> devices;
+    auto& types = deviceManager.getAvailableDeviceTypes();
+    for (int i = 0; i < types.size(); ++i) {
+        if (auto* type = types[i]) {
+            type->scanForDevices();
+            const juce::StringArray names = type->getDeviceNames(false);
+            for (int n = 0; n < names.size(); ++n) {
+                AudioOutputDeviceInfo info;
+                info.typeName = QString::fromStdString(type->getTypeName().toStdString());
+                info.deviceName = QString::fromStdString(names[n].toStdString());
+
+                std::unique_ptr<juce::AudioIODevice> device(type->createDevice(names[n], {}));
+                if (device) {
+                    info.description = QString::fromStdString(device->getName().toStdString());
+                    const juce::StringArray channelNames = device->getOutputChannelNames();
+                    for (int ch = 0; ch < channelNames.size(); ++ch) {
+                        info.outputChannelNames.append(QString::fromStdString(channelNames[ch].toStdString()));
+                    }
+                } else {
+                    info.description = info.deviceName;
+                }
+
+                devices.append(info);
+            }
+        }
+    }
+
+    return devices;
+}
+
+QtMainWindow::AudioDeviceState QtMainWindow::getActiveAudioDeviceState() const {
+    AudioDeviceState state;
+    state.typeName = QString::fromStdString(deviceManager.getCurrentAudioDeviceType().toStdString());
+
+    juce::AudioDeviceManager::AudioDeviceSetup setup;
+    deviceManager.getAudioDeviceSetup(setup);
+    state.deviceName = QString::fromStdString(setup.outputDeviceName.toStdString());
+
+    int firstSetBit = setup.outputChannels.findNextSetBit(0);
+    if (firstSetBit >= 0) {
+        state.channelStart = firstSetBit;
+        int count = 0;
+        for (int bit = firstSetBit; bit >= 0; bit = setup.outputChannels.findNextSetBit(bit + 1)) {
+            ++count;
+        }
+        state.channelCount = std::max(1, count);
+    }
+
+    return state;
+}
+
+void QtMainWindow::setKeylockQuality(DJAudioPlayer::KeylockQuality quality) {
+    qDebug() << "QtMainWindow::setKeylockQuality - Quality:" << static_cast<int>(quality);
+    
+    if (playerA) {
+        playerA->setKeylockQuality(quality);
+    }
+    
+    if (playerB) {
+        playerB->setKeylockQuality(quality);
+    }
+    
+    const char* qualityNames[] = {"Fast", "Balanced", "High Quality"};
+    qDebug() << "Keylock quality set to" << qualityNames[static_cast<int>(quality)] << "for both decks";
 }
 
 void QtMainWindow::onLeftHighChanged(int v) {

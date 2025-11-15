@@ -1,4 +1,6 @@
 #include "PreferencesDialog.h"
+#include "MainWindow.h"
+#include "DJAudioPlayer.h"
 #include <QApplication>
 #include <QTimer>
 #include <QTime>
@@ -9,6 +11,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSettings>
+#include <QVariant>
+#include <algorithm>
 #include <iostream>
 
 PreferencesDialog::PreferencesDialog(QWidget* parent)
@@ -17,6 +21,10 @@ PreferencesDialog::PreferencesDialog(QWidget* parent)
     setWindowTitle("BetaPulseX - Preferences");
     setWindowIcon(QIcon(":/icons/settings.png"));
     setModal(true);
+
+    if (!mainWindowRef) {
+        mainWindowRef = qobject_cast<QtMainWindow*>(parent);
+    }
     
     // Dialog size
     resize(800, 600);
@@ -36,14 +44,22 @@ PreferencesDialog::PreferencesDialog(QWidget* parent)
     connect(midiEngine, &MidiEngine::midiMessageReceived, this, &PreferencesDialog::onMidiMessageReceived);
     
     setupUI();
+
+    suppressChangeTracking = true;
     loadSettings();
     originalSettings = settings; // Backup für Cancel
+    suppressChangeTracking = false;
+
+    installChangeTracking();
+    pendingChanges = false;
+    updateApplyButtonState();
 }
 
 void PreferencesDialog::setPlayerReferences(DJAudioPlayer* playerA, DJAudioPlayer* playerB, QtMainWindow* mainWindow)
 {
     // Store main window reference for deck access
     mainWindowRef = mainWindow;
+    refreshAudioDeviceLists();
     
     if (midiEngine) {
         midiEngine->setPlayers(playerA, playerB);
@@ -121,12 +137,20 @@ void PreferencesDialog::createAudioTab() {
     QVBoxLayout* layout = new QVBoxLayout(audioTab);
     
     // Audio Device Group
-    QGroupBox* deviceGroup = new QGroupBox("Audio Device");
+    QGroupBox* deviceGroup = new QGroupBox("Audio Routing");
     QFormLayout* deviceLayout = new QFormLayout(deviceGroup);
-    
-    audioDeviceCombo = new QComboBox();
-    populateAudioDevices();
-    deviceLayout->addRow("Device:", audioDeviceCombo);
+
+    masterDeviceCombo = new QComboBox();
+    deviceLayout->addRow("Master Output Device:", masterDeviceCombo);
+
+    masterChannelCombo = new QComboBox();
+    deviceLayout->addRow("Master Output Channels:", masterChannelCombo);
+
+    cueDeviceCombo = new QComboBox();
+    deviceLayout->addRow("Cue Output Device:", cueDeviceCombo);
+
+    cueChannelCombo = new QComboBox();
+    deviceLayout->addRow("Cue Output Channels:", cueChannelCombo);
     
     bufferSizeCombo = new QComboBox();
     bufferSizeCombo->addItems({"64", "128", "256", "512", "1024", "2048"});
@@ -179,7 +203,23 @@ void PreferencesDialog::createAudioTab() {
     layout->addWidget(volumeGroup);
     layout->addStretch();
     
-    // Connect signals
+    // Connect audio signals
+    connect(masterDeviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+        this, &PreferencesDialog::onMasterDeviceChanged);
+    connect(masterChannelCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+        this, &PreferencesDialog::onMasterChannelChanged);
+    connect(cueDeviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+        this, &PreferencesDialog::onCueDeviceChanged);
+    connect(cueChannelCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+        this, &PreferencesDialog::onCueChannelChanged);
+    connect(bufferSizeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+            this, &PreferencesDialog::onBufferSizeChanged);
+    connect(sampleRateCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+            this, &PreferencesDialog::onSampleRateChanged);
+    connect(keylockQualityCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+            this, &PreferencesDialog::onKeylockQualityChanged);
+    
+    // Connect volume signals
     connect(masterVolumeSlider, &QSlider::valueChanged, [this](int value) {
         updateVolumeLabel(masterVolumeSlider, masterVolumeLabel, "");
     });
@@ -331,6 +371,7 @@ void PreferencesDialog::createInterfaceTab() {
         QColor color = QColorDialog::getColor(getColorFromButton(waveformColorButton), this, "Waveform Color");
         if (color.isValid()) {
             setColorButtonColor(waveformColorButton, color);
+            markDirty();
         }
     });
     
@@ -338,6 +379,7 @@ void PreferencesDialog::createInterfaceTab() {
         QColor color = QColorDialog::getColor(getColorFromButton(beatGridColorButton), this, "Beat Grid Color");
         if (color.isValid()) {
             setColorButtonColor(beatGridColorButton, color);
+            markDirty();
         }
     });
     
@@ -345,6 +387,7 @@ void PreferencesDialog::createInterfaceTab() {
         QColor color = QColorDialog::getColor(getColorFromButton(loopColorButton), this, "Loop Color");
         if (color.isValid()) {
             setColorButtonColor(loopColorButton, color);
+            markDirty();
         }
     });
     
@@ -354,6 +397,7 @@ void PreferencesDialog::createInterfaceTab() {
         if (ok) {
             settings.uiFont = font;
             fontButton->setText(formatFontName(font));
+            markDirty();
         }
     });
 }
@@ -936,8 +980,13 @@ void PreferencesDialog::createAdvancedTab() {
 
 // Button event handlers
 void PreferencesDialog::onOkClicked() {
-    saveSettings();
-    applySettings();
+    if (pendingChanges) {
+        saveSettings();
+        applySettings();
+        originalSettings = settings;
+        pendingChanges = false;
+    }
+    updateApplyButtonState();
     accept();
 }
 
@@ -947,9 +996,15 @@ void PreferencesDialog::onCancelClicked() {
 }
 
 void PreferencesDialog::onApplyClicked() {
+    if (!pendingChanges) {
+        return;
+    }
+
     saveSettings();
     applySettings();
     originalSettings = settings; // Update backup
+    pendingChanges = false;
+    updateApplyButtonState();
 }
 
 void PreferencesDialog::onRestoreDefaultsClicked() {
@@ -962,20 +1017,105 @@ void PreferencesDialog::onRestoreDefaultsClicked() {
 }
 
 // Audio event handlers
-void PreferencesDialog::onAudioDeviceChanged() {
-    // Implementation for audio device change
+void PreferencesDialog::onMasterDeviceChanged() {
+    if (!masterDeviceCombo) {
+        return;
+    }
+
+    const QVariantMap data = masterDeviceCombo->currentData().toMap();
+    settings.masterAudioDevice = data.value("deviceName").toString();
+    settings.masterAudioDeviceType = data.value("deviceType").toString();
+
+    qDebug() << "PreferencesDialog: Master device changed to" << settings.masterAudioDevice
+             << "(" << settings.masterAudioDeviceType << ")";
+
+    updateChannelComboForDevice(masterChannelCombo,
+                                settings.masterAudioDevice,
+                                settings.masterAudioDeviceType,
+                                settings.masterOutputChannelStart,
+                                settings.masterOutputChannelCount);
+
+    const QVariantMap channelData = masterChannelCombo->currentData().toMap();
+    settings.masterOutputChannelStart = channelData.value("start").toInt();
+    settings.masterOutputChannelCount = channelData.value("count").toInt();
+}
+
+void PreferencesDialog::onMasterChannelChanged() {
+    if (!masterChannelCombo) {
+        return;
+    }
+
+    const QVariantMap channelData = masterChannelCombo->currentData().toMap();
+    settings.masterOutputChannelStart = channelData.value("start").toInt();
+    settings.masterOutputChannelCount = channelData.value("count").toInt();
+
+    qDebug() << "PreferencesDialog: Master channel selection changed to start"
+             << settings.masterOutputChannelStart << "count" << settings.masterOutputChannelCount;
+}
+
+void PreferencesDialog::onCueDeviceChanged() {
+    if (!cueDeviceCombo) {
+        return;
+    }
+
+    const QVariantMap data = cueDeviceCombo->currentData().toMap();
+    settings.cueAudioDevice = data.value("deviceName").toString();
+    settings.cueAudioDeviceType = data.value("deviceType").toString();
+
+    qDebug() << "PreferencesDialog: Cue device changed to" << settings.cueAudioDevice
+             << "(" << settings.cueAudioDeviceType << ")";
+
+    updateChannelComboForDevice(cueChannelCombo,
+                                settings.cueAudioDevice,
+                                settings.cueAudioDeviceType,
+                                settings.cueOutputChannelStart,
+                                settings.cueOutputChannelCount);
+
+    const QVariantMap channelData = cueChannelCombo->currentData().toMap();
+    settings.cueOutputChannelStart = channelData.value("start").toInt();
+    settings.cueOutputChannelCount = channelData.value("count").toInt();
+}
+
+void PreferencesDialog::onCueChannelChanged() {
+    if (!cueChannelCombo) {
+        return;
+    }
+
+    const QVariantMap channelData = cueChannelCombo->currentData().toMap();
+    settings.cueOutputChannelStart = channelData.value("start").toInt();
+    settings.cueOutputChannelCount = channelData.value("count").toInt();
+
+    qDebug() << "PreferencesDialog: Cue channel selection changed to start"
+             << settings.cueOutputChannelStart << "count" << settings.cueOutputChannelCount;
 }
 
 void PreferencesDialog::onBufferSizeChanged(int size) {
-    // Implementation for buffer size change
+    settings.bufferSize = bufferSizeCombo->currentText().toInt();
+    
+    // Calculate and display latency
+    int sampleRate = sampleRateCombo->currentText().toInt();
+    if (sampleRate > 0) {
+        double latencyMs = (settings.bufferSize * 1000.0) / sampleRate;
+        qDebug() << "PreferencesDialog: Buffer size changed to" << settings.bufferSize 
+                 << "samples (~" << QString::number(latencyMs, 'f', 2) << "ms latency)";
+    }
 }
 
 void PreferencesDialog::onSampleRateChanged() {
-    // Implementation for sample rate change
+    settings.sampleRate = sampleRateCombo->currentText().toInt();
+    
+    // Recalculate latency display
+    double latencyMs = (settings.bufferSize * 1000.0) / settings.sampleRate;
+    qDebug() << "PreferencesDialog: Sample rate changed to" << settings.sampleRate 
+             << "Hz (latency ~" << QString::number(latencyMs, 'f', 2) << "ms)";
 }
 
 void PreferencesDialog::onKeylockQualityChanged() {
-    // Implementation for keylock quality change
+    settings.keylockQuality = keylockQualityCombo->currentIndex();
+    
+    const char* qualityNames[] = {"Fast", "Balanced", "High Quality"};
+    qDebug() << "PreferencesDialog: Keylock quality changed to" 
+             << qualityNames[settings.keylockQuality];
 }
 
 // Interface event handlers
@@ -1033,7 +1173,16 @@ void PreferencesDialog::loadSettings() {
     QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
     
     // Load Audio settings
-    settings.audioDevice = config.value("Audio/Device", "").toString();
+    settings.masterAudioDevice = config.value("Audio/MasterDevice",
+                                             config.value("Audio/Device", "")).toString();
+    settings.masterAudioDeviceType = config.value("Audio/MasterDeviceType", "").toString();
+    settings.masterOutputChannelStart = config.value("Audio/MasterChannelStart", 0).toInt();
+    settings.masterOutputChannelCount = config.value("Audio/MasterChannelCount", 2).toInt();
+    settings.cueAudioDevice = config.value("Audio/CueDevice", settings.masterAudioDevice).toString();
+    settings.cueAudioDeviceType = config.value("Audio/CueDeviceType", settings.masterAudioDeviceType).toString();
+    settings.cueOutputChannelStart = config.value("Audio/CueChannelStart",
+                                                 settings.masterOutputChannelStart + settings.masterOutputChannelCount).toInt();
+    settings.cueOutputChannelCount = config.value("Audio/CueChannelCount", 2).toInt();
     settings.bufferSize = config.value("Audio/BufferSize", 512).toInt();
     settings.sampleRate = config.value("Audio/SampleRate", 44100).toInt();
     settings.keylockQuality = config.value("Audio/KeylockQuality", 1).toInt();
@@ -1102,100 +1251,302 @@ void PreferencesDialog::loadSettings() {
     
     // Update UI controls with loaded settings
     updateUIFromSettings();
+
+    originalSettings = settings;
+    pendingChanges = false;
+    updateApplyButtonState();
 }
 
 void PreferencesDialog::saveSettings() {
+    settings = collectCurrentSettings();
     QSettings config(AppConfig::instance().getPreferencesPath(), QSettings::IniFormat);
     
     // Save Audio settings
-    config.setValue("Audio/Device", audioDeviceCombo->currentText());
-    config.setValue("Audio/BufferSize", bufferSizeCombo->currentText().toInt());
-    config.setValue("Audio/SampleRate", sampleRateCombo->currentText().toInt());
-    config.setValue("Audio/KeylockQuality", keylockQualityCombo->currentIndex());
-    config.setValue("Audio/ExclusiveMode", exclusiveModeCheck->isChecked());
-    config.setValue("Audio/MasterVolume", masterVolumeSlider->value() / 100.0);
-    config.setValue("Audio/HeadphoneVolume", headphoneVolumeSlider->value() / 100.0);
+    config.setValue("Audio/MasterDevice", settings.masterAudioDevice);
+    config.setValue("Audio/MasterDeviceType", settings.masterAudioDeviceType);
+    config.setValue("Audio/MasterChannelStart", settings.masterOutputChannelStart);
+    config.setValue("Audio/MasterChannelCount", settings.masterOutputChannelCount);
+    config.setValue("Audio/CueDevice", settings.cueAudioDevice);
+    config.setValue("Audio/CueDeviceType", settings.cueAudioDeviceType);
+    config.setValue("Audio/CueChannelStart", settings.cueOutputChannelStart);
+    config.setValue("Audio/CueChannelCount", settings.cueOutputChannelCount);
+    // Legacy compatibility key
+    config.setValue("Audio/Device", settings.masterAudioDevice);
+    config.setValue("Audio/BufferSize", settings.bufferSize);
+    config.setValue("Audio/SampleRate", settings.sampleRate);
+    config.setValue("Audio/KeylockQuality", settings.keylockQuality);
+    config.setValue("Audio/ExclusiveMode", settings.exclusiveMode);
+    config.setValue("Audio/MasterVolume", settings.masterVolume);
+    config.setValue("Audio/HeadphoneVolume", settings.headphoneVolume);
     
     // Save Deck settings
-    config.setValue("Decks/DeckAKeylockDefault", deckAKeylockDefault->isChecked());
-    config.setValue("Decks/DeckAQuantizeDefault", deckAQuantizeDefault->isChecked());
-    config.setValue("Decks/DeckASpeedDefault", deckASpeedDefault->value());
-    config.setValue("Decks/DeckBKeylockDefault", deckBKeylockDefault->isChecked());
-    config.setValue("Decks/DeckBQuantizeDefault", deckBQuantizeDefault->isChecked());
-    config.setValue("Decks/DeckBSpeedDefault", deckBSpeedDefault->value());
-    config.setValue("Decks/SyncOnLoad", syncOnLoad->isChecked());
-    config.setValue("Decks/AutoGainAdjust", autoGainAdjust->isChecked());
-    config.setValue("Decks/LoopLengthDefault", loopLengthDefault->value());
-    config.setValue("Decks/ScratchSensitivity", scratchSensitivity->currentIndex());
+    config.setValue("Decks/DeckAKeylockDefault", settings.deckAKeylockDefault);
+    config.setValue("Decks/DeckAQuantizeDefault", settings.deckAQuantizeDefault);
+    config.setValue("Decks/DeckASpeedDefault", settings.deckASpeedDefault);
+    config.setValue("Decks/DeckBKeylockDefault", settings.deckBKeylockDefault);
+    config.setValue("Decks/DeckBQuantizeDefault", settings.deckBQuantizeDefault);
+    config.setValue("Decks/DeckBSpeedDefault", settings.deckBSpeedDefault);
+    config.setValue("Decks/SyncOnLoad", settings.syncOnLoad);
+    config.setValue("Decks/AutoGainAdjust", settings.autoGainAdjust);
+    config.setValue("Decks/LoopLengthDefault", settings.loopLengthDefault);
+    config.setValue("Decks/ScratchSensitivity", settings.scratchSensitivity);
     
     // Save Interface settings
-    config.setValue("Interface/Theme", themeCombo->currentText());
-    config.setValue("Interface/Skin", skinCombo->currentText());
-    config.setValue("Interface/WaveformColor", getColorFromButton(waveformColorButton));
-    config.setValue("Interface/BeatGridColor", getColorFromButton(beatGridColorButton));
-    config.setValue("Interface/LoopColor", getColorFromButton(loopColorButton));
-    config.setValue("Interface/ShowBpmOnWaveform", showBpmOnWaveform->isChecked());
-    config.setValue("Interface/ShowBeatNumbers", showBeatNumbers->isChecked());
-    config.setValue("Interface/AnimatedWaveforms", animatedWaveforms->isChecked());
-    config.setValue("Interface/WaveformQuality", waveformQualitySlider->value());
-    config.setValue("Interface/FullscreenMode", fullscreenMode->isChecked());
+    config.setValue("Interface/Theme", settings.theme);
+    config.setValue("Interface/Skin", settings.skin);
+    config.setValue("Interface/WaveformColor", settings.waveformColor);
+    config.setValue("Interface/BeatGridColor", settings.beatGridColor);
+    config.setValue("Interface/LoopColor", settings.loopColor);
+    config.setValue("Interface/ShowBpmOnWaveform", settings.showBpmOnWaveform);
+    config.setValue("Interface/ShowBeatNumbers", settings.showBeatNumbers);
+    config.setValue("Interface/AnimatedWaveforms", settings.animatedWaveforms);
+    config.setValue("Interface/WaveformQuality", settings.waveformQuality);
+    config.setValue("Interface/FullscreenMode", settings.fullscreenMode);
     
     // Save Library settings
-    config.setValue("Library/Path", libraryPathEdit->text());
-    config.setValue("Library/CachePath", cachePathEdit->text());
-    config.setValue("Library/AutoScanOnStartup", autoScanOnStartup->isChecked());
-    config.setValue("Library/DeepAnalysis", deepAnalysis->isChecked());
-    config.setValue("Library/AutoCreateWaveforms", autoCreateWaveforms->isChecked());
-    config.setValue("Library/MaxRecentTracks", maxRecentTracks->value());
-    config.setValue("Library/SortDefault", sortDefaultCombo->currentText());
+    config.setValue("Library/Path", settings.libraryPath);
+    config.setValue("Library/CachePath", settings.cachePath);
+    config.setValue("Library/AutoScanOnStartup", settings.autoScanOnStartup);
+    config.setValue("Library/DeepAnalysis", settings.deepAnalysis);
+    config.setValue("Library/AutoCreateWaveforms", settings.autoCreateWaveforms);
+    config.setValue("Library/MaxRecentTracks", settings.maxRecentTracks);
+    config.setValue("Library/SortDefault", settings.sortDefault);
     
     // Save Performance settings
-    config.setValue("Performance/CpuCores", cpuCoresSpinBox->value());
-    config.setValue("Performance/MemoryLimitMB", memoryLimitSpinBox->value());
-    config.setValue("Performance/ThreadPriority", threadPrioritySlider->value());
-    config.setValue("Performance/EnableGpuAcceleration", enableGpuAcceleration->isChecked());
-    config.setValue("Performance/LowLatencyMode", lowLatencyMode->isChecked());
-    config.setValue("Performance/RenderQuality", renderQualityCombo->currentText());
-    config.setValue("Performance/BackgroundProcessing", backgroundProcessing->isChecked());
-    config.setValue("Performance/DiskCacheMB", diskCacheSlider->value());
+    config.setValue("Performance/CpuCores", settings.cpuCores);
+    config.setValue("Performance/MemoryLimitMB", settings.memoryLimitMB);
+    config.setValue("Performance/ThreadPriority", settings.threadPriority);
+    config.setValue("Performance/EnableGpuAcceleration", settings.enableGpuAcceleration);
+    config.setValue("Performance/LowLatencyMode", settings.lowLatencyMode);
+    config.setValue("Performance/RenderQuality", settings.renderQuality);
+    config.setValue("Performance/BackgroundProcessing", settings.backgroundProcessing);
+    config.setValue("Performance/DiskCacheMB", settings.diskCacheMB);
     
     // Save MIDI settings through MidiEngine
     midiEngine->saveSettings(config);
     
     // Save local MIDI UI settings
-    config.setValue("MIDI/Enabled", midiEnabled->isChecked());
-    config.setValue("MIDI/Device", midiDeviceCombo->currentText());
-    config.setValue("MIDI/LearnMode", midiLearnMode->isChecked());
+    config.setValue("MIDI/Enabled", settings.midiEnabled);
+    config.setValue("MIDI/Device", settings.midiDevice);
+    config.setValue("MIDI/LearnMode", settings.midiLearnMode);
     
     // Save Advanced settings
-    config.setValue("Advanced/ConfigPath", configPathEdit->text());
-    config.setValue("Advanced/DebugLogging", debugLogging->isChecked());
-    config.setValue("Advanced/CrashReporting", crashReporting->isChecked());
-    config.setValue("Advanced/BetaFeatures", betaFeatures->isChecked());
+    config.setValue("Advanced/ConfigPath", settings.configPath);
+    config.setValue("Advanced/DebugLogging", settings.debugLogging);
+    config.setValue("Advanced/CrashReporting", settings.crashReporting);
+    config.setValue("Advanced/BetaFeatures", settings.betaFeatures);
     
     config.sync();
 }
 
 void PreferencesDialog::applySettings() {
+    const bool audioChanged = (settings.masterAudioDevice != originalSettings.masterAudioDevice)
+        || (settings.masterAudioDeviceType != originalSettings.masterAudioDeviceType)
+        || (settings.masterOutputChannelStart != originalSettings.masterOutputChannelStart)
+        || (settings.masterOutputChannelCount != originalSettings.masterOutputChannelCount)
+        || (settings.bufferSize != originalSettings.bufferSize)
+        || (settings.sampleRate != originalSettings.sampleRate)
+        || (settings.exclusiveMode != originalSettings.exclusiveMode);
+
+    const bool keylockChanged = settings.keylockQuality != originalSettings.keylockQuality;
+
+    // Apply Audio Settings (only when changed)
+    if (mainWindowRef && audioChanged) {
+        mainWindowRef->applyAudioSettings(settings.masterAudioDeviceType,
+                                          settings.masterAudioDevice,
+                                          settings.masterOutputChannelStart,
+                                          settings.masterOutputChannelCount,
+                                          settings.cueAudioDeviceType,
+                                          settings.cueAudioDevice,
+                                          settings.cueOutputChannelStart,
+                                          settings.cueOutputChannelCount,
+                                          settings.bufferSize,
+                                          settings.sampleRate,
+                                          settings.exclusiveMode);
+        qDebug() << "PreferencesDialog: Applied audio settings - Device:" << settings.masterAudioDevice
+                 << "Channels start:" << settings.masterOutputChannelStart
+                 << "count:" << settings.masterOutputChannelCount
+                 << "BufferSize:" << settings.bufferSize
+                 << "SampleRate:" << settings.sampleRate << "Exclusive:" << settings.exclusiveMode;
+    } else if (!audioChanged) {
+        qDebug() << "PreferencesDialog: Audio settings unchanged - skipping device reconfiguration";
+    }
+
+    if (mainWindowRef && (keylockChanged || audioChanged)) {
+        DJAudioPlayer::KeylockQuality quality = DJAudioPlayer::KeylockQuality::Balanced;
+        switch (settings.keylockQuality) {
+            case 0: quality = DJAudioPlayer::KeylockQuality::Fast; break;
+            case 1: quality = DJAudioPlayer::KeylockQuality::Balanced; break;
+            case 2: quality = DJAudioPlayer::KeylockQuality::Quality; break;
+        }
+        mainWindowRef->setKeylockQuality(quality);
+    }
+    
     // Apply settings to the application
-    // This would be connected to the main application to apply changes
     emit settingsChanged();
+}
+
+void PreferencesDialog::updateApplyButtonState() {
+    if (applyButton) {
+        applyButton->setEnabled(pendingChanges);
+    }
+}
+
+void PreferencesDialog::markDirty() {
+    if (suppressChangeTracking) {
+        return;
+    }
+
+    AppSettings current = collectCurrentSettings();
+    const bool isDirty = (current != originalSettings);
+
+    settings = current;
+
+    if (pendingChanges != isDirty) {
+        pendingChanges = isDirty;
+        updateApplyButtonState();
+    }
+}
+
+void PreferencesDialog::installChangeTracking() {
+    for (auto* combo : findChildren<QComboBox*>()) {
+        connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+            markDirty();
+        });
+        connect(combo, &QComboBox::editTextChanged, this, [this](const QString&) {
+            markDirty();
+        });
+    }
+
+    for (auto* lineEdit : findChildren<QLineEdit*>()) {
+        connect(lineEdit, &QLineEdit::textChanged, this, [this](const QString&) {
+            markDirty();
+        });
+    }
+
+    for (auto* checkBox : findChildren<QCheckBox*>()) {
+        connect(checkBox, &QCheckBox::toggled, this, [this](bool) {
+            markDirty();
+        });
+    }
+
+    for (auto* spinBox : findChildren<QSpinBox*>()) {
+        connect(spinBox, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+            markDirty();
+        });
+    }
+
+    for (auto* doubleSpinBox : findChildren<QDoubleSpinBox*>()) {
+        connect(doubleSpinBox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) {
+            markDirty();
+        });
+    }
+
+    for (auto* slider : findChildren<QSlider*>()) {
+        connect(slider, &QSlider::valueChanged, this, [this](int) {
+            markDirty();
+        });
+    }
+}
+
+PreferencesDialog::AppSettings PreferencesDialog::collectCurrentSettings() const {
+    AppSettings current = settings;
+
+    if (masterDeviceCombo) {
+        const QVariantMap deviceData = masterDeviceCombo->currentData().toMap();
+        current.masterAudioDevice = deviceData.value("deviceName").toString();
+        current.masterAudioDeviceType = deviceData.value("deviceType").toString();
+    }
+    if (masterChannelCombo) {
+        const QVariantMap channelData = masterChannelCombo->currentData().toMap();
+        current.masterOutputChannelStart = channelData.value("start").toInt();
+        current.masterOutputChannelCount = channelData.value("count").toInt();
+    }
+    if (cueDeviceCombo) {
+        const QVariantMap deviceData = cueDeviceCombo->currentData().toMap();
+        current.cueAudioDevice = deviceData.value("deviceName").toString();
+        current.cueAudioDeviceType = deviceData.value("deviceType").toString();
+    }
+    if (cueChannelCombo) {
+        const QVariantMap channelData = cueChannelCombo->currentData().toMap();
+        current.cueOutputChannelStart = channelData.value("start").toInt();
+        current.cueOutputChannelCount = channelData.value("count").toInt();
+    }
+    if (bufferSizeCombo) current.bufferSize = bufferSizeCombo->currentText().toInt();
+    if (sampleRateCombo) current.sampleRate = sampleRateCombo->currentText().toInt();
+    if (keylockQualityCombo) current.keylockQuality = keylockQualityCombo->currentIndex();
+    if (exclusiveModeCheck) current.exclusiveMode = exclusiveModeCheck->isChecked();
+    if (masterVolumeSlider) current.masterVolume = masterVolumeSlider->value() / 100.0;
+    if (headphoneVolumeSlider) current.headphoneVolume = headphoneVolumeSlider->value() / 100.0;
+
+    if (deckAKeylockDefault) current.deckAKeylockDefault = deckAKeylockDefault->isChecked();
+    if (deckAQuantizeDefault) current.deckAQuantizeDefault = deckAQuantizeDefault->isChecked();
+    if (deckASpeedDefault) current.deckASpeedDefault = deckASpeedDefault->value();
+    if (deckBKeylockDefault) current.deckBKeylockDefault = deckBKeylockDefault->isChecked();
+    if (deckBQuantizeDefault) current.deckBQuantizeDefault = deckBQuantizeDefault->isChecked();
+    if (deckBSpeedDefault) current.deckBSpeedDefault = deckBSpeedDefault->value();
+    if (syncOnLoad) current.syncOnLoad = syncOnLoad->isChecked();
+    if (autoGainAdjust) current.autoGainAdjust = autoGainAdjust->isChecked();
+    if (loopLengthDefault) current.loopLengthDefault = loopLengthDefault->value();
+    if (scratchSensitivity) current.scratchSensitivity = scratchSensitivity->currentIndex();
+
+    if (themeCombo) current.theme = themeCombo->currentText();
+    if (skinCombo) current.skin = skinCombo->currentText();
+    if (waveformColorButton) current.waveformColor = getColorFromButton(waveformColorButton);
+    if (beatGridColorButton) current.beatGridColor = getColorFromButton(beatGridColorButton);
+    if (loopColorButton) current.loopColor = getColorFromButton(loopColorButton);
+    if (showBpmOnWaveform) current.showBpmOnWaveform = showBpmOnWaveform->isChecked();
+    if (showBeatNumbers) current.showBeatNumbers = showBeatNumbers->isChecked();
+    if (animatedWaveforms) current.animatedWaveforms = animatedWaveforms->isChecked();
+    if (waveformQualitySlider) current.waveformQuality = waveformQualitySlider->value();
+    if (fullscreenMode) current.fullscreenMode = fullscreenMode->isChecked();
+
+    if (libraryPathEdit) current.libraryPath = libraryPathEdit->text();
+    if (cachePathEdit) current.cachePath = cachePathEdit->text();
+    if (autoScanOnStartup) current.autoScanOnStartup = autoScanOnStartup->isChecked();
+    if (deepAnalysis) current.deepAnalysis = deepAnalysis->isChecked();
+    if (autoCreateWaveforms) current.autoCreateWaveforms = autoCreateWaveforms->isChecked();
+    if (maxRecentTracks) current.maxRecentTracks = maxRecentTracks->value();
+    if (sortDefaultCombo) current.sortDefault = sortDefaultCombo->currentText();
+
+    if (cpuCoresSpinBox) current.cpuCores = cpuCoresSpinBox->value();
+    if (memoryLimitSpinBox) current.memoryLimitMB = memoryLimitSpinBox->value();
+    if (threadPrioritySlider) current.threadPriority = threadPrioritySlider->value();
+    if (enableGpuAcceleration) current.enableGpuAcceleration = enableGpuAcceleration->isChecked();
+    if (lowLatencyMode) current.lowLatencyMode = lowLatencyMode->isChecked();
+    if (renderQualityCombo) current.renderQuality = renderQualityCombo->currentText();
+    if (backgroundProcessing) current.backgroundProcessing = backgroundProcessing->isChecked();
+    if (diskCacheSlider) current.diskCacheMB = diskCacheSlider->value();
+
+    if (midiEnabled) current.midiEnabled = midiEnabled->isChecked();
+    if (midiDeviceCombo) {
+        current.midiDevice = (midiDeviceCombo->currentIndex() > 0) ? midiDeviceCombo->currentText() : QString();
+    }
+    if (midiLearnMode) current.midiLearnMode = midiLearnMode->isChecked();
+
+    if (configPathEdit) current.configPath = configPathEdit->text();
+    if (debugLogging) current.debugLogging = debugLogging->isChecked();
+    if (crashReporting) current.crashReporting = crashReporting->isChecked();
+    if (betaFeatures) current.betaFeatures = betaFeatures->isChecked();
+
+    return current;
 }
 
 void PreferencesDialog::restoreDefaults() {
     // Reset to default values
     settings = AppSettings(); // Default constructor values
     updateUIFromSettings();
+    markDirty();
 }
 
 void PreferencesDialog::updateUIFromSettings() {
+    const bool previousGuard = suppressChangeTracking;
+    suppressChangeTracking = true;
+
     // Update all UI controls with current settings
     
     // Audio
-    if (!settings.audioDevice.isEmpty()) {
-        int index = audioDeviceCombo->findText(settings.audioDevice);
-        if (index >= 0) audioDeviceCombo->setCurrentIndex(index);
-    }
+    refreshAudioDeviceLists();
     bufferSizeCombo->setCurrentText(QString::number(settings.bufferSize));
     sampleRateCombo->setCurrentText(QString::number(settings.sampleRate));
     keylockQualityCombo->setCurrentIndex(settings.keylockQuality);
@@ -1276,6 +1627,8 @@ void PreferencesDialog::updateUIFromSettings() {
     debugLogging->setChecked(settings.debugLogging);
     crashReporting->setChecked(settings.crashReporting);
     betaFeatures->setChecked(settings.betaFeatures);
+
+    suppressChangeTracking = previousGuard;
 }
 
 // Helper methods
@@ -1290,7 +1643,7 @@ void PreferencesDialog::setColorButtonColor(QPushButton* button, const QColor& c
     button->setText(color.name());
 }
 
-QColor PreferencesDialog::getColorFromButton(QPushButton* button) {
+QColor PreferencesDialog::getColorFromButton(const QPushButton* button) const {
     QString colorName = button->text();
     return QColor(colorName);
 }
@@ -1299,12 +1652,258 @@ QString PreferencesDialog::formatFontName(const QFont& font) {
     return QString("%1, %2pt").arg(font.family()).arg(font.pointSize());
 }
 
-void PreferencesDialog::populateAudioDevices() {
-    audioDeviceCombo->addItem("Default Audio Device");
-    audioDeviceCombo->addItem("ASIO Driver");
-    audioDeviceCombo->addItem("DirectSound");
-    audioDeviceCombo->addItem("WASAPI");
-    // Add more devices as detected by the system
+PreferencesDialog::DeviceOption* PreferencesDialog::findDeviceOption(const QString& deviceName,
+                                                                     const QString& deviceType) {
+    for (auto& option : audioOutputDevices) {
+        if (option.deviceName == deviceName && option.deviceType == deviceType) {
+            return &option;
+        }
+    }
+    return nullptr;
+}
+
+const PreferencesDialog::DeviceOption* PreferencesDialog::findDeviceOption(const QString& deviceName,
+                                                                           const QString& deviceType) const {
+    for (const auto& option : audioOutputDevices) {
+        if (option.deviceName == deviceName && option.deviceType == deviceType) {
+            return &option;
+        }
+    }
+    return nullptr;
+}
+
+void PreferencesDialog::updateChannelComboForDevice(QComboBox* combo,
+                                                    const QString& deviceName,
+                                                    const QString& deviceType,
+                                                    int preferredStart,
+                                                    int preferredCount) {
+    if (!combo) {
+        return;
+    }
+
+    combo->clear();
+
+    const DeviceOption* option = findDeviceOption(deviceName, deviceType);
+    QVector<ChannelOption> channels = option ? option->channelOptions : QVector<ChannelOption>();
+
+    if (channels.isEmpty()) {
+        ChannelOption fallback;
+        fallback.startIndex = 0;
+        fallback.channelCount = 2;
+        fallback.label = "Channels 1-2";
+        channels.append(fallback);
+    }
+
+    int matchingIndex = -1;
+    for (int i = 0; i < channels.size(); ++i) {
+        const ChannelOption& channel = channels.at(i);
+        QVariantMap data;
+        data.insert("start", channel.startIndex);
+        data.insert("count", channel.channelCount);
+        combo->addItem(channel.label, data);
+        if (channel.startIndex == preferredStart && channel.channelCount == preferredCount) {
+            matchingIndex = i;
+        }
+    }
+
+    if (matchingIndex < 0) {
+        matchingIndex = 0;
+    }
+    combo->setCurrentIndex(matchingIndex);
+}
+
+void PreferencesDialog::ensureChannelSelectionValid(AppSettings& targetSettings,
+                                                    QComboBox* combo,
+                                                    const QString& deviceName,
+                                                    const QString& deviceType) {
+    if (!combo || combo->count() == 0) {
+        return;
+    }
+
+    const QVariantMap channelData = combo->currentData().toMap();
+    const int start = channelData.value("start").toInt();
+    const int count = channelData.value("count").toInt();
+
+    if (combo == masterChannelCombo && deviceName == targetSettings.masterAudioDevice
+        && deviceType == targetSettings.masterAudioDeviceType) {
+        targetSettings.masterOutputChannelStart = start;
+        targetSettings.masterOutputChannelCount = count;
+    } else if (combo == cueChannelCombo && deviceName == targetSettings.cueAudioDevice
+               && deviceType == targetSettings.cueAudioDeviceType) {
+        targetSettings.cueOutputChannelStart = start;
+        targetSettings.cueOutputChannelCount = count;
+    }
+}
+
+void PreferencesDialog::refreshAudioDeviceLists() {
+    if (!masterDeviceCombo || !cueDeviceCombo) {
+        return;
+    }
+
+    const bool previousGuard = suppressChangeTracking;
+    suppressChangeTracking = true;
+
+    QString desiredMasterDevice = settings.masterAudioDevice;
+    QString desiredMasterType = settings.masterAudioDeviceType;
+    QString desiredCueDevice = settings.cueAudioDevice;
+    QString desiredCueType = settings.cueAudioDeviceType;
+    int masterPreferredStart = settings.masterOutputChannelStart;
+    int masterPreferredCount = settings.masterOutputChannelCount;
+    int cuePreferredStart = settings.cueOutputChannelStart;
+    int cuePreferredCount = settings.cueOutputChannelCount;
+
+    QtMainWindow::AudioDeviceState activeState;
+    if (mainWindowRef) {
+        activeState = mainWindowRef->getActiveAudioDeviceState();
+    }
+
+    audioOutputDevices.clear();
+    masterDeviceCombo->clear();
+    cueDeviceCombo->clear();
+
+    auto appendDevice = [this](const DeviceOption& option) {
+        audioOutputDevices.append(option);
+        QVariantMap data;
+        data.insert("deviceName", option.deviceName);
+        data.insert("deviceType", option.deviceType);
+        masterDeviceCombo->addItem(option.displayName, data);
+        cueDeviceCombo->addItem(option.displayName, data);
+    };
+
+    if (mainWindowRef) {
+        const auto devices = mainWindowRef->getAvailableOutputDevices();
+        for (const auto& info : devices) {
+            DeviceOption option;
+            option.deviceName = info.deviceName;
+            option.deviceType = info.typeName;
+            option.displayName = info.description.isEmpty() ? info.deviceName : info.description;
+
+            const QStringList channelNames = info.outputChannelNames;
+            const int totalChannels = channelNames.isEmpty() ? 2 : channelNames.size();
+
+            for (int start = 0; start + 1 < totalChannels; start += 2) {
+                ChannelOption pair;
+                pair.startIndex = start;
+                pair.channelCount = 2;
+                const QString firstName = channelNames.value(start);
+                const QString secondName = channelNames.value(start + 1);
+                QString label = QString("Channels %1-%2").arg(start + 1).arg(start + 2);
+                if (!firstName.isEmpty() || !secondName.isEmpty()) {
+                    label += QString(" (%1 / %2)").arg(firstName.isEmpty() ? QString::number(start + 1) : firstName,
+                                                        secondName.isEmpty() ? QString::number(start + 2) : secondName);
+                }
+                pair.label = label;
+                option.channelOptions.append(pair);
+            }
+
+            if (option.channelOptions.isEmpty()) {
+                ChannelOption fallback;
+                fallback.startIndex = 0;
+                fallback.channelCount = 2;
+                fallback.label = "Channels 1-2";
+                option.channelOptions.append(fallback);
+            }
+
+            appendDevice(option);
+        }
+    }
+
+    if (audioOutputDevices.isEmpty()) {
+        DeviceOption fallback;
+        fallback.deviceName = "Default";
+        fallback.deviceType = "Default";
+        fallback.displayName = "Default Audio Device";
+        ChannelOption channel;
+        channel.startIndex = 0;
+        channel.channelCount = 2;
+        channel.label = "Channels 1-2";
+        fallback.channelOptions.append(channel);
+        appendDevice(fallback);
+    }
+
+    auto selectDevice = [](QComboBox* combo, const QString& deviceName, const QString& deviceType) {
+        if (!combo) {
+            return QVariantMap{};
+        }
+
+        for (int i = 0; i < combo->count(); ++i) {
+            const QVariantMap data = combo->itemData(i).toMap();
+            if (data.value("deviceName").toString() == deviceName
+                && data.value("deviceType").toString() == deviceType) {
+                combo->setCurrentIndex(i);
+                return data;
+            }
+        }
+
+        if (combo->count() > 0) {
+            combo->setCurrentIndex(0);
+            return combo->currentData().toMap();
+        }
+
+        return QVariantMap{};
+    };
+
+    if (desiredMasterDevice.isEmpty()) {
+        if (!activeState.deviceName.isEmpty()) {
+            desiredMasterDevice = activeState.deviceName;
+            desiredMasterType = activeState.typeName;
+            masterPreferredStart = activeState.channelStart;
+            masterPreferredCount = activeState.channelCount;
+        } else {
+            desiredMasterDevice = audioOutputDevices.first().deviceName;
+            desiredMasterType = audioOutputDevices.first().deviceType;
+        }
+    }
+
+    if (desiredCueDevice.isEmpty()) {
+        if (!activeState.deviceName.isEmpty()) {
+            desiredCueDevice = activeState.deviceName;
+            desiredCueType = activeState.typeName;
+            if (cuePreferredStart == 0 && cuePreferredCount == 2) {
+                cuePreferredStart = activeState.channelStart + activeState.channelCount;
+            }
+        } else {
+            desiredCueDevice = desiredMasterDevice;
+            desiredCueType = desiredMasterType;
+            if (cuePreferredStart == 0 && cuePreferredCount == 2) {
+                cuePreferredStart = masterPreferredStart + masterPreferredCount;
+            }
+        }
+    }
+
+    if (desiredCueType.isEmpty()) {
+        desiredCueType = desiredMasterType;
+    }
+
+    const QVariantMap masterData = selectDevice(masterDeviceCombo, desiredMasterDevice, desiredMasterType);
+    settings.masterAudioDevice = masterData.value("deviceName").toString();
+    settings.masterAudioDeviceType = masterData.value("deviceType").toString();
+
+    updateChannelComboForDevice(masterChannelCombo,
+                                settings.masterAudioDevice,
+                                settings.masterAudioDeviceType,
+                                masterPreferredStart,
+                                masterPreferredCount);
+    ensureChannelSelectionValid(settings,
+                                masterChannelCombo,
+                                settings.masterAudioDevice,
+                                settings.masterAudioDeviceType);
+
+    const QVariantMap cueData = selectDevice(cueDeviceCombo, desiredCueDevice, desiredCueType);
+    settings.cueAudioDevice = cueData.value("deviceName").toString();
+    settings.cueAudioDeviceType = cueData.value("deviceType").toString();
+
+    updateChannelComboForDevice(cueChannelCombo,
+                                settings.cueAudioDevice,
+                                settings.cueAudioDeviceType,
+                                cuePreferredStart,
+                                cuePreferredCount);
+    ensureChannelSelectionValid(settings,
+                                cueChannelCombo,
+                                settings.cueAudioDevice,
+                                settings.cueAudioDeviceType);
+
+    suppressChangeTracking = previousGuard;
 }
 
 void PreferencesDialog::populateThemes() {

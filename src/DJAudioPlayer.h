@@ -113,6 +113,8 @@ private:
     
     void applyDSPEffects(const AudioSourceChannelInfo &bufferToFill);
     void applyCrossfadeTransition(const AudioSourceChannelInfo &bufferToFill);
+    [[nodiscard]] int estimatedCallbackSamples() const noexcept;
+    [[nodiscard]] int baseSystemLatencySamples() const noexcept;
     
 #if defined(RUBBERBAND_FOUND)
     void reinitRubberBand();
@@ -184,6 +186,10 @@ private:
     std::atomic<double> measuredLatencyMs{0.0};
     int latencyCompensationSamples = 0;
     std::atomic<int> hardwareLatencySamples{0};
+    std::atomic<int> latencyDebugCounter{0};
+    std::atomic<double> callbackIntervalMs{0.0};
+    std::chrono::steady_clock::time_point lastCallbackTick{};
+    std::atomic<bool> callbackTimestampValid{false};
     
     std::atomic<int> keylockChangePending{-1};
 

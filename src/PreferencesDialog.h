@@ -15,6 +15,7 @@
 #include <QSlider>
 #include <QPushButton>
 #include <QLineEdit>
+#include <QVector>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QApplication>
@@ -65,7 +66,10 @@ private slots:
     void onRestoreDefaultsClicked();
     
     // Audio Settings
-    void onAudioDeviceChanged();
+    void onMasterDeviceChanged();
+    void onMasterChannelChanged();
+    void onCueDeviceChanged();
+    void onCueChannelChanged();
     void onBufferSizeChanged(int size);
     void onSampleRateChanged();
     void onKeylockQualityChanged();
@@ -115,7 +119,10 @@ private:
     
     // === AUDIO TAB ===
     QWidget* audioTab;
-    QComboBox* audioDeviceCombo;
+    QComboBox* masterDeviceCombo;
+    QComboBox* masterChannelCombo;
+    QComboBox* cueDeviceCombo;
+    QComboBox* cueChannelCombo;
     QComboBox* bufferSizeCombo;
     QComboBox* sampleRateCombo;
     QComboBox* keylockQualityCombo;
@@ -205,7 +212,14 @@ private:
     // Settings storage
     struct AppSettings {
         // Audio
-        QString audioDevice;
+        QString masterAudioDevice;
+        QString masterAudioDeviceType;
+        int masterOutputChannelStart = 0;   // zero-based channel index
+        int masterOutputChannelCount = 2;   // number of channels requested (default stereo)
+        QString cueAudioDevice;
+        QString cueAudioDeviceType;
+        int cueOutputChannelStart = 0;
+        int cueOutputChannelCount = 2;
         int bufferSize = 512;
         int sampleRate = 44100;
         int keylockQuality = 1; // 0=Fast, 1=Balanced, 2=Quality
@@ -267,6 +281,8 @@ private:
         bool debugLogging = false;
         bool crashReporting = true;
         bool betaFeatures = false;
+        bool operator==(const AppSettings& other) const = default;
+        bool operator!=(const AppSettings& other) const = default;
     } settings;
     
     AppSettings originalSettings; // Für Cancel-Funktionalität
@@ -276,13 +292,46 @@ private:
     
     // Main Window Reference
     QtMainWindow* mainWindowRef;
+
+    // Change tracking helpers
+    AppSettings collectCurrentSettings() const;
+    void installChangeTracking();
+    void markDirty();
+    void updateApplyButtonState();
+    bool pendingChanges = false;
+    bool suppressChangeTracking = false;
     
     // Helper methods
     void updateVolumeLabel(QSlider* slider, QLabel* label, const QString& prefix);
     void setColorButtonColor(QPushButton* button, const QColor& color);
-    QColor getColorFromButton(QPushButton* button);
+    QColor getColorFromButton(const QPushButton* button) const;
     QString formatFontName(const QFont& font);
-    void populateAudioDevices();
+    struct ChannelOption {
+        int startIndex{0};
+        int channelCount{2};
+        QString label;
+    };
+
+    struct DeviceOption {
+        QString deviceName;
+        QString deviceType;
+        QString displayName;
+        QVector<ChannelOption> channelOptions;
+    };
+
+    void refreshAudioDeviceLists();
+    void updateChannelComboForDevice(QComboBox* combo,
+                                     const QString& deviceName,
+                                     const QString& deviceType,
+                                     int preferredStart,
+                                     int preferredCount);
+    void ensureChannelSelectionValid(AppSettings& targetSettings,
+                                     QComboBox* combo,
+                                     const QString& deviceName,
+                                     const QString& deviceType);
+    DeviceOption* findDeviceOption(const QString& deviceName, const QString& deviceType);
+    const DeviceOption* findDeviceOption(const QString& deviceName, const QString& deviceType) const;
+    QVector<DeviceOption> audioOutputDevices;
     void populateThemes();
     void populateSkins();
     void populateMidiDevices();

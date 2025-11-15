@@ -4,6 +4,7 @@
 #include <QHBoxLayout>
 #include <QSlider>
 #include <QDial>
+#include <QPushButton>
 #include <QTimer>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -12,6 +13,9 @@
 #include <QRect>
 #include <QCursor>
 #include <QAbstractButton>
+#include <QVector>
+#include <QStringList>
+#include <QFrame>
 #include <ctime>
 #include <chrono>
 #include <memory>
@@ -20,12 +24,15 @@
 #include "DeckWidget.h"
 #include "BeatIndicator.h"
 #include "MenuBar.h"
+#include "DJKnob.h"
+#include "VUMeter.h"
+#include "CustomFader.h"
 #include <QListWidget>
 #include "LibraryManager.h"
 #include "MasterLevelMonitor.h"
 #include "StereoAudioCallback.h"
+#include "DJAudioPlayer.h"
 // #include "AudioMixer.h" // Removed - using simplified AudioSourcePlayer approach
-class DJAudioPlayer;
 class BpmAnalyzer;
 class PreferencesDialog;
 class ScratchEngine;
@@ -83,6 +90,38 @@ public:
     void setDeckBTempo(float normalizedValue); // MIDI control for Deck B tempo/pitch (0.0 = -100%, 0.5 = normal, 1.0 = +100%)
     void setDeckAVolume(float normalizedValue); // MIDI control for Deck A channel volume (0.0 = mute, 1.0 = full)
     void setDeckBVolume(float normalizedValue); // MIDI control for Deck B channel volume (0.0 = mute, 1.0 = full)
+    
+    // Audio settings control
+    void applyAudioSettings(const QString& masterDeviceType,
+                            const QString& masterDeviceName,
+                            int masterChannelStart,
+                            int masterChannelCount,
+                            const QString& cueDeviceType,
+                            const QString& cueDeviceName,
+                            int cueChannelStart,
+                            int cueChannelCount,
+                            int bufferSize,
+                            int sampleRate,
+                            bool exclusiveMode);
+    void setKeylockQuality(DJAudioPlayer::KeylockQuality quality);
+
+    struct AudioOutputDeviceInfo {
+        QString typeName;
+        QString deviceName;
+        QString description;
+        QStringList outputChannelNames;
+    };
+
+    struct AudioDeviceState {
+        QString typeName;
+        QString deviceName;
+        int channelStart{0};
+        int channelCount{2};
+    };
+
+    QVector<AudioOutputDeviceInfo> getAvailableOutputDevices();
+    AudioDeviceState getActiveAudioDeviceState() const;
+    
     DJAudioPlayer* getPlayerA() const { return playerA.get(); }
     DJAudioPlayer* getPlayerB() const { return playerB.get(); }
     DJAudioPlayer* getPlayer(bool isDeckA) const { return isDeckA ? playerA.get() : playerB.get(); }
@@ -123,7 +162,7 @@ private:
     bool analysisFailedB{false};
 
     BeatIndicator* beatIndicator;
-    QSlider* crossfader;
+    CustomFader* crossfader;
     
     // BetaPulseX Menu System
     MenuBar* menuBar{nullptr};
@@ -131,18 +170,29 @@ private:
     // Store algorithm names for BPM display
     QString algorithmA;
     QString algorithmB;
+    // Trim knobs (gain)
+    DJKnob* leftTrim;
+    DJKnob* rightTrim;
     // EQ knobs
-    QDial* leftHigh;
-    QDial* leftMid;
-    QDial* leftLow;
-    QDial* leftFilter;
-    QDial* rightHigh;
-    QDial* rightMid;
-    QDial* rightLow;
-    QDial* rightFilter;
+    DJKnob* leftHigh;
+    DJKnob* leftMid;
+    DJKnob* leftLow;
+    DJKnob* leftFilter;
+    DJKnob* rightHigh;
+    DJKnob* rightMid;
+    DJKnob* rightLow;
+    DJKnob* rightFilter;
     // Volume sliders (moved from deck widgets)
-    QSlider* leftVolumeSlider;
-    QSlider* rightVolumeSlider;
+    CustomFader* leftVolumeSlider;
+    CustomFader* rightVolumeSlider;
+    // Cue buttons
+    QPushButton* leftCueButton;
+    QPushButton* rightCueButton;
+    // VU Meters
+    VUMeter* vuMeterDeckA;
+    VUMeter* vuMeterDeckB;
+    VUMeter* vuMeterMasterL;
+    VUMeter* vuMeterMasterR;
     LibraryManager* libraryManager;
     juce::AudioDeviceManager deviceManager;
     
@@ -154,6 +204,9 @@ private:
 
     // PREROLL SUPPORT: Timer for automatic position updates
     QTimer* positionUpdateTimer;
+    
+    // VU meter update timer
+    QTimer* vuMeterUpdateTimer;
     
     // Scratching state management to prevent timer conflicts
     qint64 lastScratchEndA{0};
@@ -207,6 +260,7 @@ private:
     QPoint dragStartPosition;
     bool systemMoveActive{false};
     bool externalDragActive{false};
+    bool systemResizeActive{false};
     enum class ResizeRegion {
         None,
         Left,
@@ -284,5 +338,7 @@ private:
     void beginWindowDragInternal(const QPoint& globalPos, bool fromExternalSource);
     void updateWindowDragInternal(const QPoint& globalPos);
     void endWindowDragInternal();
+    bool beginSystemResizeForRegion(ResizeRegion region);
+    Qt::Edges edgesForRegion(ResizeRegion region) const;
     DJAudioPlayer* playerForDeck(bool isDeckA) const { return isDeckA ? playerA.get() : playerB.get(); }
 };

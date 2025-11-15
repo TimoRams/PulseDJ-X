@@ -26,9 +26,9 @@ bool QtMainWindow::eventFilter(QObject* obj, QEvent* event)
 
             const bool isButton = static_cast<bool>(qobject_cast<QAbstractButton*>(widget));
             const bool isMenu = static_cast<bool>(qobject_cast<QMenu*>(widget));
-            const bool isMenuBarWidget = (widget == menuBar);
             QWidget* topRightCorner = menuBar ? menuBar->cornerWidget(Qt::TopRightCorner) : nullptr;
             const bool isWindowControl = topRightCorner && (widget == topRightCorner || topRightCorner->isAncestorOf(widget));
+            const bool isMenuBarSubtree = menuBar && (widget == menuBar || menuBar->isAncestorOf(widget));
 
             switch (event->type())
             {
@@ -43,12 +43,28 @@ bool QtMainWindow::eventFilter(QObject* obj, QEvent* event)
                         ResizeRegion region = detectResizeRegion(windowPos);
                         if (region != ResizeRegion::None && !isButton && !isMenu && !isWindowControl)
                         {
-                            currentResizeRegion = region;
-                            isResizing = true;
-                            isDragging = false;
-                            resizeStartPosition = globalPos;
-                            resizeStartGeometry = geometry();
-                            updateCursorForRegion(region);
+                            if (beginSystemResizeForRegion(region))
+                            {
+                                systemResizeActive = true;
+                                isResizing = false;
+                                handled = true;
+                                event->accept();
+                            }
+                            else
+                            {
+                                currentResizeRegion = region;
+                                isResizing = true;
+                                isDragging = false;
+                                resizeStartPosition = globalPos;
+                                resizeStartGeometry = geometry();
+                                updateCursorForRegion(region);
+                                handled = true;
+                                event->accept();
+                            }
+                        }
+                        else if (isMenuBarSubtree && menuBar && menuBar->isGlobalPointInDragHandle(globalPos))
+                        {
+                            beginWindowDragInternal(globalPos, false);
                             handled = true;
                             event->accept();
                         }
@@ -59,7 +75,12 @@ bool QtMainWindow::eventFilter(QObject* obj, QEvent* event)
                 {
                     auto mouseEvent = static_cast<QMouseEvent*>(event);
                     const QPoint globalPos = mouseEvent->globalPosition().toPoint();
-                    if (isResizing && (mouseEvent->buttons() & Qt::LeftButton))
+                    if (systemResizeActive && (mouseEvent->buttons() & Qt::LeftButton))
+                    {
+                        handled = true;
+                        event->accept();
+                    }
+                    else if (isResizing && (mouseEvent->buttons() & Qt::LeftButton))
                     {
                         performResize(globalPos);
                         updateCursorForRegion(currentResizeRegion);
@@ -94,7 +115,16 @@ bool QtMainWindow::eventFilter(QObject* obj, QEvent* event)
                     auto mouseEvent = static_cast<QMouseEvent*>(event);
                     if (mouseEvent->button() == Qt::LeftButton)
                     {
-                        if (isResizing)
+                        if (systemResizeActive)
+                        {
+                            systemResizeActive = false;
+                            ResizeRegion region = detectResizeRegion(mapFromGlobal(mouseEvent->globalPosition().toPoint()));
+                            currentResizeRegion = region;
+                            updateCursorForRegion(region);
+                            handled = true;
+                            event->accept();
+                        }
+                        else if (isResizing)
                         {
                             isResizing = false;
                             ResizeRegion region = detectResizeRegion(mapFromGlobal(mouseEvent->globalPosition().toPoint()));
@@ -248,6 +278,14 @@ void QtMainWindow::mousePressEvent(QMouseEvent* event)
         ResizeRegion region = detectResizeRegion(localPos);
         if (region != ResizeRegion::None)
         {
+            if (beginSystemResizeForRegion(region))
+            {
+                systemResizeActive = true;
+                isResizing = false;
+                event->accept();
+                return;
+            }
+
             currentResizeRegion = region;
             isResizing = true;
             isDragging = false;
@@ -265,6 +303,12 @@ void QtMainWindow::mouseMoveEvent(QMouseEvent* event)
 {
     const QPoint globalPos = event->globalPosition().toPoint();
     const QPoint localPos = event->pos();
+
+    if (systemResizeActive && (event->buttons() & Qt::LeftButton))
+    {
+        event->accept();
+        return;
+    }
 
     if (isResizing && (event->buttons() & Qt::LeftButton))
     {
@@ -295,6 +339,15 @@ void QtMainWindow::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton)
     {
+        if (systemResizeActive)
+        {
+            systemResizeActive = false;
+            ResizeRegion region = detectResizeRegion(mapFromGlobal(event->globalPosition().toPoint()));
+            currentResizeRegion = region;
+            updateCursorForRegion(region);
+            event->accept();
+            return;
+        }
         if (isResizing)
         {
             isResizing = false;
@@ -414,9 +467,66 @@ void QtMainWindow::updateCursorForRegion(ResizeRegion region)
     currentCursorShape = desiredShape;
 }
 
+Qt::Edges QtMainWindow::edgesForRegion(ResizeRegion region) const
+{
+    Qt::Edges edges;
+    switch (region)
+    {
+        case ResizeRegion::TopLeft:
+            edges |= Qt::TopEdge;
+            edges |= Qt::LeftEdge;
+            break;
+        case ResizeRegion::TopRight:
+            edges |= Qt::TopEdge;
+            edges |= Qt::RightEdge;
+            break;
+        case ResizeRegion::BottomLeft:
+            edges |= Qt::BottomEdge;
+            edges |= Qt::LeftEdge;
+            break;
+        case ResizeRegion::BottomRight:
+            edges |= Qt::BottomEdge;
+            edges |= Qt::RightEdge;
+            break;
+        case ResizeRegion::Top:
+            edges |= Qt::TopEdge;
+            break;
+        case ResizeRegion::Bottom:
+            edges |= Qt::BottomEdge;
+            break;
+        case ResizeRegion::Left:
+            edges |= Qt::LeftEdge;
+            break;
+        case ResizeRegion::Right:
+            edges |= Qt::RightEdge;
+            break;
+        case ResizeRegion::None:
+            break;
+    }
+    return edges;
+}
+
+bool QtMainWindow::beginSystemResizeForRegion(ResizeRegion region)
+{
+    if (region == ResizeRegion::None)
+        return false;
+
+    if (QWindow* window = windowHandle())
+    {
+        const Qt::Edges edges = edgesForRegion(region);
+        if (edges == Qt::Edges())
+            return false;
+
+        if (window->startSystemResize(edges))
+            return true;
+    }
+
+    return false;
+}
+
 void QtMainWindow::performResize(const QPoint& globalPos)
 {
-    if (!isResizing || currentResizeRegion == ResizeRegion::None)
+    if (systemResizeActive || !isResizing || currentResizeRegion == ResizeRegion::None)
         return;
 
     QPoint delta = globalPos - resizeStartPosition;
